@@ -17,6 +17,7 @@
 
 # 二进制资源，禁止换行转换与 diff
 *.png binary
+*.rgba binary
 *.jpg binary
 *.jpeg binary
 *.webp binary
