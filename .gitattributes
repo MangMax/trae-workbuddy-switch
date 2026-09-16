@@ -1,0 +1,34 @@
+# Trellis: append-only developer journals should merge cleanly across
+# parallel sessions/worktrees — each session only appends a new block, so
+# there is nothing to actually conflict on.
+#
+# Do NOT add a rule for workspace/*/index.md here — it is fully regenerated
+# every session, so a real conflict there is expected and safe to resolve by
+# picking either side (task state lives in task.json, not index.md). See
+# .trellis/spec/cli/backend/directory-structure.md for details.
+.trellis/workspace/*/journal-*.md merge=union
+
+# 统一仓库内文本为 LF，避免跨平台（Windows/macOS/Linux）构建时脚本换行问题
+* text=auto eol=lf
+
+# Windows 批处理脚本在 LF 下存在解析边缘情况，固定为 CRLF
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# 二进制资源，禁止换行转换与 diff
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.ico binary
+*.icns binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.exe binary
+*.dll binary
+*.pdb binary
+
+# 锁文件不参与 diff 统计
+package-lock.json -diff linguist-generated
+Cargo.lock -diff linguist-generated

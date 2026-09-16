@@ -1,0 +1,381 @@
+//! 出站请求体指纹脱敏：剥离上游内容审核黑名单指纹。
+//!
+//! 移植自参考实现 `internal/upstream/sanitize.go`。上游审核按**逐字精确匹配**
+//! 拦截（非语义审核），因此策略是两层：
+//! - **剥离层**：键值/header 型指纹（`x-anthropic-billing-header:`、`cc_xxx=…;`）整段删除；
+//! - **改写层**：承载语义的模板句只换一个词（`for Claude` → `for Claude tool` 类），语义不变。
+//!
+//! 关键设计：先做 `contains` 特征预检，普通请求零改动直接返回（无正则开销）。
+
+use std::sync::OnceLock;
+
+use regex::Regex;
+use serde_json::Value;
+
+/// 特征预检串：任一命中才进入净化。截断前缀即可命中，故只存前缀。
+const FEATURES: &[&str] = &[
+    "x-anthropic-billing-header",
+    "cc_entrypoint=",
+    "You are Claude Code",
+    "Main branch (",
+    "You are a coding agent running in the Codex CLI",
+    "github.com/anthropics/",
+    "11128",
+];
+
+/// 改写层：逐字替换对，每句只改一个词。
+///
+/// 身份句的匹配串**不带结尾标点**：CLI 版以句号收尾，桌面版以逗号接后继内容，
+/// 去掉标点后两种形态一并覆盖，原有标点由原文保留。
+const REWRITES: &[(&str, &str)] = &[
+    (
+        "You are Claude Code, Anthropic's official CLI for Claude",
+        "You are Claude Code, Anthropic's official CLI tool for Claude",
+    ),
+    (
+        "Main branch (you will usually use this for PRs)",
+        "Default branch (you will usually use this for PRs)",
+    ),
+    (
+        "You are a coding agent running in the Codex CLI, a terminal-based coding assistant.",
+        "You are a coding agent running in the Codex CLI tool, a terminal-based coding assistant.",
+    ),
+    (
+        "To give feedback, users should report the issue at https://github.com/anthropics/claude-code/issues",
+        "To provide feedback, users should report the issue at https://github.com/anthropics/claude-code/issues",
+    ),
+    // 上游反探测：请求体里出现裸数字 11128 即整单拦截（与本数字上下文无关）。
+    // 插入连字符保留可读性与指代（零宽空格无效，实测上游会归一化）。
+    ("11128", "11-128"),
+];
+
+/// 裸键名兜底替换值（`header` → `hdr`，破坏逐字匹配但保留可读性）。
+const BARE_HEADER_REPLACEMENT: &str = "x-anthropic-billing-hdr";
+
+/// `(?i)x-anthropic-billing-header:[^;\n]*;?\s*` —— 键值形态整段删除。
+fn header_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)x-anthropic-billing-header:[^;\n]*;?\s*").expect("静态正则合法")
+    })
+}
+
+/// `(?i)x-anthropic-billing-header` —— 裸键名（无冒号）最小缩写。
+///
+/// 该正则是 [`header_re`] 的超集（不要求冒号）：先删键值形态，再缩写残留裸键名，
+/// 两者替换语义不同，不可合并。
+fn bare_header_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?i)x-anthropic-billing-header").expect("静态正则合法"))
+}
+
+/// `(?i)\bcc_[a-z0-9_]+=[^;\n]*;?\s*` —— 尾随裸键值循环清理。
+fn kv_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?i)\bcc_[a-z0-9_]+=[^;\n]*;?\s*").expect("静态正则合法"))
+}
+
+/// 特征预检：`contains` 快路径 + 大小写不敏感的裸键名正则兜底。
+///
+/// `contains` 大小写敏感、`header_re` 要求冒号，两者都会漏掉「混合大小写 + 裸键名」，
+/// 故必须用不要求冒号的 [`bare_header_re`] 兜底，否则整条净化被跳过。
+pub fn has_fingerprint(text: &str) -> bool {
+    FEATURES.iter().any(|feature| text.contains(feature)) || bare_header_re().is_match(text)
+}
+
+/// 单段文本净化：预检不中直接返回原串。
+pub fn sanitize_text(text: &str) -> String {
+    if !has_fingerprint(text) {
+        return text.to_string();
+    }
+
+    let mut out = text.to_string();
+    for (from, to) in REWRITES {
+        if out.contains(from) {
+            out = out.replace(from, to);
+        }
+    }
+
+    if header_re().is_match(&out) {
+        out = header_re().replace_all(&out, "").into_owned();
+    }
+
+    if out.contains("cc_") {
+        // 循环清理：一条消息里可能有多个相邻的 cc_ 键值对。
+        let mut previous = String::new();
+        while previous != out {
+            previous = out.clone();
+            out = kv_re().replace_all(&out, "").into_owned();
+        }
+    }
+
+    let out = bare_header_re()
+        .replace_all(&out, BARE_HEADER_REPLACEMENT)
+        .into_owned();
+    out.trim().to_string()
+}
+
+/// 净化 `content`：字符串直接处理；多模态数组只动 `text` part，image 等 part 不动。
+fn sanitize_content(value: &mut Value) -> bool {
+    match value {
+        Value::String(text) => {
+            let cleaned = sanitize_text(text);
+            if cleaned == *text {
+                return false;
+            }
+            *value = Value::String(cleaned);
+            true
+        }
+        Value::Array(parts) => {
+            let mut changed = false;
+            for part in parts.iter_mut() {
+                let Some(wrapped) = part.as_object_mut() else {
+                    continue;
+                };
+                let Some(Value::String(text)) = wrapped.get_mut("text") else {
+                    continue;
+                };
+                let cleaned = sanitize_text(text);
+                if cleaned != *text {
+                    *text = cleaned;
+                    changed = true;
+                }
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+/// 净化 `tool_calls[].function.arguments`。
+///
+/// `arguments` 是**字符串化的 JSON**（不是对象），因此按文本走 [`sanitize_text`]。
+/// 这块易被漏掉：工具调用消息的 `content` 常为 `null`，若在 `content` 缺失时
+/// `continue`，整条消息连 `tool_calls` 一起被跳过，历史里写进工具参数的被拦字符串
+/// （文件名、命令、写入内容）会原样漏出。
+fn sanitize_tool_calls(value: &mut Value) -> bool {
+    let Some(calls) = value.as_array_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    for call in calls.iter_mut() {
+        let Some(arguments) = call
+            .get_mut("function")
+            .and_then(Value::as_object_mut)
+            .and_then(|function| function.get_mut("arguments"))
+        else {
+            continue;
+        };
+        let Value::String(raw) = arguments else {
+            continue;
+        };
+        let cleaned = sanitize_text(raw);
+        if cleaned != *raw {
+            *raw = cleaned;
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// 净化 `messages` 中的 `content`、`reasoning_content` 与 `tool_calls`。
+///
+/// 返回是否发生改动。`content` 与 `tool_calls` **各自独立判断**：`content` 为 `null`
+/// 的工具调用轮次，其 `tool_calls` 仍必须净化。
+pub fn sanitize_messages(messages: &mut [Value]) -> bool {
+    let mut changed = false;
+    for message in messages.iter_mut() {
+        let Some(wrapped) = message.as_object_mut() else {
+            continue;
+        };
+
+        if let Some(content) = wrapped.get_mut("content") {
+            if sanitize_content(content) {
+                changed = true;
+            }
+        }
+
+        if let Some(Value::String(reasoning)) = wrapped.get_mut("reasoning_content") {
+            let cleaned = sanitize_text(reasoning);
+            if cleaned != *reasoning {
+                *reasoning = cleaned;
+                changed = true;
+            }
+        }
+
+        if let Some(tool_calls) = wrapped.get_mut("tool_calls") {
+            if sanitize_tool_calls(tool_calls) {
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn ordinary_text_is_untouched() {
+        let text = "正常的一句中英文 mixed content，包含 11101 与 11148 等无关数字。";
+        assert_eq!(sanitize_text(text), text);
+        assert!(!has_fingerprint(text));
+    }
+
+    #[test]
+    fn header_key_value_is_stripped_entirely() {
+        let text = "prefix x-anthropic-billing-header: abc-123; suffix";
+        let cleaned = sanitize_text(text);
+        assert!(!cleaned.contains("abc-123"), "值必须被删除: {cleaned}");
+        assert!(cleaned.contains("prefix"));
+        assert!(cleaned.contains("suffix"));
+    }
+
+    #[test]
+    fn bare_header_key_is_abbreviated_case_insensitively() {
+        let cleaned = sanitize_text("see `X-Anthropic-Billing-Header` in docs");
+        assert!(
+            !cleaned.to_lowercase().contains("x-anthropic-billing-header"),
+            "裸键名必须被改写: {cleaned}"
+        );
+        assert!(cleaned.contains(BARE_HEADER_REPLACEMENT));
+    }
+
+    #[test]
+    fn cc_key_values_are_removed_in_a_loop() {
+        let text = "a cc_version=1.2.3; cc_entrypoint=cli; b";
+        let cleaned = sanitize_text(text);
+        assert!(!cleaned.contains("cc_version"), "首个键值必须清除: {cleaned}");
+        assert!(!cleaned.contains("cc_entrypoint"), "相邻键值也必须清除: {cleaned}");
+        assert!(cleaned.contains('a') && cleaned.contains('b'));
+    }
+
+    #[test]
+    fn identity_sentence_is_rewritten_with_one_word() {
+        let cleaned = sanitize_text(
+            "You are Claude Code, Anthropic's official CLI for Claude.",
+        );
+        assert!(cleaned.contains("official CLI tool for Claude"));
+        assert!(!cleaned.contains("official CLI for Claude"));
+        assert!(cleaned.ends_with('.'), "原有标点必须保留: {cleaned}");
+    }
+
+    #[test]
+    fn desktop_variant_without_period_is_also_rewritten() {
+        let cleaned = sanitize_text(
+            "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.",
+        );
+        assert!(
+            cleaned.contains("official CLI tool for Claude"),
+            "不带句号的桌面版形态必须覆盖: {cleaned}"
+        );
+    }
+
+    #[test]
+    fn main_branch_and_feedback_sentences_are_rewritten() {
+        let cleaned = sanitize_text("Main branch (you will usually use this for PRs)");
+        assert!(cleaned.contains("Default branch"));
+
+        let cleaned = sanitize_text(
+            "To give feedback, users should report the issue at https://github.com/anthropics/claude-code/issues",
+        );
+        assert!(cleaned.contains("To provide feedback"));
+        assert!(!cleaned.contains("To give feedback"));
+    }
+
+    #[test]
+    fn codex_instruction_gains_tool_word() {
+        let cleaned = sanitize_text(
+            "You are a coding agent running in the Codex CLI, a terminal-based coding assistant.",
+        );
+        assert!(cleaned.contains("Codex CLI tool, a terminal-based"));
+    }
+
+    #[test]
+    fn bare_number_11128_is_hyphenated() {
+        let cleaned = sanitize_text("error code=11128 occurred");
+        assert!(cleaned.contains("11-128"));
+        assert!(!cleaned.contains("11128"));
+    }
+
+    #[test]
+    fn health_bypass_survives_regression() {
+        // 相邻错误码必须放行（上游只拦 11128）。
+        assert_eq!(sanitize_text("code 11148"), "code 11148");
+        assert_eq!(sanitize_text("code 11115"), "code 11115");
+    }
+
+    #[test]
+    fn sanitize_messages_cleans_content_and_tool_calls_independently() {
+        let mut messages = vec![
+            json!({"role": "user", "content": "You are Claude Code, Anthropic's official CLI for Claude"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "f", "arguments": "{\"note\":\"code 11128\"}"}
+                }]
+            }),
+            json!({"role": "tool", "tool_call_id": "c1", "content": "cc_entrypoint=cli;"}),
+        ];
+        assert!(sanitize_messages(&mut messages));
+        assert!(messages[0]["content"]
+            .as_str()
+            .expect("string content")
+            .contains("official CLI tool for Claude"));
+        assert!(
+            messages[1]["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .expect("string arguments")
+                .contains("11-128"),
+            "content 为 null 时 tool_calls 仍必须净化"
+        );
+        assert_eq!(messages[2]["content"], json!(""), "裸 kv 被清空后仅剩空串");
+    }
+
+    #[test]
+    fn sanitize_messages_handles_multimodal_text_parts_only() {
+        let mut messages = vec![json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Please read Main branch (you will usually use this for PRs)"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA11128"}}
+            ]
+        })];
+        assert!(sanitize_messages(&mut messages));
+        assert!(messages[0]["content"][0]["text"]
+            .as_str()
+            .expect("string")
+            .contains("Default branch"));
+        assert_eq!(
+            messages[0]["content"][1]["image_url"]["url"],
+            json!("data:image/png;base64,AAAA11128"),
+            "非 text part 不得被改写"
+        );
+    }
+
+    #[test]
+    fn sanitize_messages_reports_no_change_for_clean_input() {
+        let mut messages = vec![json!({"role": "user", "content": "hello world"})];
+        assert!(!sanitize_messages(&mut messages));
+        assert_eq!(messages[0]["content"], json!("hello world"));
+    }
+
+    #[test]
+    fn sanitize_messages_cleans_reasoning_content() {
+        let mut messages = vec![json!({
+            "role": "assistant",
+            "content": "ok",
+            "reasoning_content": "plan refers to 11128"
+        })];
+        assert!(sanitize_messages(&mut messages));
+        assert!(messages[0]["reasoning_content"]
+            .as_str()
+            .expect("string")
+            .contains("11-128"));
+    }
+}
