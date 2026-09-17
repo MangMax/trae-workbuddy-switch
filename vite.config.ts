@@ -12,13 +12,13 @@ const host = process.env.TAURI_DEV_HOST;
 //   `npm run build`       → `dist/`       base "/"                  — 被三处消费：
 //                                       rust-embed(`crates/buddy-switch-server`)、
 //                                       Tauri `frontendDist`、`scripts/fix-app.sh`
-//   `npm run build:demo`  → `dist-demo/`  base "/workbuddy-switch/" — 仅供 GitHub Pages
+//   `npm run build:demo`  → `dist-demo/`  base "/trae-workbuddy-switch/" — 仅供 GitHub Pages
 // 两者曾共用 `dist/`，导致「把演示构建编进 server/Tauri」→ index.html 请求
-// `/workbuddy-switch/assets/*`（embed 中不存在）→ 回退成 HTML → 模块脚本 MIME 校验失败
+// `/trae-workbuddy-switch/assets/*`（embed 中不存在）→ 回退成 HTML → 模块脚本 MIME 校验失败
 // → webui/桌面端空白页。`api::tests::embedded_index_html_references_only_embedded_assets`
 // 是这条约定的回归护栏。
 // @ts-expect-error process is a nodejs global
-const base = process.env.VITE_PAGES_DEMO === "1" ? "/workbuddy-switch/" : "/";
+const base = process.env.VITE_PAGES_DEMO === "1" ? "/trae-workbuddy-switch/" : "/";
 
 // https://vite.dev/config/
 export default defineConfig(async () => ({

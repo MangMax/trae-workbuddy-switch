@@ -19,8 +19,8 @@ use crate::modules::config::{
 
 /// 应用当前版本（来自 Cargo.toml package.version）。
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const GITHUB_OWNER: &str = "changexbc";
-pub const GITHUB_REPO: &str = "workbuddy-switch";
+pub const GITHUB_OWNER: &str = "NextAgentX";
+pub const GITHUB_REPO: &str = "trae-workbuddy-switch";
 
 /// 成功结果缓存有效期（6 小时）。自动轮询（30 分钟）命中缓存，不发网络请求；
 /// 设置页手动检查传 force=true 绕过缓存强制刷新。
@@ -36,6 +36,20 @@ static CACHE: Mutex<Option<CachedCheck>> = Mutex::new(None);
 
 pub fn github_config_file() -> PathBuf {
     store_dir().join("github_config.json")
+}
+
+/// 把已知的旧仓库坐标归一到当前坐标，返回 `(owner, repo)`。
+///
+/// 旧坐标有两代：`changexbc/buddy-switch`（早期截图/配置）与
+/// `changexbc/workbuddy-switch`（旧公开仓库）。配置文件 `github_config.json`
+/// 的优先级**高于**常量，若不迁移，已存有旧坐标的用户会永久指向已迁走的仓库、
+/// 再也收不到更新。因此按 **owner** 判定，一次性把该 owner 下的所有旧 repo 归一到新坐标。
+fn migrate_legacy_coordinates(owner: &str, repo: &str) -> (String, String) {
+    if owner == "changexbc" {
+        (GITHUB_OWNER.to_string(), GITHUB_REPO.to_string())
+    } else {
+        (owner.to_string(), repo.to_string())
+    }
 }
 
 /// 读取更新源配置（兼容旧配置文件，但永不返回 token）。
@@ -65,9 +79,10 @@ pub fn load_github_config() -> Value {
             }
         }
     }
-    // 旧版本截图/配置曾使用 changexbc/buddy-switch；迁移到实际公开仓库。
-    if owner == "changexbc" && repo == "buddy-switch" {
-        repo = GITHUB_REPO.to_string();
+    let (migrated_owner, migrated_repo) = migrate_legacy_coordinates(&owner, &repo);
+    if migrated_owner != owner || migrated_repo != repo {
+        owner = migrated_owner;
+        repo = migrated_repo;
         should_normalize = true;
     }
     let normalized = json!({"owner": owner, "repo": repo, "proxy": proxy});
@@ -328,27 +343,44 @@ mod tests {
 
     #[test]
     fn updater_manifest_urls_macos_skips_duplicate_fallback() {
-        let urls = updater_manifest_urls("changexbc", "workbuddy-switch", "macos", "aarch64");
+        let urls = updater_manifest_urls(GITHUB_OWNER, GITHUB_REPO, "macos", "aarch64");
         assert_eq!(
             urls,
             vec![
-                "https://github.com/changexbc/workbuddy-switch/releases/latest/download/latest.json",
-                "https://github.com/changexbc/workbuddy-switch/releases/latest/download/latest-macos-aarch64.json",
+                "https://github.com/NextAgentX/trae-workbuddy-switch/releases/latest/download/latest.json",
+                "https://github.com/NextAgentX/trae-workbuddy-switch/releases/latest/download/latest-macos-aarch64.json",
             ]
         );
     }
 
     #[test]
     fn updater_manifest_urls_windows_keeps_macos_compat() {
-        let urls = updater_manifest_urls("changexbc", "workbuddy-switch", "windows", "x86_64");
+        let urls = updater_manifest_urls(GITHUB_OWNER, GITHUB_REPO, "windows", "x86_64");
         assert_eq!(
             urls,
             vec![
-                "https://github.com/changexbc/workbuddy-switch/releases/latest/download/latest.json",
-                "https://github.com/changexbc/workbuddy-switch/releases/latest/download/latest-windows-x86_64.json",
-                "https://github.com/changexbc/workbuddy-switch/releases/latest/download/latest-macos-x86_64.json",
+                "https://github.com/NextAgentX/trae-workbuddy-switch/releases/latest/download/latest.json",
+                "https://github.com/NextAgentX/trae-workbuddy-switch/releases/latest/download/latest-windows-x86_64.json",
+                "https://github.com/NextAgentX/trae-workbuddy-switch/releases/latest/download/latest-macos-x86_64.json",
             ]
         );
+    }
+
+    /// 旧坐标必须被迁移到新仓库：配置文件里的旧坐标优先级高于常量，
+    /// 不迁移的话老用户会永久指向已迁走的仓库。
+    #[test]
+    fn legacy_github_coordinates_migrate_to_current_repo() {
+        for legacy_repo in ["workbuddy-switch", "buddy-switch"] {
+            let migrated = migrate_legacy_coordinates("changexbc", legacy_repo);
+            assert_eq!(
+                migrated,
+                (GITHUB_OWNER.to_string(), GITHUB_REPO.to_string()),
+                "legacy repo `{legacy_repo}` should migrate to current coordinates"
+            );
+        }
+        // 非旧 owner 的坐标必须原样保留（不得被误伤）
+        let kept = migrate_legacy_coordinates("someone-else", "workbuddy-switch");
+        assert_eq!(kept, ("someone-else".to_string(), "workbuddy-switch".to_string()));
     }
 
     #[test]

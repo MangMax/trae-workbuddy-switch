@@ -21,7 +21,7 @@ WorkBuddy / CodeBuddy CLI / CodeBuddy CN IDE 账号切换桌面 App（Tauri）�
 
 ### 在线演示
 
-[打开 GitHub Pages 在线演示](https://changexbc.github.io/workbuddy-switch/)（只读演示；账号、积分与请求记录均为虚构数据，所有业务操作均已禁用。）
+[打开 GitHub Pages 在线演示](https://nextagentx.github.io/trae-workbuddy-switch/)（只读演示；账号、积分与请求记录均为虚构数据，所有业务操作均已禁用。）
 
 ## 快速开始
 
@@ -37,7 +37,7 @@ webui 界面与桌面 App 一致：WorkBuddy / CodeBuddy CLI / CodeBuddy IDE 账
 
 ### 桌面 App
 
-前往 [GitHub Releases](https://github.com/changexbc/workbuddy-switch/releases/latest) 下载对应平台的安装包：
+前往 [GitHub Releases](https://github.com/NextAgentX/trae-workbuddy-switch/releases/latest) 下载对应平台的安装包：
 
 | 平台 | 安装包 | 安装方式 |
 | --- | --- | --- |
