@@ -1,6 +1,6 @@
 [package]
 name = "buddy-switch-core"
-version = "2026.9.16"
+version = "2026.9.181729"
 edition = "2021"
 description = "buddy-switch 核心逻辑（账号/切换/会话/签到/更新），不依赖 Tauri，可被桌面端与 HTTP server 复用"
 
@@ -8,19 +8,38 @@ description = "buddy-switch 核心逻辑（账号/切换/会话/签到/更新）
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
-tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros", "net"] }
 uuid = { version = "1", features = ["v4"] }
 dirs = "5"
 chrono = "0.4"
 rusqlite = { version = "0.32", features = ["bundled"] }
 
+# Trae OAuth 登录：本地回调监听（`127.0.0.1:<port>/authorize`）。
+# 版本与 buddy-switch-gateway 一致，复用 Cargo.lock 里已有的 0.7.9，不引入新解析。
+axum = "0.7"
+
 # CodeBuddy CN IDE Safe Storage (state.vscdb secret inject)
 aes = "0.8"
-cbc = "0.1"
+# `alloc` 特性是 Trae icube tc 信封解密的硬需求：`decrypt_padded_vec_mut`（AES-128-CBC/PKCS7）
+# 由 `cipher/alloc` 提供。此前该用法只出现在 `#[cfg(not(windows))]` 分支里，Windows 构建
+# 不会编译到它，因此缺这个特性也不报错；icube.rs 是**三平台共用**的，必须显式开启。
+cbc = { version = "0.1", features = ["alloc"] }
 pbkdf2 = "0.12"
 sha1 = "0.10"
 aes-gcm = "0.10"
 base64 = "0.22"
+
+# Trae 模块：设备标识的确定性派生（必须与参考实现 device_proxy.py / auto_checkin.py
+# 逐字节一致，否则同一账号在代理与签到脚本之间会出现两套设备 ID）。
+sha2 = "0.10"
+
+# Trae 设备凭证（icube tc 信封）：P-256 私钥解析 + DeviceProof 签名（ECDSA P-256/SHA-256）。
+# ⚠️ 只有 refreshToken 刷新链路用它（DeviceProof 是那条路径的专属结构，见 icube.rs 模块头）；
+# AuthCode 交换路径**不持有私钥**，因此不依赖本 crate —— 让「拿错结构体」成为编译错误。
+p256 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
+# OAuth 授权 URL 参数编码（x_device_brand 可能含空格/非 ASCII、x_os_version、auth_callback_url）。
+# 手写 `.replace(':','%3A')` 只够处理回调地址，覆盖不了 COMPUTERNAME。
+urlencoding = "2"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }

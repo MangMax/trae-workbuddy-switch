@@ -26,6 +26,7 @@ pub mod school;
 pub mod session;
 pub mod switch;
 pub mod token_stats;
+pub mod trae;
 pub mod travel;
 pub mod update;
 pub mod upstream;

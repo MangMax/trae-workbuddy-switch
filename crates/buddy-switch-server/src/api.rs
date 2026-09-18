@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 use buddy_switch_core::modules::{
     account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, config, credit_usage, credits, export_import,
     migrate, oauth, process, refresh, region::Region, region::RegionFilter, rotate, schedule, session, switch,
-    token_stats, travel, update,
+    token_stats, trae, travel, update,
 };
 use buddy_switch_gateway::{GatewayConfig, GatewayStatusView};
 
@@ -154,6 +154,60 @@ fn api_routes() -> Router {
         )
         .route("/api/gateway/logs", get(api_gateway_logs))
         .route("/api/gateway/logs/clear", post(api_gateway_clear_logs))
+        // ---- Trae 模块（与 src-tauri commands.rs 的 trae 命令一一对应）----
+        .route("/api/trae/env", get(api_trae_env))
+        .route("/api/trae/variants", get(api_trae_variants))
+        .route("/api/trae/capabilities", get(api_trae_capabilities))
+        .route("/api/trae/accounts", get(api_trae_accounts))
+        .route("/api/trae/accounts/add", post(api_trae_add_account))
+        .route("/api/trae/accounts/update", post(api_trae_update_account))
+        .route("/api/trae/accounts/delete", post(api_trae_delete_account))
+        // ---- 账号迁移（与 WorkBuddy 的 /api/import-local、/api/export-accounts* 同构）----
+        .route("/api/trae/accounts/import-local", post(api_trae_import_local))
+        // ---- Trae OAuth 登录（对齐 WorkBuddy 的 /api/oauth/*）----
+        .route("/api/trae/oauth/start", post(api_trae_oauth_start))
+        .route("/api/trae/oauth/status", post(api_trae_oauth_status))
+        .route("/api/trae/oauth/cancel", post(api_trae_oauth_cancel))
+        .route("/api/trae/accounts/export", post(api_trae_export_accounts))
+        .route(
+            "/api/trae/accounts/export-to-path",
+            post(api_trae_export_accounts_to_path),
+        )
+        .route("/api/trae/accounts/import/preview", post(api_trae_preview_import))
+        .route("/api/trae/accounts/import", post(api_trae_import_accounts))
+        .route("/api/trae/groups", post(api_trae_group_op))
+        .route("/api/trae/checkin/status", get(api_trae_checkin_status))
+        .route("/api/trae/checkin", post(api_trae_checkin))
+        .route("/api/trae/credits", get(api_trae_credits))
+        .route("/api/trae/token-stats", get(api_trae_token_statistics))
+        .route("/api/trae/logs", get(api_trae_logs))
+        .route("/api/trae/credits/refresh", post(api_trae_refresh_credits))
+        .route("/api/trae/refresh-jwt", post(api_trae_refresh_jwt))
+        .route("/api/trae/cooldown/clear", post(api_trae_clear_cooldown))
+        .route("/api/trae/profiles", get(api_trae_profiles))
+        .route("/api/trae/login/save", post(api_trae_save_login))
+        .route("/api/trae/profiles/backup", post(api_trae_backup_profile))
+        .route("/api/trae/profiles/restore", post(api_trae_restore_profile))
+        .route("/api/trae/profiles/delete", post(api_trae_delete_profile))
+        .route("/api/trae/switch", post(api_trae_switch))
+        .route("/api/trae/device/reset", post(api_trae_reset_device))
+        .route("/api/trae/settings", get(api_trae_settings).post(api_trae_save_settings))
+        // ---- Trae API 网关（管理面；网关本体走独立端口 7864，**不** merge 进本 Router）----
+        .route(
+            "/api/trae/gateway/config",
+            get(api_trae_gateway_config).post(api_save_trae_gateway_config),
+        )
+        .route("/api/trae/gateway/status", get(api_trae_gateway_status))
+        .route("/api/trae/gateway/models", get(api_trae_gateway_models))
+        .route(
+            "/api/trae/gateway/key/regenerate",
+            post(api_trae_regenerate_api_key),
+        )
+        .route("/api/trae/gateway/logs", get(api_trae_gateway_logs))
+        .route(
+            "/api/trae/gateway/logs/clear",
+            post(api_trae_clear_gateway_logs),
+        )
 }
 
 fn json_ok(v: Value) -> Response {
@@ -179,6 +233,22 @@ fn query_value(query: Option<&str>, name: &str) -> Option<String> {
 /// 解析 region 参数，缺省为 `cn`（保证旧行为）。
 fn parse_region(value: Option<&str>) -> Region {
     value.and_then(Region::parse).unwrap_or(Region::Cn)
+}
+
+/// 解析 Trae 产品线变体参数，缺省为 [`trae::variant::TraeVariant::default`]（保证旧行为）。
+///
+/// 与 [`parse_region`] 同风格：**缺失即回落到默认**，不做「未知值报错」——
+/// 老版本前端不带该参数、或从探测结果里回传目录名（如 `TRAE SOLO CN`）都应被接受；
+/// 无法解析时等价于未传。
+///
+/// ⚠️ **本函数在 `src-tauri/src/commands.rs` 有一份同款实现，两处必须保持一致**
+/// （同样的「缺失/未知 → `default()`」语义）。不要为了去重跨 crate 抽公共函数——
+/// server 与 tauri 是两个独立 crate，为这 4 行引入共享依赖不值得。
+/// 两处各自带 `parse_trae_variant_*` 单测（含未知值回落护栏）钉住行为。
+fn parse_trae_variant(value: Option<&str>) -> trae::variant::TraeVariant {
+    value
+        .and_then(trae::variant::TraeVariant::parse)
+        .unwrap_or_default()
 }
 
 /// 解析统计查询范围参数，缺省为 `cn`（保证旧行为）；额外支持 `"all"` 合并视图。
@@ -1047,6 +1117,537 @@ async fn api_gateway_clear_logs() -> Response {
 }
 
 // ---------------------------------------------------------------------------
+// Trae 模块路由
+// ---------------------------------------------------------------------------
+//
+// 与 `src-tauri/src/commands.rs` 的同名命令**一一对应**，返回形状由
+// `buddy_switch_core::modules::trae::handlers` 单点保证。本层只做参数解析与
+// HTTP 状态码映射，不自行拼装业务对象——这正是为了避免 `copy_sessions` 那种
+// 「两条通道返回形状不同」的问题。
+
+async fn api_trae_env() -> Response {
+    json_ok(trae::platform::env_status())
+}
+
+/// GET /api/trae/variants —— **全部** Trae 产品线的独立环境状态（数组）。
+///
+/// 与 `/api/trae/env` 的分工：`env` 回答"自动挑中的是哪一条"，本端点回答
+/// "每条各自是什么状态"（供前端并排渲染多个图标）。与 Tauri 的
+/// `get_trae_variants` 一一对应。
+async fn api_trae_variants() -> Response {
+    json_ok(trae::platform::variants_status())
+}
+
+async fn api_trae_capabilities() -> Response {
+    json_ok(trae::platform::capabilities())
+}
+
+/// GET /api/trae/accounts —— 账号 + 分组 + 计数（`variant` 可选，缺省默认变体）。
+async fn api_trae_accounts(RawQuery(query): RawQuery) -> Response {
+    let variant = parse_trae_variant(query_value(query.as_deref(), "variant").as_deref());
+    json_ok(trae::handlers::accounts_overview_for(variant))
+}
+
+/// GET /api/trae/checkin/status —— 签到摘要与冷却（`variant` 可选）。
+async fn api_trae_checkin_status(RawQuery(query): RawQuery) -> Response {
+    let variant = parse_trae_variant(query_value(query.as_deref(), "variant").as_deref());
+    json_ok(trae::handlers::checkin_status_for(variant))
+}
+
+/// GET /api/trae/credits —— 剩余积分、明细、每日趋势（`variant` 可选）。
+async fn api_trae_credits(RawQuery(query): RawQuery) -> Response {
+    let variant = parse_trae_variant(query_value(query.as_deref(), "variant").as_deref());
+    json_ok(trae::handlers::credits_overview_for(variant))
+}
+
+/// GET /api/trae/token-stats —— Token 统计（`days` 可选，缺省全部历史）。
+async fn api_trae_token_statistics(RawQuery(query): RawQuery) -> Response {
+    let days = query_value(query.as_deref(), "days").and_then(|value| value.parse::<i64>().ok());
+    json_ok(trae::handlers::token_statistics(days))
+}
+
+/// GET /api/trae/logs —— 运行日志（`kind` / `date` / `keyword` / `limit` / `variant` 均可选）。
+///
+/// 读取 `logs/` 下的纯文本日志文件，属于阻塞 IO，因此放进 blocking 线程池。
+async fn api_trae_logs(RawQuery(query): RawQuery) -> Response {
+    let read = |key: &str| query_value(query.as_deref(), key);
+    let limit = read("limit").and_then(|value| value.parse::<u64>().ok());
+    let params = serde_json::json!({
+        "kind": read("kind"),
+        "date": read("date"),
+        "keyword": read("keyword"),
+        "limit": limit,
+        "variant": read("variant"),
+    });
+    match tokio::task::spawn_blocking(move || trae::handlers::logs(&params)).await {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(format!("读取日志失败: {error}"), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// GET /api/trae/profiles —— 登录态快照总览（`variant` 可选）。
+///
+/// 快照目录是递归统计（逐文件求大小），可能耗时数十毫秒以上，
+/// 因此放进 blocking 线程池，避免占用 HTTP 工作线程。
+async fn api_trae_profiles(RawQuery(query): RawQuery) -> Response {
+    let variant = parse_trae_variant(query_value(query.as_deref(), "variant").as_deref());
+    match tokio::task::spawn_blocking(move || trae::profile::overview_for(variant)).await {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(format!("读取快照失败: {error}"), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+async fn api_trae_settings() -> Response {
+    match serde_json::to_value(trae::settings::load()) {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(format!("读取设置失败: {error}"), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+async fn api_trae_save_settings(Json(body): Json<Value>) -> Response {
+    let patch = body.get("patch").cloned().unwrap_or(body);
+    match trae::handlers::save_settings(patch) {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn api_trae_add_account(Json(body): Json<Value>) -> Response {
+    let name = body.get("name").and_then(Value::as_str).unwrap_or("");
+    let jwt_value = body.get("jwt").and_then(Value::as_str).unwrap_or("");
+    let group_id = body.get("groupId").and_then(Value::as_str);
+    let variant = parse_trae_variant(body.get("variant").and_then(Value::as_str));
+    match trae::handlers::add_account_for(variant, name, jwt_value, group_id) {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn api_trae_update_account(Json(body): Json<Value>) -> Response {
+    let user_id = body.get("userId").and_then(Value::as_str).unwrap_or("");
+    if user_id.is_empty() {
+        return json_err("缺少 userId".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let name = body.get("name").and_then(Value::as_str);
+    let jwt_value = body.get("jwt").and_then(Value::as_str);
+    let variant = parse_trae_variant(body.get("variant").and_then(Value::as_str));
+    match trae::handlers::update_account_for(variant, user_id, name, jwt_value) {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn api_trae_delete_account(Json(body): Json<Value>) -> Response {
+    let user_id = body.get("userId").and_then(Value::as_str).unwrap_or("");
+    if user_id.is_empty() {
+        return json_err("缺少 userId".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let delete_profile = body
+        .get("deleteProfile")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let variant = parse_trae_variant(body.get("variant").and_then(Value::as_str));
+    let owned = user_id.to_string();
+    match tokio::task::spawn_blocking(move || {
+        trae::handlers::delete_account_for(variant, &owned, delete_profile)
+    })
+    .await
+    {
+        Ok(Ok(value)) => json_ok(value),
+        Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
+        Err(error) => json_err(format!("删除账号失败: {error}"), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// POST /api/trae/accounts/import-local —— 从 Trae 客户端登录态导入当前账号。
+///
+/// 与 WorkBuddy 侧 `/api/import-local` 语义一致：读客户端 userData 里的
+/// `Cloud-IDE-JWT`，已存在的账号**覆盖**（刷新 JWT，保留名字/分组），不存在则新建。
+///
+/// body 可带可选 `variant`（`"trae_work"` / `"trae_cn"`，也接受 `TRAE SOLO CN`
+/// 之类的目录名），决定读哪条产品线的 userData；**缺失时回落默认变体**，
+/// 保证旧调用点行为不变。
+async fn api_trae_import_local(Json(body): Json<Value>) -> Response {
+    let variant = parse_trae_variant(body.get("variant").and_then(Value::as_str));
+    match tokio::task::spawn_blocking(move || trae::handlers::import_local_account_for(variant)).await
+    {
+        Ok(Ok(value)) => json_ok(value),
+        Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
+        Err(error) => json_err(
+            format!("导入本机账号失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+/// POST /api/trae/oauth/start —— 发起 Trae OAuth 登录（开本地回调监听）。
+///
+/// body: `{ variant? }`（`"trae_work"` / `"trae_cn"`，缺失 / 无法识别回落默认变体，
+/// 与 WorkBuddy 侧 `/api/oauth/start` 的 `{ region? }` 同构）。
+/// 返回 `{ loginId, verificationUri, expiresIn, port, variant, variantLabel,
+/// deviceCredential }`，由调用方负责打开 `verificationUri`。
+///
+/// 变体必须**透传到 core**：授权 URL 的设备身份、会话归属、成功后落库的账号库
+/// 全部由它决定；在这里丢弃它会让两条产品线的登录互相串号。
+async fn api_trae_oauth_start(Json(body): Json<Value>) -> Response {
+    let variant = trae::handlers::parse_variant_param(&body);
+    match trae::handlers::oauth_login_start_for(variant).await {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/trae/oauth/status —— 轮询登录结果（body: `{ loginId }`）。
+///
+/// 与 WorkBuddy 侧 `/api/oauth/status` 同构：**永不返 Err**，
+/// 「还没好」用 `{ done: false }` 表达，前端无需靠抛错驱动轮询。
+/// 变体不需要单独传：会话自己记着它（`loginId` 是唯一入口）。
+async fn api_trae_oauth_status(Json(body): Json<Value>) -> Response {
+    let login_id = body
+        .get("loginId")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    json_ok(trae::handlers::oauth_login_status(&login_id))
+}
+
+/// POST /api/trae/oauth/cancel —— 取消登录（body: `{ loginId }`），释放端口。
+async fn api_trae_oauth_cancel(Json(body): Json<Value>) -> Response {
+    let login_id = body
+        .get("loginId")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    json_ok(trae::handlers::oauth_login_cancel(&login_id))
+}
+
+/// POST /api/trae/accounts/export —— 按 userId 列表导出完整记录（含 JWT）。
+async fn api_trae_export_accounts(Json(body): Json<Value>) -> Response {
+    let ids = body
+        .get("userIds")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(String::from))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let variant = parse_trae_variant(body.get("variant").and_then(Value::as_str));
+    match tokio::task::spawn_blocking(move || trae::handlers::export_accounts_for(variant, &ids)).await
+    {
+        Ok(Ok(value)) => json_ok(value),
+        Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
+        Err(error) => json_err(format!("导出账号失败: {error}"), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// POST /api/trae/accounts/export-to-path —— 写入用户选择的路径，返回落地路径。
+async fn api_trae_export_accounts_to_path(Json(body): Json<Value>) -> Response {
+    let ids = body
+        .get("userIds")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(String::from))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let path = body
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let variant = parse_trae_variant(body.get("variant").and_then(Value::as_str));
+    match tokio::task::spawn_blocking(move || {
+        trae::handlers::export_accounts_to_path_for(variant, &ids, &path)
+    })
+    .await
+    {
+        Ok(Ok(value)) => json_ok(value),
+        Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
+        Err(error) => json_err(format!("导出账号失败: {error}"), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// POST /api/trae/accounts/import/preview —— 解析导入文件并回传脱敏预览。
+///
+/// 纯函数（只读请求体文本，不触及账号库），因此**不接受也不忽略 variant**——
+/// 预览阶段还没有落库位置，给个参数只会是永远被忽略的假参数。
+async fn api_trae_preview_import(Json(body): Json<Value>) -> Response {
+    let text = body
+        .get("fileText")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    match trae::handlers::preview_import_file(&text) {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/trae/accounts/import —— 按选中索引导入，返回计数与最新账号视图。
+async fn api_trae_import_accounts(Json(body): Json<Value>) -> Response {
+    let text = body
+        .get("fileText")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let indexes = body
+        .get("indexes")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_u64().map(|n| n as usize))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let variant = parse_trae_variant(body.get("variant").and_then(Value::as_str));
+    match tokio::task::spawn_blocking(move || {
+        trae::handlers::import_accounts_for(variant, &text, &indexes)
+    })
+    .await
+    {
+        Ok(Ok(value)) => json_ok(value),
+        Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
+        Err(error) => json_err(format!("导入账号失败: {error}"), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// POST /api/trae/groups —— 分组操作分发。
+///
+/// 动作由 `action` 字段指定（`create` / `update` / `delete` / `move`），
+/// 与 Tauri 的 `trae_group_op(action, params, variant)` 参数顺序一致。
+async fn api_trae_group_op(Json(body): Json<Value>) -> Response {
+    let action = body
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let params = body.get("params").cloned().unwrap_or_else(|| json!({}));
+    let variant = parse_trae_variant(body.get("variant").and_then(Value::as_str));
+    match trae::handlers::group_op_for(variant, &action, &params) {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/trae/checkin —— 批量签到。
+///
+/// webui 无事件推送通道，因此这里一次性返回完整报告；Tauri 侧同名命令会额外
+/// 派发 `trae-checkin-progress` 事件。**两者的响应体形状相同**。
+///
+/// 变体从 `options.variant` 解析（与其他端点「顶层 `variant`」不同：签到的入参
+/// 本就整体包在 `options` 里，再套一层顶层字段会让两条通道的契约分叉）。
+async fn api_trae_checkin(Json(body): Json<Value>) -> Response {
+    let options = body.get("options").cloned().unwrap_or(body);
+    let parsed = match trae::handlers::parse_checkin_options(&options) {
+        Ok(parsed) => parsed,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    json_ok(trae::handlers::run_checkin_report(parsed).await)
+}
+
+async fn api_trae_refresh_credits(Json(body): Json<Value>) -> Response {
+    let user_id = body.get("userId").and_then(Value::as_str);
+    let variant = parse_trae_variant(body.get("variant").and_then(Value::as_str));
+    match trae::handlers::refresh_credits_for(variant, user_id).await {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn api_trae_refresh_jwt(Json(body): Json<Value>) -> Response {
+    let user_id = body.get("userId").and_then(Value::as_str).unwrap_or("");
+    if user_id.is_empty() {
+        return json_err("缺少 userId".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let variant = parse_trae_variant(body.get("variant").and_then(Value::as_str));
+    match trae::handlers::refresh_jwt_for(variant, user_id).await {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn api_trae_clear_cooldown(Json(body): Json<Value>) -> Response {
+    let user_id = body.get("userId").and_then(Value::as_str);
+    let variant = parse_trae_variant(body.get("variant").and_then(Value::as_str));
+    match trae::handlers::clear_cooldown_for(variant, user_id) {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn api_trae_save_login(Json(body): Json<Value>) -> Response {
+    let user_id = body.get("userId").and_then(Value::as_str).unwrap_or("");
+    if user_id.is_empty() {
+        return json_err("缺少 userId".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let variant = trae::handlers::parse_variant_param(&body);
+    let owned = user_id.to_string();
+    match tokio::task::spawn_blocking(move || trae::handlers::save_login_for(variant, &owned)).await {
+        Ok(Ok(value)) => json_ok(value),
+        Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
+        Err(error) => json_err(format!("保存登录态失败: {error}"), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+async fn api_trae_backup_profile(Json(body): Json<Value>) -> Response {
+    let user_id = body.get("userId").and_then(Value::as_str).unwrap_or("");
+    if user_id.is_empty() {
+        return json_err("缺少 userId".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let variant = trae::handlers::parse_variant_param(&body);
+    let owned = user_id.to_string();
+    match tokio::task::spawn_blocking(move || trae::handlers::backup_profile_for(variant, &owned)).await {
+        Ok(Ok(value)) => json_ok(value),
+        Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
+        Err(error) => json_err(format!("备份失败: {error}"), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+async fn api_trae_restore_profile(Json(body): Json<Value>) -> Response {
+    let user_id = body.get("userId").and_then(Value::as_str).unwrap_or("");
+    if user_id.is_empty() {
+        return json_err("缺少 userId".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let variant = trae::handlers::parse_variant_param(&body);
+    let owned = user_id.to_string();
+    match tokio::task::spawn_blocking(move || trae::handlers::restore_profile_for(variant, &owned)).await {
+        Ok(Ok(value)) => json_ok(value),
+        Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
+        Err(error) => json_err(format!("恢复失败: {error}"), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+async fn api_trae_delete_profile(Json(body): Json<Value>) -> Response {
+    let slot = body.get("slot").and_then(Value::as_str).unwrap_or("");
+    if slot.is_empty() {
+        return json_err("缺少 slot".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let variant = trae::handlers::parse_variant_param(&body);
+    let owned = slot.to_string();
+    match tokio::task::spawn_blocking(move || trae::handlers::delete_profile_for(variant, &owned)).await {
+        Ok(Ok(value)) => json_ok(value),
+        Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
+        Err(error) => json_err(format!("删除快照失败: {error}"), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// POST /api/trae/switch —— 切换账号。
+///
+/// 返回体是完整的切换报告（含逐步进度），与 Tauri 侧一致；进度事件仅 Tauri 有。
+async fn api_trae_switch(Json(body): Json<Value>) -> Response {
+    let options = body.get("options").cloned().unwrap_or(body);
+    let parsed = match trae::handlers::parse_switch_options(&options) {
+        Ok(parsed) => parsed,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    match tokio::task::spawn_blocking(move || {
+        trae::profile::switch_account(&parsed, |_| {}).to_json()
+    })
+    .await
+    {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(format!("切换账号失败: {error}"), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// POST /api/trae/device/reset —— 重置设备标识（`variant` 可选）。
+async fn api_trae_reset_device(Json(body): Json<Value>) -> Response {
+    let variant = trae::handlers::parse_variant_param(&body);
+    match tokio::task::spawn_blocking(move || trae::handlers::reset_device_for(variant)).await {
+        Ok(Ok(value)) => json_ok(value),
+        Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
+        Err(error) => json_err(format!("重置设备标识失败: {error}"), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Trae API 网关（管理面）
+// ---------------------------------------------------------------------------
+//
+// 与上面 WorkBuddy 网关的管理面形状一致，少一套多 Key 管理（Trae 只有一把钥匙）。
+
+async fn api_trae_gateway_config() -> Response {
+    match serde_json::to_value(buddy_switch_gateway::trae::TraeGatewayConfig::load()) {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+async fn api_save_trae_gateway_config(Json(body): Json<Value>) -> Response {
+    let submitted = body.get("config").cloned().unwrap_or(body);
+    let config: buddy_switch_gateway::trae::TraeGatewayConfig =
+        match serde_json::from_value(submitted) {
+            Ok(config) => config,
+            Err(error) => return json_err(format!("配置格式错误: {error}"), StatusCode::BAD_REQUEST),
+        };
+    if let Err(error) = config.save() {
+        return json_err(error, StatusCode::BAD_REQUEST);
+    }
+    let state = crate::trae_gateway_host::shared_state();
+    *state.config.write().await = config.clone();
+    state.log.set_keep(config.log_keep);
+    state.log.set_log_bodies(config.log_bodies);
+    let addr = match crate::trae_gateway_host::apply().await {
+        Ok(addr) => addr,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    json_ok(json!({
+        "ok": true,
+        "config": config,
+        "running": addr.is_some(),
+        "addr": addr,
+    }))
+}
+
+async fn api_trae_gateway_status() -> Response {
+    let (running, addr) = crate::trae_gateway_host::status().await;
+    json_ok(
+        buddy_switch_gateway::trae::status_view(
+            &crate::trae_gateway_host::shared_state(),
+            running,
+            addr,
+            update::APP_VERSION,
+        )
+        .await,
+    )
+}
+
+async fn api_trae_gateway_models() -> Response {
+    json_ok(buddy_switch_gateway::trae::payload::models_response())
+}
+
+async fn api_trae_regenerate_api_key() -> Response {
+    let plaintext = match buddy_switch_gateway::trae::regenerate_api_key() {
+        Ok(plaintext) => plaintext,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    // 共享状态缓存的是旧 Key，必须同步，否则旧 Key 在进程存活期内仍然可用（真事故）。
+    let state = crate::trae_gateway_host::shared_state();
+    *state.api_key.write().await = plaintext.clone();
+    json_ok(json!({
+        "ok": true,
+        "key": plaintext,
+        "prefix": buddy_switch_gateway::trae::mask_api_key(&plaintext),
+    }))
+}
+
+async fn api_trae_gateway_logs() -> Response {
+    let state = crate::trae_gateway_host::shared_state();
+    json_ok(json!({ "logs": state.log.list() }))
+}
+
+async fn api_trae_clear_gateway_logs() -> Response {
+    let state = crate::trae_gateway_host::shared_state();
+    state.log.clear();
+    json_ok(json!({ "ok": true }))
+}
+
+// ---------------------------------------------------------------------------
 // 静态前端
 // ---------------------------------------------------------------------------
 
@@ -1737,9 +2338,9 @@ mod tests {
     //
     // 背景（真实事故）：`npm run build`（Vite base `/`，供 rust-embed / Tauri
     // `frontendDist` / `scripts/fix-app.sh` 使用）与 `npm run build:demo`
-    // （base `/workbuddy-switch/`，仅供 GitHub Pages）**曾共同输出到 `dist/`**。
+    // （base `/trae-workbuddy-switch/`，仅供 GitHub Pages）**曾共同输出到 `dist/`**。
     // 若编译期 `dist/` 恰好是演示构建，`index.html` 会请求
-    // `/workbuddy-switch/assets/index-*.js`——该前缀在 embed 里不存在 →
+    // `/trae-workbuddy-switch/assets/index-*.js`——该前缀在 embed 里不存在 →
     // `static_handler` 回退成 HTML → 浏览器模块脚本 MIME 校验失败：
     //   Failed to load module script: Expected a JavaScript-or-Wasm module script
     //   but the server responded with a MIME type of "text/html".
@@ -1803,7 +2404,7 @@ mod tests {
             assert!(
                 Assets::get(key).is_some(),
                 "dist/index.html references `{reference}` which is NOT embedded. \
-                 `dist/` most likely holds a **demo** build (Vite base `/workbuddy-switch/`). \
+                 `dist/` most likely holds a **demo** build (Vite base `/trae-workbuddy-switch/`). \
                  Run `npm run build` (NOT `npm run build:demo`) before compiling the server / Tauri app. \
                  Embedded paths: {:?}",
                 Assets::iter().collect::<Vec<_>>()
@@ -2177,5 +2778,47 @@ mod tests {
             account_ids(&emptied).is_empty(),
             "删除后 Global 库应为空：{emptied}"
         );
+    }
+}
+
+/// `parse_trae_variant` 的回归护栏。
+///
+/// 覆盖：合法值、大小写与空白、**未知值回落默认**（且不 panic）。
+/// 与 `src-tauri/src/commands.rs` 的同名单测**互为镜像**，
+/// 两处实现必须保持一致（见 [`parse_trae_variant`] 的文档注释）。
+#[cfg(test)]
+mod parse_trae_variant_tests {
+    use super::parse_trae_variant;
+    use buddy_switch_core::modules::trae::variant::TraeVariant;
+
+    #[test]
+    fn parses_known_canonical_values() {
+        assert_eq!(
+            parse_trae_variant(Some("trae_work")),
+            TraeVariant::TraeWork
+        );
+        assert_eq!(parse_trae_variant(Some("trae_cn")), TraeVariant::TraeCn);
+    }
+
+    #[test]
+    fn parses_case_and_whitespace_insensitively() {
+        // `TraeVariant::parse` 内部会 `trim + to_ascii_lowercase`。
+        assert_eq!(
+            parse_trae_variant(Some("TRAE_WORK")),
+            TraeVariant::TraeWork
+        );
+        assert_eq!(parse_trae_variant(Some(" Trae CN ")), TraeVariant::TraeCn);
+    }
+
+    #[test]
+    fn unknown_or_empty_falls_back_to_default() {
+        // 未知值 / 空串 / 纯空白 / 缺省，都应回落到 `TraeVariant::default()`。
+        // 断言「不 panic」本身就是这组输入的主要价值：钉死「未知值不报错」，
+        // 防止未来有人把它改成 `parse(...).unwrap()`。
+        let default = TraeVariant::default();
+        assert_eq!(parse_trae_variant(Some("trae_bogus")), default);
+        assert_eq!(parse_trae_variant(Some("")), default);
+        assert_eq!(parse_trae_variant(Some("   ")), default);
+        assert_eq!(parse_trae_variant(None), default);
     }
 }

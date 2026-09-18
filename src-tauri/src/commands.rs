@@ -10,16 +10,33 @@ use std::sync::Mutex;
 use tauri::{Emitter, Manager};
 use buddy_switch_core::modules::{
     account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, credit_usage, credits, export_import, migrate,
-    oauth, process, refresh, region::Region, region::RegionFilter, rotate, session, switch, token_stats, travel,
+    oauth, process, refresh, region::Region, region::RegionFilter, rotate, session, switch, token_stats, trae, travel,
     update,
 };
 use buddy_switch_gateway::{AccountStrategy, GatewayConfig, GatewayStatusView};
 
 use crate::gateway;
+use crate::trae_gateway;
 
 /// 解析 region 参数，缺省为 `cn`（保证旧行为）。
 fn parse_region(value: Option<&str>) -> Region {
     value.and_then(Region::parse).unwrap_or(Region::Cn)
+}
+
+/// 解析 Trae 产品线变体参数，缺省为 [`trae::variant::TraeVariant::default`]（保证旧行为）。
+///
+/// 与 [`parse_region`] 同风格：**缺失即回落到默认**，不做「未知值报错」——
+/// 前端老版本不带该参数、或用户从探测结果里传回目录名（如 `TRAE SOLO CN`），
+/// 都应被宽容接受；无法解析时等价于未传。
+///
+/// ⚠️ **本函数在 `crates/buddy-switch-server/src/api.rs` 有一份同款实现，
+/// 两处必须保持一致**（同样的「缺失/未知 → `default()`」语义）。不要为了去重
+/// 跨 crate 抽公共函数——server 与 tauri 是两个独立 crate，为这 4 行引入共享依赖
+/// 不值得。两处各自带 `parse_trae_variant_*` 单测（含未知值回落护栏）钉住行为。
+fn parse_trae_variant(value: Option<&str>) -> trae::variant::TraeVariant {
+    value
+        .and_then(trae::variant::TraeVariant::parse)
+        .unwrap_or_default()
 }
 
 /// 解析统计查询范围参数，缺省为 `cn`（保证旧行为）；额外支持 `"all"` 合并视图。
@@ -780,6 +797,48 @@ mod relaunch_tests {
     }
 }
 
+/// `parse_trae_variant` 的回归护栏。
+///
+/// 覆盖：合法值、大小写与空白、**未知值回落默认**（且不 panic）。
+/// 与 `crates/buddy-switch-server/src/api.rs` 的同名单测**互为镜像**，
+/// 两处实现必须保持一致（见 [`parse_trae_variant`] 的文档注释）。
+#[cfg(test)]
+mod parse_trae_variant_tests {
+    use super::parse_trae_variant;
+    use buddy_switch_core::modules::trae::variant::TraeVariant;
+
+    #[test]
+    fn parses_known_canonical_values() {
+        assert_eq!(
+            parse_trae_variant(Some("trae_work")),
+            TraeVariant::TraeWork
+        );
+        assert_eq!(parse_trae_variant(Some("trae_cn")), TraeVariant::TraeCn);
+    }
+
+    #[test]
+    fn parses_case_and_whitespace_insensitively() {
+        // `TraeVariant::parse` 内部会 `trim + to_ascii_lowercase`。
+        assert_eq!(
+            parse_trae_variant(Some("TRAE_WORK")),
+            TraeVariant::TraeWork
+        );
+        assert_eq!(parse_trae_variant(Some(" Trae CN ")), TraeVariant::TraeCn);
+    }
+
+    #[test]
+    fn unknown_or_empty_falls_back_to_default() {
+        // 未知值 / 空串 / 纯空白 / 缺省，都应回落到 `TraeVariant::default()`。
+        // 断言「不 panic」本身就是这组输入的主要价值：钉死「未知值不报错」，
+        // 防止未来有人把它改成 `parse(...).unwrap()`。
+        let default = TraeVariant::default();
+        assert_eq!(parse_trae_variant(Some("trae_bogus")), default);
+        assert_eq!(parse_trae_variant(Some("")), default);
+        assert_eq!(parse_trae_variant(Some("   ")), default);
+        assert_eq!(parse_trae_variant(None), default);
+    }
+}
+
 /// POST /api/launch-at-login —— 注册 / 移除系统开机自启，并回读权威状态。
 ///
 /// 回读结果与请求值不一致时按失败处理并返回当前真实状态，避免假装设置成功。
@@ -971,6 +1030,453 @@ pub fn get_gateway_logs() -> Value {
 #[tauri::command]
 pub fn clear_gateway_logs() -> Value {
     let state = gateway::shared_state();
+    state.log.clear();
+    json!({ "ok": true })
+}
+
+// ===========================================================================
+// Trae 模块命令
+// ===========================================================================
+//
+// 与 `buddy-switch-server::api::api.rs` 的 `/api/trae/*` 路由**一一对应**，
+// 返回形状由 `buddy_switch_core::modules::trae::handlers` 单点保证，
+// 本层只负责「解析参数 → 调 handlers → 返回 Value」。
+//
+// 文件 IO / 子进程类操作一律走 `spawn_blocking`：Tauri 的异步命令运行在共享
+// 运行时上，在其中做同步磁盘遍历（快照目录递归统计、9 类文件复制）会阻塞
+// 同一个运行时上的其他命令与事件派发。`core` 侧的 `get_status` 已有同样的处理。
+
+/// GET /api/trae/env —— Trae 客户端安装/运行/数据目录状态。
+///
+/// **单一视角**：返回自动探测挑中的那一条产品线（`variant` / `variantLabel`）。
+/// 界面要**并排**显示两条产品线时用 [`get_trae_variants`]。
+#[tauri::command]
+pub fn get_trae_env() -> Value {
+    trae::platform::env_status()
+}
+
+/// GET /api/trae/variants —— **全部** Trae 产品线的独立环境状态（数组）。
+///
+/// 与 [`get_trae_env`] 的分工：`env` 回答"自动挑中的是哪一条"（用于"当前在操作哪条线"
+/// 的页面标题、诊断文案），本命令回答"每条各自是什么状态"（用于并排渲染多个图标，
+/// 对齐 WorkBuddy 右上角三个独立产品图标）。
+///
+/// 返回 `{ platform, variants: [...] }`，每个元素自带
+/// `variant` / `variantLabel` / `installed` / `running` / `version` / `path` /
+/// `dataDir` / `dataDirExists`，前端直接遍历即可。
+#[tauri::command]
+pub fn get_trae_variants() -> Value {
+    trae::platform::variants_status()
+}
+
+/// GET /api/trae/capabilities —— 当前平台的能力与受限项说明。
+#[tauri::command]
+pub fn get_trae_capabilities() -> Value {
+    trae::platform::capabilities()
+}
+
+/// GET /api/trae/accounts —— 账号 + 分组 + 计数。
+///
+/// `variant` 可选（`"trae_work"` / `"trae_cn"`）：决定读哪个账号库。缺失回落默认变体，
+/// 保证老调用点行为不变。
+#[tauri::command]
+pub fn get_trae_accounts(variant: Option<String>) -> Value {
+    trae::handlers::accounts_overview_for(parse_trae_variant(variant.as_deref()))
+}
+
+/// GET /api/trae/checkin/status —— 最近一次签到摘要与冷却明细。
+#[tauri::command]
+pub fn get_trae_checkin_status(variant: Option<String>) -> Value {
+    trae::handlers::checkin_status_for(parse_trae_variant(variant.as_deref()))
+}
+
+/// GET /api/trae/credits —— 剩余积分、明细、每日趋势。
+#[tauri::command]
+pub fn get_trae_credits(variant: Option<String>) -> Value {
+    trae::handlers::credits_overview_for(parse_trae_variant(variant.as_deref()))
+}
+
+/// GET /api/trae/token-stats —— Token 统计（聚合本机网关请求日志）。
+///
+/// `days` 为统计窗口天数；`None` / `<= 0` 表示全部历史。
+#[tauri::command]
+pub fn get_trae_token_statistics(days: Option<i64>) -> Value {
+    trae::handlers::token_statistics(days)
+}
+
+/// GET /api/trae/logs —— 运行日志（系统日志页的「运行日志」标签页）。
+///
+/// `kind` 取 `app` / `checkin` / `switch`（缺省或 `all` 表示不限）；
+/// `date` 为 `YYYY-MM-DD`；`keyword` 大小写不敏感；`limit` 缺省 500、上限 2000；
+/// `variant` 决定读哪条产品线的 `checkin` / `switcher` 日志（`app.log` 共用）。
+///
+/// 入参在这里组装成 JSON 再交给 [`trae::handlers::logs`]：过滤逻辑只实现一份，
+/// 两条通道共用（历史上两边各写一遍导致过响应形状漂移）。
+#[tauri::command(rename_all = "camelCase")]
+pub fn get_trae_logs(
+    kind: Option<String>,
+    date: Option<String>,
+    keyword: Option<String>,
+    limit: Option<u64>,
+    variant: Option<String>,
+) -> Value {
+    trae::handlers::logs(&serde_json::json!({
+        "kind": kind,
+        "date": date,
+        "keyword": keyword,
+        "limit": limit,
+        "variant": variant,
+    }))
+}
+
+/// GET /api/trae/profiles —— 登录态快照总览。
+#[tauri::command]
+pub async fn get_trae_profiles(variant: Option<String>) -> Result<Value, String> {
+    let variant = parse_trae_variant(variant.as_deref());
+    tauri::async_runtime::spawn_blocking(move || trae::profile::overview_for(variant))
+        .await
+        .map_err(|error| format!("读取快照失败: {error}"))
+}
+
+/// GET /api/trae/settings —— Trae 模块设置。
+#[tauri::command]
+pub fn get_trae_settings() -> Value {
+    serde_json::to_value(trae::settings::load()).unwrap_or(Value::Null)
+}
+
+/// POST /api/trae/settings —— 局部更新 Trae 模块设置。
+#[tauri::command]
+pub fn save_trae_settings(patch: Value) -> Result<Value, String> {
+    trae::handlers::save_settings(patch)
+}
+
+/// POST /api/trae/accounts/add —— 手动添加账号（粘贴 JWT）。
+#[tauri::command(rename_all = "camelCase")]
+pub fn trae_add_account(
+    name: String,
+    jwt: String,
+    group_id: Option<String>,
+    variant: Option<String>,
+) -> Result<Value, String> {
+    let variant = parse_trae_variant(variant.as_deref());
+    trae::handlers::add_account_for(variant, &name, &jwt, group_id.as_deref())
+}
+
+/// POST /api/trae/accounts/update —— 改名 / 换 JWT。
+#[tauri::command(rename_all = "camelCase")]
+pub fn trae_update_account(
+    user_id: String,
+    name: Option<String>,
+    jwt: Option<String>,
+    variant: Option<String>,
+) -> Result<Value, String> {
+    let variant = parse_trae_variant(variant.as_deref());
+    trae::handlers::update_account_for(variant, &user_id, name.as_deref(), jwt.as_deref())
+}
+
+/// POST /api/trae/accounts/delete —— 删除账号（可选一并删除登录态快照）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn trae_delete_account(
+    user_id: String,
+    delete_profile: Option<bool>,
+    variant: Option<String>,
+) -> Result<Value, String> {
+    let delete_profile = delete_profile.unwrap_or(false);
+    let variant = parse_trae_variant(variant.as_deref());
+    tauri::async_runtime::spawn_blocking(move || {
+        trae::handlers::delete_account_for(variant, &user_id, delete_profile)
+    })
+    .await
+    .map_err(|error| format!("删除账号失败: {error}"))?
+}
+
+/// POST /api/trae/accounts/import-local —— 从 Trae 客户端登录态导入当前账号。
+///
+/// `variant` 为可选产品线（`"trae_work"` / `"trae_cn"`，也接受 `TRAE SOLO CN`
+/// 之类的目录名）：决定读哪条产品线的 userData。**缺失时回落默认变体**，
+/// 保证老调用点行为不变。命令名不变，仅新增参数。
+#[tauri::command]
+pub async fn trae_import_local_account(variant: Option<String>) -> Result<Value, String> {
+    let variant = parse_trae_variant(variant.as_deref());
+    tauri::async_runtime::spawn_blocking(move || trae::handlers::import_local_account_for(variant))
+        .await
+        .map_err(|error| format!("导入本机账号失败: {error}"))?
+}
+
+/// POST /api/trae/oauth/start —— 发起 Trae OAuth 登录（开本地回调监听）。
+///
+/// 与 WorkBuddy 侧 `oauth_start` 的区别：本命令**不带 region**，带的是 `variant`。
+/// Trae 两条产品线共用一套上游，但账号库、设备身份与会话归属都按变体分家
+/// （见 `modules::trae` 的模块头注释），所以 `variant` 不是假参数。
+///
+/// `variant` 可选：缺失 / 无法识别回落默认变体，保证老调用点行为不变。
+/// 命令名不变，仅新增参数。
+#[tauri::command]
+pub async fn trae_oauth_start(variant: Option<String>) -> Result<Value, String> {
+    trae::handlers::oauth_login_start_for(parse_trae_variant(variant.as_deref())).await
+}
+
+/// POST /api/trae/oauth/status —— 轮询登录结果。
+///
+/// 与 WorkBuddy 侧 `oauth_status` 的区别：本命令**不带 region**。
+/// 变体也不需要传：会话自己记着它（`loginId` 是唯一入口），
+/// 后端据此从正确的账号库取列表。
+#[tauri::command(rename_all = "camelCase")]
+pub fn trae_oauth_status(login_id: String) -> Value {
+    trae::handlers::oauth_login_status(&login_id)
+}
+
+/// POST /api/trae/oauth/cancel —— 取消登录，释放监听端口。
+#[tauri::command(rename_all = "camelCase")]
+pub fn trae_oauth_cancel(login_id: String) -> Value {
+    trae::handlers::oauth_login_cancel(&login_id)
+}
+
+/// POST /api/trae/accounts/export —— 按 userId 列表导出完整记录（含 JWT）。
+#[tauri::command(rename_all = "camelCase")]
+pub fn trae_export_accounts(user_ids: Vec<String>, variant: Option<String>) -> Result<Value, String> {
+    trae::handlers::export_accounts_for(parse_trae_variant(variant.as_deref()), &user_ids)
+}
+
+/// POST /api/trae/accounts/export-to-path —— 写入用户选择的路径，返回落地路径。
+#[tauri::command(rename_all = "camelCase")]
+pub fn trae_export_accounts_to_path(
+    user_ids: Vec<String>,
+    path: String,
+    variant: Option<String>,
+) -> Result<Value, String> {
+    trae::handlers::export_accounts_to_path_for(parse_trae_variant(variant.as_deref()), &user_ids, &path)
+}
+
+/// POST /api/trae/accounts/import/preview —— 解析导入文件并回传脱敏预览。
+#[tauri::command(rename_all = "camelCase")]
+pub fn trae_preview_import_accounts(file_text: String) -> Result<Value, String> {
+    trae::handlers::preview_import_file(&file_text)
+}
+
+/// POST /api/trae/accounts/import —— 按选中索引导入，返回计数与最新账号视图。
+#[tauri::command(rename_all = "camelCase")]
+pub fn trae_import_accounts(
+    file_text: String,
+    indexes: Vec<usize>,
+    variant: Option<String>,
+) -> Result<Value, String> {
+    trae::handlers::import_accounts_for(parse_trae_variant(variant.as_deref()), &file_text, &indexes)
+}
+
+/// POST /api/trae/groups —— 分组操作分发（create / update / delete / move）。
+#[tauri::command]
+pub fn trae_group_op(action: String, params: Value, variant: Option<String>) -> Result<Value, String> {
+    trae::handlers::group_op_for(parse_trae_variant(variant.as_deref()), &action, &params)
+}
+
+/// POST /api/trae/checkin —— 批量签到（进度经 `trae-checkin-progress` 事件推送）。
+///
+/// 变体从 `options.variant` 解析（同一份入参契约，见
+/// [`trae::handlers::parse_checkin_options`]），因此本命令无需单独的 `variant` 参数。
+#[tauri::command]
+pub async fn trae_checkin(app: tauri::AppHandle, options: Option<Value>) -> Result<Value, String> {
+    let options = options.unwrap_or_else(|| json!({}));
+    let parsed = trae::handlers::parse_checkin_options(&options)?;
+    let report = trae::checkin::run_checkin(parsed, move |event| {
+        // 事件名带 `trae-` 前缀：与 WorkBuddy 侧的 `checkin-progress` 区分，
+        // 否则 Trae 的进度会被 WorkBuddy 页面消费掉。
+        let _ = app.emit("trae-checkin-progress", event.clone());
+    })
+    .await;
+    Ok(trae::checkin::report_json(&report))
+}
+
+/// POST /api/trae/credits/refresh —— 刷新剩余积分（单个或全部）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn trae_refresh_credits(
+    user_id: Option<String>,
+    variant: Option<String>,
+) -> Result<Value, String> {
+    let variant = parse_trae_variant(variant.as_deref());
+    trae::handlers::refresh_credits_for(variant, user_id.as_deref()).await
+}
+
+/// POST /api/trae/refresh-jwt —— 用 refresh_token 换新 JWT。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn trae_refresh_jwt(user_id: String, variant: Option<String>) -> Result<Value, String> {
+    let variant = parse_trae_variant(variant.as_deref());
+    trae::handlers::refresh_jwt_for(variant, &user_id).await
+}
+
+/// POST /api/trae/cooldown/clear —— 清除冷却（单个或全部）。
+#[tauri::command(rename_all = "camelCase")]
+pub fn trae_clear_cooldown(user_id: Option<String>, variant: Option<String>) -> Result<Value, String> {
+    let variant = parse_trae_variant(variant.as_deref());
+    trae::handlers::clear_cooldown_for(variant, user_id.as_deref())
+}
+
+/// 进度事件名（前端订阅用，集中定义避免拼写漂移）。
+const TRAE_SWITCH_PROGRESS_EVENT: &str = "trae-switch-progress";
+
+/// POST /api/trae/switch —— 切换账号（含「先保存当前」的兜底）。
+///
+/// 用 `spawn_blocking`：整个过程串行做 9 类文件的递归复制 + 进程终止/启动，
+/// 放在异步运行时上会阻塞事件循环，导致进度事件无法及时送达前端。
+#[tauri::command]
+pub async fn trae_switch_account(app: tauri::AppHandle, options: Value) -> Result<Value, String> {
+    let options = trae::handlers::parse_switch_options(&options)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let outcome = trae::profile::switch_account(&options, |step| {
+            let _ = app.emit(TRAE_SWITCH_PROGRESS_EVENT, step.to_json());
+        });
+        outcome.to_json()
+    })
+    .await
+    .map_err(|error| format!("切换账号失败: {error}"))
+}
+
+/// POST /api/trae/login/save —— 保存当前登录态到指定账号槽位。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn trae_save_login(
+    user_id: String,
+    variant: Option<String>,
+) -> Result<Value, String> {
+    let variant = parse_trae_variant(variant.as_deref());
+    tauri::async_runtime::spawn_blocking(move || trae::handlers::save_login_for(variant, &user_id))
+        .await
+        .map_err(|error| format!("保存登录态失败: {error}"))?
+}
+
+/// POST /api/trae/profiles/backup —— 备份当前登录态到槽位。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn trae_backup_profile(
+    user_id: String,
+    variant: Option<String>,
+) -> Result<Value, String> {
+    let variant = parse_trae_variant(variant.as_deref());
+    tauri::async_runtime::spawn_blocking(move || trae::handlers::backup_profile_for(variant, &user_id))
+        .await
+        .map_err(|error| format!("备份失败: {error}"))?
+}
+
+/// POST /api/trae/profiles/restore —— 用槽位快照覆盖客户端登录态（高级操作）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn trae_restore_profile(
+    user_id: String,
+    variant: Option<String>,
+) -> Result<Value, String> {
+    let variant = parse_trae_variant(variant.as_deref());
+    tauri::async_runtime::spawn_blocking(move || trae::handlers::restore_profile_for(variant, &user_id))
+        .await
+        .map_err(|error| format!("恢复失败: {error}"))?
+}
+
+/// POST /api/trae/profiles/delete —— 删除登录态快照。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn trae_delete_profile(slot: String, variant: Option<String>) -> Result<Value, String> {
+    let variant = parse_trae_variant(variant.as_deref());
+    tauri::async_runtime::spawn_blocking(move || trae::handlers::delete_profile_for(variant, &slot))
+        .await
+        .map_err(|error| format!("删除快照失败: {error}"))?
+}
+
+/// POST /api/trae/device/reset —— 重置 6 层设备标识。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn trae_reset_device(variant: Option<String>) -> Result<Value, String> {
+    let variant = parse_trae_variant(variant.as_deref());
+    tauri::async_runtime::spawn_blocking(move || trae::handlers::reset_device_for(variant))
+        .await
+        .map_err(|error| format!("重置设备标识失败: {error}"))?
+}
+
+// ---------------------------------------------------------------------------
+// Trae API 网关（管理面）
+// ---------------------------------------------------------------------------
+//
+// 与 WorkBuddy 网关的管理命令**形状对齐**（get config / save config / status /
+// models / logs / clear logs），少一套多 Key 管理：Trae 侧只需要「一把钥匙」，
+// 它存在 `TraeSettings::apiKey`，由 `ensure_api_key()` 自动生成。
+
+/// GET /api/trae/gateway/config —— Trae 网关配置。
+#[tauri::command]
+pub fn get_trae_gateway_config() -> Value {
+    serde_json::to_value(buddy_switch_gateway::trae::TraeGatewayConfig::load())
+        .unwrap_or(Value::Null)
+}
+
+/// POST /api/trae/gateway/config —— 保存配置并应用（启动/重启独立监听）。
+///
+/// 注意 `max_body_mb` 是**构造期**固化进 axum `DefaultBodyLimit` 的（与 WorkBuddy
+/// 网关同理），改它要等下一次 `apply()`——而 `apply()` 每次都会重建监听，所以只要
+/// 走本命令保存就一定生效。
+#[tauri::command]
+pub async fn save_trae_gateway_config(
+    app: tauri::AppHandle,
+    config: Value,
+) -> Result<Value, String> {
+    let submitted = config.get("config").cloned().unwrap_or(config);
+    let parsed: buddy_switch_gateway::trae::TraeGatewayConfig =
+        serde_json::from_value(submitted).map_err(|error| format!("配置格式错误: {error}"))?;
+    parsed.save()?;
+
+    let state = trae_gateway::shared_state();
+    *state.config.write().await = parsed.clone();
+    state.log.set_keep(parsed.log_keep);
+    state.log.set_log_bodies(parsed.log_bodies);
+
+    let runtime = app.state::<trae_gateway::TraeGatewayRuntime>();
+    let addr = runtime.apply().await?;
+    Ok(json!({
+        "ok": true,
+        "config": parsed,
+        "running": addr.is_some(),
+        "addr": addr,
+    }))
+}
+
+/// GET /api/trae/gateway/status —— 运行状态 + 账号池摘要 + 账号明细 + 诊断。
+#[tauri::command]
+pub async fn trae_gateway_status(app: tauri::AppHandle) -> Value {
+    let (running, addr) = {
+        let runtime = app.state::<trae_gateway::TraeGatewayRuntime>();
+        (runtime.is_running(), runtime.addr())
+    };
+    buddy_switch_gateway::trae::status_view(
+        &trae_gateway::shared_state(),
+        running,
+        addr,
+        update::APP_VERSION,
+    )
+    .await
+}
+
+/// GET /api/trae/gateway/models —— 对外暴露的模型清单（静态）。
+#[tauri::command]
+pub fn get_trae_gateway_models() -> Value {
+    buddy_switch_gateway::trae::payload::models_response()
+}
+
+/// POST /api/trae/gateway/key/regenerate —— 重新生成 API Key（返回一次性明文）。
+#[tauri::command]
+pub async fn regenerate_trae_api_key() -> Result<Value, String> {
+    let plaintext = buddy_switch_gateway::trae::regenerate_api_key()?;
+    // 共享状态里缓存的是旧 Key，必须同步，否则旧 Key 在进程存活期内仍然可用（真事故）。
+    let state = trae_gateway::shared_state();
+    *state.api_key.write().await = plaintext.clone();
+    Ok(json!({
+        "ok": true,
+        "key": plaintext,
+        "prefix": buddy_switch_gateway::trae::mask_api_key(&plaintext),
+    }))
+}
+
+/// GET /api/trae/gateway/logs —— 最近 N 条请求日志（元数据）。
+#[tauri::command]
+pub fn get_trae_gateway_logs() -> Value {
+    let state = trae_gateway::shared_state();
+    json!({ "logs": state.log.list() })
+}
+
+/// POST /api/trae/gateway/logs/clear —— 清空日志。
+#[tauri::command]
+pub fn clear_trae_gateway_logs() -> Value {
+    let state = trae_gateway::shared_state();
     state.log.clear();
     json!({ "ok": true })
 }

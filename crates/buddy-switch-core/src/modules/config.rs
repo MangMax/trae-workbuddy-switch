@@ -143,6 +143,78 @@ fn home_dir_override() -> Option<PathBuf> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 测试专用：进程级 home 覆盖的串行化
+// ---------------------------------------------------------------------------
+
+/// 单元测试共用的「进程级 home 覆盖」互斥锁。
+///
+/// ## 为什么必须有
+///
+/// [`BUDDY_SWITCH_HOME_ENV`] 是**进程级全局状态**，而 lib 单元测试**全在同一个进程里
+/// 并行跑**（集成测试每个文件各自起进程，不受此影响 —— 那侧用 `tests/*.rs` 里各自的
+/// `ENV_LOCK`）。任何一处 `set_var` 都可能被并发读取的测试观察到，症状是
+/// **自相矛盾的断言**：例如 `paths.rs` 里
+/// `assert_eq!(credits_history_file().parent(), Some(trae_dir().as_path()))` 会在
+/// 两次调用之间被改掉 home，于是左边是临时目录、右边是真实目录，报出一个
+/// 「同一个函数族内部不一致」的假失败。
+///
+/// 因此：**凡是要改它、或断言结果依赖它的测试，都必须先取这把锁**。
+/// 改值请用 [`HomeOverrideGuard`]，它会在 drop 时恢复原值（含 panic 路径），
+/// 避免把临时 home 泄漏给后续测试。
+#[cfg(test)]
+pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 把 home 覆盖指向某个目录，并在 drop 时**恢复原值**（两个变量名都恢复）。
+///
+/// 只改不还原是这里最容易犯的错：`set_var` 到临时目录、结束时只删目录不删变量，
+/// 于是变量继续指向一个**已不存在的目录**，后续所有测试都吃一次
+/// 「已忽略：必须是一个已存在的目录」的警告并回落真实 home；
+/// 若测试 panic 导致目录没删掉，后续测试还会**静默**地把数据写进临时目录。
+#[cfg(test)]
+pub(crate) struct HomeOverrideGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    previous_new: Option<std::ffi::OsString>,
+    previous_legacy: Option<std::ffi::OsString>,
+}
+
+#[cfg(test)]
+impl HomeOverrideGuard {
+    /// 取锁并把 [`BUDDY_SWITCH_HOME_ENV`] 指向 `dir`（调用方需保证 `dir` 已存在，
+    /// 否则 [`validate_home_override`] 会忽略它）。
+    pub(crate) fn set(dir: &std::path::Path) -> Self {
+        let lock = env_lock();
+        let previous_new = std::env::var_os(BUDDY_SWITCH_HOME_ENV);
+        let previous_legacy = std::env::var_os(LEGACY_HOME_ENV);
+        // 旧变量名会让 `home_dir_override` 在其被忽略时顶上来，一并清掉，
+        // 保证「设置后一定是这个目录」。
+        std::env::remove_var(LEGACY_HOME_ENV);
+        std::env::set_var(BUDDY_SWITCH_HOME_ENV, dir);
+        Self {
+            _lock: lock,
+            previous_new,
+            previous_legacy,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for HomeOverrideGuard {
+    fn drop(&mut self) {
+        match self.previous_new.take() {
+            Some(value) => std::env::set_var(BUDDY_SWITCH_HOME_ENV, value),
+            None => std::env::remove_var(BUDDY_SWITCH_HOME_ENV),
+        }
+        match self.previous_legacy.take() {
+            Some(value) => std::env::set_var(LEGACY_HOME_ENV, value),
+            None => std::env::remove_var(LEGACY_HOME_ENV),
+        }
+    }
+}
+
 pub fn store_dir() -> PathBuf {
     let home = home_dir();
     let dir = home.join(".buddy-switch");
@@ -1222,8 +1294,15 @@ mod tests {
     ///
     /// CN 沿用 `workbuddy_exe.json`（保持兼容），Global 用 `workbuddy_exe.global.json`；
     /// 若两版共用一份，CN 的探测结果会覆盖国际版启动路径。
+    ///
+    /// 本用例断言的是**绝对路径**（`store_dir().join(..)`），而 `store_dir()` 依赖进程级
+    /// 的 `BUDDY_SWITCH_HOME`。若并发测试在中途改掉该变量，两次调用会读到**不同的 home**，
+    /// 报出「同一个函数族内部不一致」的假失败 —— 所以必须先取 env 锁
+    /// （同 `trae::paths::trae_files_do_not_collide_with_workbuddy_files`）。
     #[test]
     fn workbuddy_exe_cache_file_for_is_region_scoped() {
+        let _lock = env_lock();
+
         let cn = workbuddy_exe_cache_file_for(Region::Cn);
         let global = workbuddy_exe_cache_file_for(Region::Global);
 
@@ -1326,5 +1405,89 @@ mod tests {
         assert!(!not_dir.is_empty());
         assert_ne!(not_absolute, not_dir);
         assert_ne!(OverrideReject::NotAbsolute, OverrideReject::NotDir);
+    }
+
+    /// 旧数据目录 `.wb-switch` 的兼容回落必须成立（品牌化重命名的保命绳）。
+    ///
+    /// 场景：老用户升级后 `~/.buddy-switch` 尚不存在，而 `~/.wb-switch` 里有账号、
+    /// 密钥与缓存。此时 `store_dir()` **必须**继续返回旧目录——否则程序会去读一个
+    /// 空的新目录，表现为「升级后账号全部消失」（文件其实还在，只是读错了地方）。
+    ///
+    /// 用隔离的临时 home 验证，绝不触碰真实 `~/.buddy-switch` / `~/.wb-switch`。
+    ///
+    /// 注意：**不要**在这里再手动 `env_lock()`。`HomeOverrideGuard::set()` 内部已经
+    /// 取锁并把持到 drop，而 `env_lock()` 返回的是**非可重入**的 `MutexGuard`——
+    /// 重复取用会**自死锁**，且因为测试线程互相等待，会连带把其他同样需要该锁的
+    /// 测试（`trae::paths`、`trae::logs`）一起拖住，表现为整个测试进程挂死。
+    #[test]
+    fn store_dir_falls_back_to_legacy_when_new_absent() {
+        let home = std::env::temp_dir().join(format!(
+            "buddy-switch-legacy-store-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let new_dir = home.join(".buddy-switch");
+        let legacy_dir = home.join(".wb-switch");
+        std::fs::create_dir_all(&home).expect("create isolated home");
+
+        // 取锁 + 指向隔离 home，均由本 guard 负责（持锁至 drop）。
+        let _guard = HomeOverrideGuard::set(&home);
+
+        // 1) 两个目录都不存在 → 创建并返回新目录（全新安装）。
+        let fresh = store_dir();
+        assert_eq!(fresh, new_dir, "全新安装应使用新目录");
+
+        // 2) 仅旧目录存在 → 落到旧目录，既有的账号数据才不会「消失」。
+        std::fs::create_dir_all(&legacy_dir).expect("create legacy dir");
+        assert_eq!(
+            store_dir(),
+            legacy_dir,
+            "新目录不存在而旧目录存在时必须沿用旧目录"
+        );
+
+        // 3) 新目录也存在 → 新目录优先（用户已迁移完成的场景）。
+        std::fs::create_dir_all(&new_dir).expect("create new dir");
+        assert_eq!(store_dir(), new_dir, "两目录并存时新目录优先");
+
+        std::fs::remove_dir_all(&home).expect("cleanup isolated home");
+    }
+
+    /// `BUDDY_SWITCH_HOME` 覆盖优先级：新变量名 > 旧变量名 `WB_SWITCH_HOME`。
+    ///
+    /// 两者同时设置时必须以新变量为准；只看旧变量会让已迁移的用户被指回旧路径。
+    #[test]
+    fn buddy_switch_home_env_wins_over_legacy_env() {
+        let _lock = env_lock();
+        let base = std::env::temp_dir().join(format!(
+            "buddy-switch-home-priority-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let new_home = base.join("new-home");
+        let legacy_home = base.join("legacy-home");
+        std::fs::create_dir_all(&new_home).expect("create new home");
+        std::fs::create_dir_all(&legacy_home).expect("create legacy home");
+
+        // 先只设旧变量 → 生效（`HomeOverrideGuard::set` 只写新变量名，故这里手动
+        // 设旧变量名，验证兼容回退链本身仍然工作）。
+        let previous_legacy = std::env::var_os(LEGACY_HOME_ENV);
+        let previous_new = std::env::var_os(BUDDY_SWITCH_HOME_ENV);
+        std::env::remove_var(BUDDY_SWITCH_HOME_ENV);
+        std::env::set_var(LEGACY_HOME_ENV, legacy_home.as_os_str());
+        assert_eq!(home_dir(), legacy_home, "仅旧变量设置时应生效");
+
+        // 两个都设 → 新变量优先
+        std::env::set_var(BUDDY_SWITCH_HOME_ENV, new_home.as_os_str());
+        assert_eq!(home_dir(), new_home, "新变量名必须优先于旧变量名");
+
+        // 还原（含 panic 时靠测试进程结束兜底，但不依赖它）。
+        match previous_new {
+            Some(value) => std::env::set_var(BUDDY_SWITCH_HOME_ENV, value),
+            None => std::env::remove_var(BUDDY_SWITCH_HOME_ENV),
+        }
+        match previous_legacy {
+            Some(value) => std::env::set_var(LEGACY_HOME_ENV, value),
+            None => std::env::remove_var(LEGACY_HOME_ENV),
+        }
+
+        std::fs::remove_dir_all(&base).expect("cleanup");
     }
 }
