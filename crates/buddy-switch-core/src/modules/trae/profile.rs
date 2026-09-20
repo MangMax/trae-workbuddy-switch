@@ -397,6 +397,16 @@ pub fn import_local_login_for(variant: TraeVariant) -> Result<LocalLogin, String
 /// **上一账号仍然有效**的 token ⇒ **静默导入到另一个账号**。
 /// 所以判据必须是「**键**存在与否」这一个 bit，而不是「是否过期」——
 /// 「解不开」那一格同样可达、同样没有回落的正当性。
+///
+/// ## `Err` 的措辞约束（R6）
+///
+/// 本函数的 `Err` 会被**保存守卫**（[`ensure_save_target_matches_client`] 的出口②）
+/// **逐字透传**给用户，因此这里**不得**出现「另一个账号」这类措辞 —— 那是守卫
+/// **出口③**（读到登录态、但 uid 与目标不符）独有的语义。透传过来会让用户以为
+/// 「客户端登录着别的账号」，而真实原因是**这个目录里没有可用登录态**。
+/// 出口② 与出口③ 必须能靠文案区分开。
+///
+/// 约束落在**被约束的函数**上而不是只写在测试里：**测试是可以被改的**。
 fn local_login_from_dir(data_dir: &Path, variant: TraeVariant) -> Result<LocalLogin, String> {
     // 设备身份取**同一个目录**的；取不到即 `None`，**不**回落去别的目录 ——
     // 否则「凭据来自 A、设备身份来自 B」，正是本项目反复栽的不同源。
@@ -428,9 +438,15 @@ fn local_login_from_dir(data_dir: &Path, variant: TraeVariant) -> Result<LocalLo
     // 所以这里按「**键**存在与否」这一个 bit 收口，而不是按「是否过期」——
     // 「解不开」那一格同样可达，且语义上同样没有回落正当性。
     if storage_has_key(data_dir, icube::CLOUDIDE_KEY) {
+        // ⚠️ 文案**刻意中性**（R6）：本函数的 `Err` 会被保存守卫**逐字透传**给用户
+        // （见 `ensure_save_target_matches_client` 的出口②），而「客户端登录着另一个账号」
+        // 是守卫**出口③** 独有的语义。这里若写「为避免导入到另一个账号」，守卫消息里就会
+        // 出现只属于出口③ 的措辞，两条出口随之混淆。
+        // 「为什么不再回落明文」留在上面那段注释里 —— 注释给人看，文案给用户看。
+        // 保留「**找到了副本**」这个事实：它是与「该目录没有登录态」区分开的关键；
+        // 也不得只写「已过期」—— 解不开时那句话是错的。
         return Err(format!(
-            "在【{}】的数据目录（{}）里找到了 iCube 登录态副本，但它已过期或无法解密；\
-             为避免导入到另一个账号，这里**不再**回退到明文来源（客户端日志会跨账号留存）。\
+            "在【{}】的数据目录（{}）里找到了 iCube 登录态副本，但它已过期或无法解密。\
              请在 Trae 中重新登录后重试；或改用「OAuth 网页登录」——\
              它不依赖本地文件，且能获得可自动续期的凭据。",
             variant.display_name(),
@@ -1684,14 +1700,23 @@ pub(crate) fn ensure_save_target_matches_client(
         // 出口①：源目录不存在 ⇒ 放行，报错交给 `backup_to_slot_for`。
         return Ok(());
     };
-    let Ok((client_uid, _)) = extract_local_jwt_from_dir(&dir, variant) else {
-        // 出口②：目录在、但读不出登录态 ⇒ **拒绝**（文案必须与下面的出口③可区分，
-        // 这里没有 `client_uid` 这个值，绝不能复用「另一个账号」的措辞）。
-        return Err(format!(
-            "无法读取【{}】客户端当前的登录态，因此不能把一份**没有登录态**的快照存进【{user_id}】名下 —— \
-             那样之后切到该账号会变成未登录。请先在 Trae 客户端里登录后再保存，或改用「OAuth 网页登录」。",
-            variant.display_name()
-        ));
+    let (client_uid, _) = match extract_local_jwt_from_dir(&dir, variant) {
+        Ok(pair) => pair,
+        Err(reason) => {
+            // 出口②：目录在、但读不出登录态 ⇒ **拒绝**。
+            // **透传底层原因**（R6）：`extract_local_jwt_from_dir` 的 `Err` 至少有 5 种成因
+            // （没有 `storage.json` / 没有 cloudide 键 / 信封解不开 / 凭据已过期 / uid 解不出），
+            // 旧实现把它们**统一替换**成「没有登录态」—— 对「信封已过期」这类是**误归因**
+            // （我们确实读到了，只是过期了），而且丢掉了最可操作的那句「请重新登录」。
+            // 顺序**先后果、后原因**：先说清「这次保存会毁掉什么」，再给底层事实。
+            // 文案必须与出口③ 可区分：这里没有 `client_uid` 这个值，绝不能复用
+            // 「另一个账号」的措辞（该约束落在 `local_login_from_dir` 的 doc 上）。
+            return Err(format!(
+                "不能把【{}】客户端当前的登录态保存到【{user_id}】名下\
+                 （这份快照会缺少可用的登录态，之后切到该账号会变成未登录）。原因：{reason}",
+                variant.display_name()
+            ));
+        }
     };
     if client_uid == user_id {
         return Ok(());
@@ -3325,9 +3350,16 @@ mod tests {
 
         let error = save_current_login_for(variant, "1234567890123456")
             .expect_err("客户端没有登录态时必须拒绝，而不是把未登录态存进账号槽位");
+        // 断言**底层原因被透传**（R6）：`extract_local_jwt_from_dir` 的 `Err` 应原样出现在
+        // 守卫消息里（此处是 `diagnose_missing_credential` 的诊断）。旧断言找的是守卫
+        // 自己那句已被删除的「无法读取…」—— 那等于**奖励**「把底层原因丢掉」的实现。
         assert!(
-            error.contains("无法读取"),
-            "报错必须说清「读不到登录态」：{error}"
+            error.contains("找到可用的登录凭据"),
+            "报错必须透传底层原因（诊断），而不是换成守卫自己的一句笼统话：{error}"
+        );
+        assert!(
+            error.contains("不能把【"),
+            "报错必须带守卫出口② 的固定前缀：{error}"
         );
         assert!(
             !error.contains("另一个账号"),
@@ -3346,8 +3378,8 @@ mod tests {
     ///
     /// 与 [`save_refuses_when_the_client_has_no_login_state`] 成对：那条证明「目录在、读不到
     /// ⇒ 拒绝」，本条证明「目录不存在 ⇒ 放行」。若实现把「目录不存在」也改成拒绝，
-    /// 本用例会红（报错会变成守卫的「无法读取…」而不是 `backup_to_slot_for` 的
-    /// 「未找到 Trae 客户端数据目录…」）。
+    /// 本用例会红（报错会变成守卫出口② 的「不能把【…】…保存到…名下」，而不是
+    /// `backup_to_slot_for` 的「未找到 Trae 客户端数据目录…」）。
     #[cfg(windows)]
     #[test]
     fn save_guard_fails_open_only_when_the_source_dir_is_absent() {
@@ -3366,8 +3398,12 @@ mod tests {
             error.contains("未找到 Trae 客户端数据目录"),
             "报错必须来自 backup_to_slot_for（而不是守卫）：{error}"
         );
+        // ⚠️ 这是**代理断言**：它要证明的是「拦截不是守卫做的」，所以锚点必须是
+        // **守卫出口② 的固定前缀**（`不能把【`），而不是某句随时会被改写的文案。
+        // 旧锚点「无法读取」在 R6 把守卫文案换成「透传底层原因」之后会**永远为真**，
+        // 退化成一句装饰 —— 本轮的换锚点就是为它做的。
         assert!(
-            !error.contains("无法读取"),
+            !error.contains("不能把【"),
             "守卫不得在「源目录不存在」时拦截：{error}"
         );
     }

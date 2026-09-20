@@ -2251,6 +2251,129 @@ hLkrYGiVNhsErnjKIgS7/EIHdsihRANCAARznG0WLhenNiMW5jA3SwFpTNyet2zw\n\
         });
     }
 
+    /// 取 `source` 里每个 `callee(` 调用点的**顶层实参**（已 `trim`）。
+    ///
+    /// 只做括号配平（`()` / `[]` / `{}`），并跳过**注释行**（行首非空白以 `//` 开头）。
+    /// 不处理字符串字面量里的括号 —— 本项目在调用点不写这种实参；万一将来写了，
+    /// 本函数会**多切**，断言随之**报红**而不是静默放过（宁可吵，不可哑）。
+    fn call_arguments(source: &str, callee: &str) -> Vec<Vec<String>> {
+        let mut found = Vec::new();
+        let mut from = 0usize;
+        while let Some(rel) = source[from..].find(callee) {
+            let at = from + rel;
+            from = at + callee.len();
+
+            // 标识符边界：`xxx_exchange_token_for` 不算。
+            if let Some(prev) = source[..at].chars().next_back() {
+                if prev.is_alphanumeric() || prev == '_' {
+                    continue;
+                }
+            }
+            // 定义处（`… fn exchange_token_for(`）不算 —— 那是形参表，不是调用。
+            if source[..at].trim_end().ends_with("fn") {
+                continue;
+            }
+            // 注释行不算（docblock 里会引用签名，例如 `…(variant, refresh_token, device_id)`）。
+            let line_start = source[..at].rfind('\n').map_or(0, |index| index + 1);
+            if source[line_start..at].trim_start().starts_with("//") {
+                continue;
+            }
+            // 后面必须紧跟 `(`（允许空白）。
+            let tail = &source[at + callee.len()..];
+            let trimmed = tail.trim_start();
+            if !trimmed.starts_with('(') {
+                continue;
+            }
+            let open = at + callee.len() + (tail.len() - trimmed.len());
+
+            let mut depth = 0i32;
+            let mut args: Vec<String> = Vec::new();
+            let mut current = String::new();
+            for ch in source[open..].chars() {
+                match ch {
+                    '(' | '[' | '{' => {
+                        depth += 1;
+                        if depth > 1 {
+                            current.push(ch);
+                        }
+                    }
+                    ')' | ']' | '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                        current.push(ch);
+                    }
+                    ',' if depth == 1 => {
+                        args.push(current.trim().to_string());
+                        current.clear();
+                    }
+                    _ => current.push(ch),
+                }
+            }
+            args.push(current.trim().to_string());
+            found.push(args);
+        }
+        found
+    }
+
+    /// ★【T13-4 / A】`exchange_token_for` 的第三个实参**不得是硬编码 `None`**。
+    ///
+    /// ## 为什么需要这条：签名挡不住「主动放弃绑定」
+    ///
+    /// `exchange_token_for(variant, refresh_token, device_id)` 的签名只保证
+    /// 「**传了**第三个实参」，不保证「传的是**从绑定读出来的那个值**」。
+    /// 有人把调用点改成 `…, None)` ⇒ 编译过、`bound_device_id` 的用例照样绿、
+    /// 回落用例照样绿 ⇒ **绑定被静默忽略 → 退回猜活跃目录 → 上游 20403/20405**，
+    /// 而**没有任何测试会红**。这条断言就是补这个洞。
+    ///
+    /// ## 为什么是结构断言
+    ///
+    /// `refresh_jwt_for` 本体要发网络请求，跑不起来（同
+    /// `switch_passes_the_same_dir_to_restore_and_verification` 的理由）。
+    ///
+    /// ## 与 R1-4 那条的区别：**锚点不是名字**
+    ///
+    /// R1-4 锚定的是**一个业务函数体**（`switch_account`）与**一个局部变量名**
+    /// （`restore_dir`）—— 改名即失配。本条锚定的是**被调 API 的调用形态**：
+    /// 扫本文件里**所有** `exchange_token_for(…)` 调用点，逐个看第三个实参。
+    /// 于是「把这段逻辑挪进别的函数」「换个变量名」都不影响它；
+    /// 只有「改被调函数名 / 改参数个数」会让它失配 —— 而那两件事**必须**有人来看这里，
+    /// 所以「一个调用点都没找到」时本断言**报红**，绝不静默通过。
+    ///
+    /// ## 已知边界（耦合点登记）
+    ///
+    /// - 只扫 `account.rs`：`oauth.rs` 的兼容路径**刻意**传 `None`（那一刻账号绑定
+    ///   尚未落库，已裁定接受），不在范围内；
+    /// - 认的是**字面量** `None`：写成 `Option::<&str>::None`、或先 `let none = None;`
+    ///   再传变量，本断言抓不到 —— 但那已不是「顺手写个 `None`」，需要刻意绕；
+    /// - 依赖「注释行以 `//` 开头」来跳过 docblock 里的签名引用（本文件风格如此）。
+    ///
+    /// ## 反向验证
+    ///
+    /// 把调用点的第三实参改成字面量 `None` ⇒ 本用例必须报红。
+    #[test]
+    fn refresh_never_passes_a_hardcoded_none_device_id() {
+        let calls = call_arguments(include_str!("account.rs"), "exchange_token_for");
+        assert!(
+            !calls.is_empty(),
+            "一个 `exchange_token_for` 调用点都没找到 —— 要么被改名/加参数，要么调用点被搬走；\
+             两种情况都必须有人来复核本断言，故此处报红"
+        );
+        for args in &calls {
+            assert_eq!(
+                args.len(),
+                3,
+                "`exchange_token_for` 应当是 3 参调用，实际实参：{args:?}"
+            );
+            assert_ne!(
+                args[2], "None",
+                "第三个实参不得是硬编码 `None`：那会让账号绑定被静默忽略\
+                 （退回猜活跃目录 ⇒ 上游 20403/20405），且现有测试全都不会红"
+            );
+        }
+    }
+
     /// ★ refresh 的 URL 必须由**该变体的 `icube_base`** 拼成，与回调 `host` 无关。
     ///
     /// refresh 是**离线触发**（没有浏览器回调），根本没有 host 可传；

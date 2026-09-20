@@ -1210,6 +1210,12 @@ async fn perform_login(
         // 兼容路径（回调直接给 refreshToken）：此刻**还没有**账号绑定 ——
         // 绑定由下面 `login_with_exchanged_tokens_for` 在落库时写入。
         // 故这里传 `None`：`exchange_token_for` 会回落「当前目录的那一条」并留痕。
+        //
+        // ⚠️ 这个 `None` 是**必须**的，**不是漏改**（R6 裁定）：若改成
+        // `Some(&identity.device_id)`，当本机没有该 id 的 `icube-dc` 条目时，行为会从
+        // 「用当前目录的那一条」变成「**无设备凭证**」—— 即从「可能签错名」变成
+        // 「连签名都没有」，凭空新增一种失败模式。且那一刻绑定尚未落库，
+        // `Some` 拿不到任何比 `None` 更可信的东西。
         let exchanged = account::exchange_token_for(variant, refresh_token, None)
             .await
             .map_err(|error| account::refresh_error_message(&error))?;
