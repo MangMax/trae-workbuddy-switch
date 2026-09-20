@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "BuddySwitch",
-  "version": "2026.9.181729",
+  "version": "2026.9.201442",
   "identifier": "com.trae.workbuddy.switch.app",
   "build": {
     "beforeDevCommand": "npm run dev",
