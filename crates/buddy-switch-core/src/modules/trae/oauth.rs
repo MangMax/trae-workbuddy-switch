@@ -1207,7 +1207,10 @@ async fn perform_login(
         let exchanged = exchange_auth_code(variant, &host, auth_code, pkce_verifier, identity).await?;
         (exchanged.jwt, exchanged.refresh_token)
     } else if let Some(refresh_token) = callback.refresh_token.as_deref() {
-        let exchanged = account::exchange_token_for(variant, refresh_token)
+        // 兼容路径（回调直接给 refreshToken）：此刻**还没有**账号绑定 ——
+        // 绑定由下面 `login_with_exchanged_tokens_for` 在落库时写入。
+        // 故这里传 `None`：`exchange_token_for` 会回落「当前目录的那一条」并留痕。
+        let exchanged = account::exchange_token_for(variant, refresh_token, None)
             .await
             .map_err(|error| account::refresh_error_message(&error))?;
         // 上游没轮换就沿用回调给的那个（绝不写成 None：那会让刚登录的账号
@@ -1227,6 +1230,9 @@ async fn perform_login(
         jwt,
         refresh_token,
         callback.display_name.clone(),
+        // 登录时实际使用的那台设备（授权 URL 的 `device_id` / `DeviceInfo.DeviceID` /
+        // `x-device-id` 三方同源的那个值）⇒ 落成账号绑定，续期复用它签名。
+        Some(identity.device_id.as_str()),
     )?;
     let uid = account::resolve_user_id(&raw);
     // jwt 已经写进 `raw.jwt`（落盘源就是它），这里的解析只用于日志里的到期时间。
@@ -1976,6 +1982,7 @@ mod tests {
             make_jwt("work-user"),
             None,
             Some("Work".to_string()),
+            None,
         )
         .expect("Trae Work 账号应能落库");
         account::login_with_exchanged_tokens_for(
@@ -1983,6 +1990,7 @@ mod tests {
             make_jwt("cn-user"),
             None,
             Some("CN".to_string()),
+            None,
         )
         .expect("Trae CN 账号应能落库");
 

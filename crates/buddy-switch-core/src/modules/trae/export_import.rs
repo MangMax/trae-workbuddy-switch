@@ -437,4 +437,62 @@ mod tests {
         assert_eq!(preview["accounts"][0]["hasJwt"], json!(true));
         assert_eq!(preview["accounts"][0]["userId"], json!("u1"));
     }
+
+    /// ★【T13-4 ⑥ / I-1】导入一份 JSON **不得清空**本机的设备绑定。
+    ///
+    /// 这是 `AccountsFile.device_bindings`（G-b）能成立的**前提护栏**：
+    /// `import_accounts_for` 一旦字面重建 `AccountsFile { accounts: … }`，
+    /// 那个容器键就会被**静默清空** —— 用户只是导入一份 JSON，本机所有绑定消失，
+    /// 续期集体退回「猜活跃目录」，且没有任何报错。
+    ///
+    /// 它与 [`merge_import_records`] 的签名（只收 `&mut Vec<RawAccount>`）是两重保险：
+    /// 合并逻辑**结构上**碰不到容器键，而这条用例钉住**回存**那一步没把容器丢掉。
+    #[test]
+    fn import_accounts_keeps_device_bindings() {
+        let temp = std::env::temp_dir().join(format!(
+            "buddy-switch-trae-bindings-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&temp);
+        let _guard = crate::modules::config::HomeOverrideGuard::set(&temp);
+        let variant = TraeVariant::TraeWork;
+
+        // 先造两条绑定。
+        let mut file = account::load_accounts_for(variant);
+        file.accounts.push(raw("u1", "一号", "jwt-1"));
+        file.device_bindings.insert("u1".to_string(), "dev-1".to_string());
+        file.device_bindings.insert("u2".to_string(), "dev-2".to_string());
+        account::save_accounts_for(variant, &file).expect("造绑定");
+
+        // 导入一份**不含任何绑定字段**的 JSON。
+        let text = r#"[{ "UserID": "u9", "name": "新账号", "jwt": "jwt-9" }]"#;
+        let result = import_accounts_for(variant, text, &[0]).expect("导入应成功");
+        assert_eq!(result.imported, 1);
+
+        let after = account::load_accounts_for(variant);
+        assert_eq!(
+            after.device_bindings.len(),
+            2,
+            "导入后绑定**一条都不能少**，实际: {:?}",
+            after.device_bindings
+        );
+        assert_eq!(
+            after.device_bindings.get("u1").map(String::as_str),
+            Some("dev-1")
+        );
+        assert_eq!(
+            after.device_bindings.get("u2").map(String::as_str),
+            Some("dev-2")
+        );
+        // 导入本身仍然生效（否则「绑定没丢」可能只是因为整个导入都没做事）。
+        assert!(
+            after
+                .accounts
+                .iter()
+                .any(|account| account::resolve_user_id(account) == "u9"),
+            "导入的账号应在库里"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp);
+    }
 }

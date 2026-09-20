@@ -51,11 +51,53 @@ pub struct RawAccount {
     pub updated_at: Option<String>,
 }
 
-/// 账号库文件。
+/// 账号库文件（**G-b**：设备绑定放「文件容器」，不放账号记录）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AccountsFile {
     #[serde(default)]
     pub accounts: Vec<RawAccount>,
+    /// `uid → iCubeAuthInfo://icube-dc:<deviceId>` 内嵌的 `<deviceId>`。
+    ///
+    /// ## 为什么放在容器键而不是 `RawAccount.device_id`
+    ///
+    /// 它是**本机绑定**，不是账号的可携带属性：
+    /// 1. `export_accounts_for` 逐条 `serde_json::to_value(record)` ⇒ 放在记录里会被写进
+    ///    **给另一台机器导入**的导出文件，把本机 `deviceId` 泄漏出去；
+    /// 2. `merge_import_record` 的覆盖分支是 `*existing = replaced` ⇒ 放在记录里会被
+    ///    一份不含该字段的导入文件**静默抹掉**。
+    ///
+    /// 容器键两个问题都不存在：合并逻辑的签名只收 `&mut Vec<RawAccount>`，**结构上碰不到**它。
+    ///
+    /// ## 为什么需要它
+    ///
+    /// 续期（DeviceProof 签名）**必须**用「这个账号当初登录/导入时那台设备」的私钥。
+    /// 客户端换过设备、或本变体有多个候选 userData 目录时，「活跃目录里的那一条」
+    /// 未必是账号绑定的那台 —— 用错私钥会被服务端拒绝（20403/20405）。
+    ///
+    /// ## 三条不变式（改「uid ↔ 记录」对应关系的路径必须全部遵守）
+    ///
+    /// | # | 路径 | 规则 |
+    /// |:--|:--|:--|
+    /// | I-1 | [`crate::modules::trae::export_import::import_accounts_for`] | 回存**整个** `AccountsFile`，不得字面重建容器（否则清空全部绑定） |
+    /// | I-2 | [`delete_for`] | 删账号时一并 `remove(uid)` |
+    /// | I-3 | [`update_for`] | 换 JWT 导致 uid 变化时删**旧 uid** 的绑定；新 uid 留空 |
+    ///
+    /// 空表不落盘（`skip_serializing_if`）：不产生绑定时，账号库文件与改造前**逐字一致**，
+    /// 既有备份 / 参考实现的 `device_proxy.py` 读到的形状不变。
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub device_bindings: HashMap<String, String>,
+}
+
+/// 把 `uid` 绑定到某个 `device_id`（**只写不删**：`None` / 空串不改变既有绑定）。
+///
+/// 删除一律由三条不变式各自的调用点显式 `remove` —— 「`None` 该不该清掉旧绑定」
+/// 在不同路径上答案不同（I-3 要清、导入缺 `device_id` 时不该清），
+/// 由本函数统一猜会让其中一条悄悄变错。
+fn bind_device(file: &mut AccountsFile, uid: &str, device_id: Option<&str>) {
+    if let Some(device_id) = device_id.map(str::trim).filter(|value| !value.is_empty()) {
+        file.device_bindings
+            .insert(uid.to_string(), device_id.to_string());
+    }
 }
 
 /// 分组。
@@ -443,31 +485,51 @@ pub fn import_local() -> Result<RawAccount, String> {
 /// 变体影响**两件事**（两处都必须用它，缺一即串味）：
 /// 1. 读哪个 userData 目录（见 [`crate::modules::trae::profile::extract_local_jwt_for`]）；
 /// 2. 写进哪个账号库（见 [`paths::accounts_file_for`]）—— 两条产品线的账号库彼此独立。
+///
+/// 落库时同时写 `uid → device_id` 绑定（[`AccountsFile::device_bindings`]，**G-b**）：
+/// 导入读的是哪个目录，续期就该用**那个目录那台设备**的私钥签名 —— 客户端换过设备、
+/// 或本变体有多个候选目录时，「活跃目录里的那一条」未必是这台。
 pub fn import_local_for(variant: TraeVariant) -> Result<RawAccount, String> {
-    let (uid, jwt_value) = crate::modules::trae::profile::extract_local_jwt_for(variant)?;
+    // 用 `import_local_login_for` 而不是 `extract_local_jwt_for`：除了 uid 与凭据，
+    // 还需要它一并给出的 `device_id` —— 那是**同一个来源目录**里的设备身份，
+    // 续期要用它的私钥签名。分两次取会让「凭据来自 A、设备身份来自 B」。
+    let login = crate::modules::trae::profile::import_local_login_for(variant)?;
+    let uid = login.user_id;
+    let jwt_value = login.authorization;
+    let device_id = login.device_id;
+
     let mut accounts = load_accounts_for(variant);
     let now = store::now_iso();
-    if let Some(existing) = accounts
+
+    let record = match accounts
         .accounts
         .iter_mut()
         .find(|account| resolve_user_id(account) == uid)
     {
-        existing.jwt = jwt_value;
-        existing.user_id = Some(uid.clone());
-        existing.updated_at = Some(now);
-        let snapshot = existing.clone();
-        save_accounts_for(variant, &accounts)?;
-        return Ok(snapshot);
-    }
-    let record = RawAccount {
-        name: format!("账号{}", &uid[uid.len().saturating_sub(6)..]),
-        user_id: Some(uid.clone()),
-        jwt: jwt_value,
-        refresh_token: None,
-        added_at: Some(now.clone()),
-        updated_at: Some(now),
+        Some(existing) => {
+            existing.jwt = jwt_value;
+            existing.user_id = Some(uid.clone());
+            existing.updated_at = Some(now);
+            existing.clone()
+        }
+        None => {
+            let record = RawAccount {
+                name: format!("账号{}", &uid[uid.len().saturating_sub(6)..]),
+                user_id: Some(uid.clone()),
+                jwt: jwt_value,
+                refresh_token: None,
+                added_at: Some(now.clone()),
+                updated_at: Some(now),
+            };
+            accounts.accounts.push(record.clone());
+            record
+        }
     };
-    accounts.accounts.push(record.clone());
+
+    // 记录**这次导入用的是哪台设备**（`Some` 才写）。
+    // 取不到时**不动**既有绑定：宁可留旧值（下次续期仍可能对），也不要用一个空值把
+    // 「本来正确的绑定」清掉 —— 后者会让续期退回「猜活跃目录」，且用户无从察觉。
+    bind_device(&mut accounts, &uid, device_id.as_deref());
     save_accounts_for(variant, &accounts)?;
     Ok(record)
 }
@@ -484,6 +546,10 @@ pub fn delete(user_id: &str, delete_profile: bool) -> Result<(), String> {
 ///
 /// **删快照也必须限定变体**：两条产品线的快照根目录不同
 /// （见 [`paths::profiles_dir_for`]），否则会删到另一条产品线的快照。
+///
+/// **I-2**：删账号必须**一并删掉它的设备绑定**。否则 uid 被重新登录 / 复用时，
+/// 会拿**属于旧设备**的绑定去签名 ⇒ 续期被上游拒绝（20403/20405），
+/// 而用户看到的是「刚加的账号就是刷新不了」。
 pub fn delete_for(
     variant: TraeVariant,
     user_id: &str,
@@ -494,7 +560,10 @@ pub fn delete_for(
     accounts
         .accounts
         .retain(|account| resolve_user_id(account) != user_id);
-    if accounts.accounts.len() != before {
+    // 只删**这个** uid 的绑定：同一本账号库里其他 uid 的绑定不受影响。
+    let binding_removed = accounts.device_bindings.remove(user_id).is_some();
+    // 账号条数与绑定**任一**有变化就要回存：账号本就不存在、但绑定残留时也得清掉。
+    if accounts.accounts.len() != before || binding_removed {
         save_accounts_for(variant, &accounts)?;
     }
 
@@ -518,6 +587,10 @@ pub fn update(user_id: &str, name: Option<String>, raw_jwt: Option<String>) -> R
 }
 
 /// 更新账号（按变体分家）。
+///
+/// **I-3**：换 JWT 可能换掉账号主体（`:543-546` 同步改 uid），此时**旧 uid 的绑定必须删掉**
+/// —— 它属于**旧账号**，留着就是错配；新 uid **不搬**旧绑定（旧设备的私钥对新账号不适用），
+/// 留空后续期回落活跃目录并留痕。uid 未变则绑定原样保留。
 pub fn update_for(
     variant: TraeVariant,
     user_id: &str,
@@ -525,29 +598,38 @@ pub fn update_for(
     raw_jwt: Option<String>,
 ) -> Result<(), String> {
     let mut accounts = load_accounts_for(variant);
-    let account = accounts
-        .accounts
-        .iter_mut()
-        .find(|account| resolve_user_id(account) == user_id)
-        .ok_or("账号不存在")?;
+    let previous_uid = user_id.to_string();
+    let mut next_uid = previous_uid.clone();
+    {
+        let account = accounts
+            .accounts
+            .iter_mut()
+            .find(|account| resolve_user_id(account) == user_id)
+            .ok_or("账号不存在")?;
 
-    if let Some(name) = name {
-        let name = name.trim().to_string();
-        if !name.is_empty() {
-            account.name = name;
-        }
-    }
-    if let Some(raw_jwt) = raw_jwt {
-        let raw_jwt = raw_jwt.trim().to_string();
-        if !raw_jwt.is_empty() {
-            // JWT 可能换了账号：同步 uid，否则分组/积分/设备会错挂到旧 uid 上。
-            if let Some(uid) = jwt::user_id_of(&raw_jwt) {
-                account.user_id = Some(uid);
+        if let Some(name) = name {
+            let name = name.trim().to_string();
+            if !name.is_empty() {
+                account.name = name;
             }
-            account.jwt = raw_jwt;
         }
+        if let Some(raw_jwt) = raw_jwt {
+            let raw_jwt = raw_jwt.trim().to_string();
+            if !raw_jwt.is_empty() {
+                // JWT 可能换了账号：同步 uid，否则分组/积分/设备会错挂到旧 uid 上。
+                if let Some(uid) = jwt::user_id_of(&raw_jwt) {
+                    account.user_id = Some(uid.clone());
+                    next_uid = uid;
+                }
+                account.jwt = raw_jwt;
+            }
+        }
+        account.updated_at = Some(store::now_iso());
     }
-    account.updated_at = Some(store::now_iso());
+    // I-3：uid 变了 ⇒ 旧绑定属于旧账号，删除（**不**搬给新 uid）。
+    if next_uid != previous_uid {
+        accounts.device_bindings.remove(&previous_uid);
+    }
     save_accounts_for(variant, &accounts)
 }
 
@@ -892,6 +974,49 @@ fn build_refresh_variants(
     variants
 }
 
+/// 读某账号**绑定的**设备身份（[`refresh_jwt_for`] 的唯一取值点）。
+///
+/// 抽成具名函数而不是内联在 `refresh_jwt_for` 里：一是与 `snapshot_data_dir_for`
+/// 同一套「唯一取值点」写法，二是让「绑定读得到 / 读不到」这条**可单测**
+/// （`refresh_jwt_for` 本体要发网络请求，测不动）。
+/// 「读到的值确实被传下去」由签名保证：`exchange_token_for` 必须收第三个实参。
+fn bound_device_id(variant: TraeVariant, user_id: &str) -> Option<String> {
+    load_accounts_for(variant)
+        .device_bindings
+        .get(user_id)
+        .cloned()
+}
+
+/// 解析本次续期要用的**设备凭证**（**同源优先**，[`exchange_token_for`] 的唯一取值点）。
+///
+/// - `Some(id)` ⇒ [`icube::device_credential_by_device_id`] **按 id 精确取**，不依赖活跃度；
+/// - `None`（旧账号 / 无绑定）⇒ [`icube::device_credential_for`] 回落「当前目录的那一条」，
+///   并**写一条留痕日志** —— 这条路径拿到的私钥可能与账号当初用的那台不一致，
+///   出问题时必须能从日志里看出来「这次是猜的」。
+///
+/// 抽出来是为了**可测**：`exchange_token_for` 的其余部分要发网络请求，
+/// 而「到底取了哪台设备的私钥」正是 T13-4 要钉住的那件事。
+fn resolve_refresh_credential(
+    variant: TraeVariant,
+    device_id: Option<&str>,
+) -> Result<DeviceCredential, icube::IcubeError> {
+    match device_id.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(device_id) => icube::device_credential_by_device_id(variant, device_id),
+        None => {
+            // 留痕：不阻塞流程，但必须留下「这次没有绑定、是猜的」这个事实。
+            store::append_log(
+                &paths::checkin_log_file_for(variant),
+                &format!(
+                    "设备凭证回落：账号无绑定 deviceId，改用【{}】当前目录的那一条\
+                     （续期若报 20403/20405，请重新导入本机账号以重建绑定）",
+                    variant.display_name()
+                ),
+            );
+            icube::device_credential_for(variant)
+        }
+    }
+}
+
 /// 调 `ExchangeToken` 把 refresh_token 换成 access token（**四步变体链**）。
 ///
 /// **不做任何落盘**：调用方决定「这条凭据属于谁、要不要写回」。
@@ -904,11 +1029,21 @@ fn build_refresh_variants(
 /// 改造前这里只发 `{ClientID, RefreshToken, ClientSecret, UserID}` —— 那正是参考项目
 /// **自己排在最后、并标注「保留至固化协议验证期结束」的旧协议兜底**，且全仓
 /// `DeviceProof` 零命中 ⇒ 自动续期走的是一条上游很可能已不接受的路径。
+/// ## 设备凭证的来源（**同源优先**）
+///
+/// `device_id` = 该账号**绑定的**那台设备（[`AccountsFile::device_bindings`]，G-b）：
+/// - `Some(id)` ⇒ [`icube::device_credential_by_device_id`] **按 id 精确取**
+///   （不依赖活跃度）—— 客户端换过设备、或本变体有多个候选目录时，
+///   「活跃目录里的那一条」未必是这台，用错私钥会被上游拒（20403/20405）；
+/// - `None`（旧账号 / 无绑定）⇒ [`icube::device_credential_for`] 回落「当前目录的那一条」，
+///   并**写一条留痕日志**：这条路径拿到的私钥可能与账号当初用的那台不一致，
+///   出问题时必须能从日志里看出来「这次是猜的」。
 pub(crate) async fn exchange_token_for(
     variant: TraeVariant,
     refresh_token: &str,
+    device_id: Option<&str>,
 ) -> Result<ExchangedToken, RefreshExchangeError> {
-    let credential = icube::device_credential_for(variant);
+    let credential = resolve_refresh_credential(variant, device_id);
     let credential_note = credential
         .as_ref()
         .err()
@@ -1168,11 +1303,16 @@ fn key_paths(value: &Value) -> Vec<String> {
 /// 报错指向上游，用户永远查不到原因。
 ///
 /// 返回 `(落盘后的账号记录, 新 JWT)`。
+///
+/// `device_id` 是**登录时实际使用的那台设备**（OAuth 三方同源的那个 `identity.device_id`），
+/// 落库时写进 [`AccountsFile::device_bindings`]（G-b）—— 续期要复用它签名。
+/// 传 `None` 时不写（**不动**既有绑定，见 [`bind_device`]）。
 pub fn login_with_exchanged_tokens_for(
     variant: TraeVariant,
     exchanged_jwt: String,
     refresh_token: Option<String>,
     display_name: Option<String>,
+    device_id: Option<&str>,
 ) -> Result<(RawAccount, String), String> {
     // uid 以上游签发的 JWT 为准，而不是信任本地传入的任何 ID：
     // 这条路径上本来没有可信的 uid 来源（账号可能还不存在）。
@@ -1225,6 +1365,9 @@ pub fn login_with_exchanged_tokens_for(
         }
     };
 
+    // 绑定**这次登录用的那台设备**：续期必须复用它签名（换设备/多候选目录时，
+    // 「活跃目录里的那一条」未必是这台）。
+    bind_device(&mut accounts, &uid, device_id);
     save_accounts_for(variant, &accounts)?;
     Ok((record, exchanged_jwt))
 }
@@ -1257,6 +1400,10 @@ pub async fn refresh_jwt(user_id: &str) -> Result<String, String> {
 ///
 /// 刷新后校验 uid 一致：不一致说明 refresh_token 属于另一个账号，
 /// 此时**拒绝写回**，否则会把账号 A 的凭据写进账号 B 的记录里。
+///
+/// **设备身份取自账号绑定**（[`AccountsFile::device_bindings`]，G-b）：
+/// 续期必须用「这个账号当初登录 / 导入时那台设备」的私钥签名。旧账号没有绑定 ⇒
+/// 透传 `None`，由 [`exchange_token_for`] 回落当前目录并**留痕**。
 pub async fn refresh_jwt_for(variant: TraeVariant, user_id: &str) -> Result<String, String> {
     let account = find_for(variant, user_id).ok_or("账号不存在")?;
     let refresh_token = account
@@ -1265,8 +1412,10 @@ pub async fn refresh_jwt_for(variant: TraeVariant, user_id: &str) -> Result<Stri
         .filter(|token| !token.is_empty())
         .ok_or("该账号无 refresh_token（抓取得到的账号不支持自动刷新），请重新获取 JWT")?
         .clone();
+    // 绑定可能不存在（旧账号 / 刚换过 uid）—— 那正是回落分支存在的意义，不是错误。
+    let device_binding = bound_device_id(variant, user_id);
 
-    let exchanged = exchange_token_for(variant, &refresh_token)
+    let exchanged = exchange_token_for(variant, &refresh_token, device_binding.as_deref())
         .await
         .map_err(|error| refresh_error_message(&error))?;
     let new_jwt = exchanged.jwt;
@@ -1471,6 +1620,8 @@ mod tests {
         };
         let file = AccountsFile {
             accounts: vec![account],
+            // 无绑定：本用例还要证明「空表不落盘」—— 序列化结果与改造前**逐字一致**。
+            device_bindings: HashMap::new(),
         };
         let text = serde_json::to_string(&file).expect("序列化");
         // 关键：键名必须是参考实现的大写 UserID，而不是 user_id
@@ -1482,9 +1633,16 @@ mod tests {
             !text.contains("\"user_id\""),
             "不得写回 snake_case 键，实际: {text}"
         );
+        // 新增的容器键在**空表时不得出现**：否则既有备份 / 参考实现的 `device_proxy.py`
+        // 读到的形状就变了（N-8：只新增一个可选键，不动既有键，也不无端多一个空键）。
+        assert!(
+            !text.contains("device_bindings"),
+            "无绑定时不得写出 device_bindings 键，实际: {text}"
+        );
         // 且能再次读回
         let back: AccountsFile = serde_json::from_str(&text).expect("回读");
         assert_eq!(back.accounts[0].user_id, file.accounts[0].user_id);
+        assert!(back.device_bindings.is_empty());
     }
 
     /// 空账号库与缺 `accounts` 键的账号库都必须解析成功并给出空列表。
@@ -1713,6 +1871,7 @@ mod tests {
                     added_at: None,
                     updated_at: None,
                 }],
+                device_bindings: HashMap::new(),
             },
         )
         .expect("写 TraeWork");
@@ -1727,6 +1886,7 @@ mod tests {
                     added_at: None,
                     updated_at: None,
                 }],
+                device_bindings: HashMap::new(),
             },
         )
         .expect("写 TraeCn");
@@ -1998,8 +2158,14 @@ hLkrYGiVNhsErnjKIgS7/EIHdsihRANCAARznG0WLhenNiMW5jA3SwFpTNyet2zw\n\
 
             // 首次落库：新账号。
             let (record, returned) =
-                login_with_exchanged_tokens_for(variant, jwt.clone(), Some("rt-1".into()), Some("小明".into()))
-                    .expect("首次落库不应失败");
+                login_with_exchanged_tokens_for(
+                    variant,
+                    jwt.clone(),
+                    Some("rt-1".into()),
+                    Some("小明".into()),
+                    None,
+                )
+                .expect("首次落库不应失败");
             assert_eq!(returned, jwt);
             assert_eq!(record.name, "小明");
             assert_eq!(record.refresh_token.as_deref(), Some("rt-1"));
@@ -2009,7 +2175,7 @@ hLkrYGiVNhsErnjKIgS7/EIHdsihRANCAARznG0WLhenNiMW5jA3SwFpTNyet2zw\n\
             // 再次落库：`name` 不传 ⇒ 保留用户自己的名字；jwt/refresh_token 覆盖。
             let jwt2 = make_jwt(uid);
             let (updated, _) =
-                login_with_exchanged_tokens_for(variant, jwt2.clone(), Some("rt-2".into()), None)
+                login_with_exchanged_tokens_for(variant, jwt2.clone(), Some("rt-2".into()), None, None)
                     .expect("重复落库不应失败");
             assert_eq!(updated.name, "小明", "name 不该被上游空值冲掉");
             assert_eq!(updated.refresh_token.as_deref(), Some("rt-2"));
@@ -2023,7 +2189,7 @@ hLkrYGiVNhsErnjKIgS7/EIHdsihRANCAARznG0WLhenNiMW5jA3SwFpTNyet2zw\n\
 
             // refresh_token 传 None ⇒ **保留**旧值（清空会让账号失去自动续期）。
             let (kept, _) =
-                login_with_exchanged_tokens_for(variant, make_jwt(uid), None, None).unwrap();
+                login_with_exchanged_tokens_for(variant, make_jwt(uid), None, None, None).unwrap();
             assert_eq!(kept.refresh_token.as_deref(), Some("rt-2"));
 
             // 另一条产品线**看不到**这条账号（变体隔离）。
@@ -2036,8 +2202,14 @@ hLkrYGiVNhsErnjKIgS7/EIHdsihRANCAARznG0WLhenNiMW5jA3SwFpTNyet2zw\n\
     fn login_with_exchanged_tokens_for_rejects_unparsable_jwt() {
         with_temp_home(|| {
             let error =
-                login_with_exchanged_tokens_for(TraeVariant::TraeWork, "not-a-jwt".into(), None, None)
-                    .expect_err("解析不出 uid 必须拒绝");
+                login_with_exchanged_tokens_for(
+                    TraeVariant::TraeWork,
+                    "not-a-jwt".into(),
+                    None,
+                    None,
+                    None,
+                )
+                .expect_err("解析不出 uid 必须拒绝");
             assert!(error.contains("UserID"), "{error}");
             assert!(entries_for(TraeVariant::TraeWork).is_empty());
         });
@@ -2052,7 +2224,7 @@ hLkrYGiVNhsErnjKIgS7/EIHdsihRANCAARznG0WLhenNiMW5jA3SwFpTNyet2zw\n\
         with_temp_home(|| {
             let variant = TraeVariant::TraeWork;
             let uid = "3333333333333333";
-            login_with_exchanged_tokens_for(variant, make_jwt(uid), Some("rt-old".into()), None)
+            login_with_exchanged_tokens_for(variant, make_jwt(uid), Some("rt-old".into()), None, None)
                 .expect("造账号不应失败");
 
             // 上游轮换了 refresh token ⇒ 必须覆盖。
@@ -2082,7 +2254,7 @@ hLkrYGiVNhsErnjKIgS7/EIHdsihRANCAARznG0WLhenNiMW5jA3SwFpTNyet2zw\n\
     /// ★ refresh 的 URL 必须由**该变体的 `icube_base`** 拼成，与回调 `host` 无关。
     ///
     /// refresh 是**离线触发**（没有浏览器回调），根本没有 host 可传；
-    /// `exchange_token_for(variant, refresh_token)` 的签名里也确实没有 host 形参
+    /// `exchange_token_for(variant, refresh_token, device_id)` 的签名里也确实没有 host 形参
     /// （编译期护栏：多一个 `host` 参数本用例就编不过）。
     #[test]
     fn refresh_url_is_built_from_variant_icube_base() {
@@ -2232,5 +2404,307 @@ hLkrYGiVNhsErnjKIgS7/EIHdsihRANCAARznG0WLhenNiMW5jA3SwFpTNyet2zw\n\
             request.contains(&format!("\"DeviceID\":\"{}\"", credential.device_id)),
             "{request}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // T13-4：账号 ↔ 设备身份绑定（G-b）
+    //
+    // 绑定键是 uid ⇒ 「账号被删 / uid 变了」时必须清理（I-2 / I-3）；
+    // 而 `import_accounts_for` 一旦字面重建容器就会清空全部绑定（I-1，护栏在
+    // `export_import.rs` 的 `import_accounts_keeps_device_bindings`）。
+    // -----------------------------------------------------------------------
+
+    /// 造一份 Trae Work 的候选目录 fixture，并给**指定下标**的候选挂上 `device_id`。
+    ///
+    /// 活跃度由网格构造器用 `File::set_modified` **显式钉死**，不依赖写入顺序 ——
+    /// 否则 Windows 约 15.6ms 的时间粒度会让「谁更活跃」变成掷骰子（P0-2 的成因）。
+    #[cfg(windows)]
+    fn work_grid_with_devices(
+        env: &crate::modules::trae::test_support::TempEnv,
+        cells: &[(bool, bool, bool)],
+        devices: &[(usize, &str)],
+    ) -> crate::modules::trae::icube::test_support::SelectionGrid {
+        use crate::modules::trae::icube::test_support as fixtures;
+        let grid = fixtures::write_selection_grid(
+            &env.appdata(),
+            TraeVariant::TraeWork,
+            cells,
+            chrono::Utc::now().timestamp() + 3600,
+        );
+        for (index, device_id) in devices {
+            fixtures::attach_device_entry(&env.appdata(), grid.cells[*index].name, device_id);
+        }
+        grid
+    }
+
+    /// 造一条最小可用的账号记录。
+    fn raw(uid: &str, name: &str) -> RawAccount {
+        RawAccount {
+            name: name.to_string(),
+            user_id: Some(uid.to_string()),
+            jwt: make_jwt(uid),
+            refresh_token: None,
+            added_at: None,
+            updated_at: None,
+        }
+    }
+
+    /// ★【T13-4 ①】导入必须把**来源目录那台设备**记成账号绑定。
+    ///
+    /// fixture 是用户机器形态：首位**活跃但无登录态**、次位**不活跃但有登录态 + 设备身份**。
+    /// ⇒ 「绑定取自活跃目录」的退化实现会去首位找设备身份（那里没有）⇒ 绑定落空。
+    #[cfg(windows)]
+    #[test]
+    fn import_local_for_writes_the_device_binding() {
+        let env = crate::modules::trae::test_support::TempEnv::empty();
+        let bound = "22929298067000007";
+        let grid = work_grid_with_devices(
+            &env,
+            &[(true, false, true), (true, true, false)],
+            &[(1, bound)],
+        );
+        assert!(
+            grid.cells[0].active && !grid.cells[0].logged_in,
+            "前置：活跃目录没有登录态"
+        );
+        assert!(
+            !grid.cells[1].active && grid.cells[1].logged_in,
+            "前置：登录态在次位候选"
+        );
+
+        let record = import_local_for(TraeVariant::TraeWork).expect("导入必须成功");
+        let uid = resolve_user_id(&record);
+        assert_eq!(uid, grid.cells[1].user_id, "必须导入次位（装着登录态）那个账号");
+
+        let stored = load_accounts_for(TraeVariant::TraeWork);
+        assert_eq!(
+            stored.device_bindings.get(&uid).map(String::as_str),
+            Some(bound),
+            "绑定必须是**来源目录**那台设备（而不是活跃目录的设备）"
+        );
+    }
+
+    /// 取不到设备身份时**不得**把既有绑定清空 —— 宁可留旧值（下次续期仍可能对），
+    /// 也不要用一个空值把本来正确的绑定抹掉（那会让续期静默退回「猜活跃目录」）。
+    #[cfg(windows)]
+    #[test]
+    fn import_local_for_keeps_the_existing_binding_when_device_identity_is_missing() {
+        let env = crate::modules::trae::test_support::TempEnv::empty();
+        // 有登录态，但**一条 `icube-dc` 都没有**（客户端从未注册设备身份）。
+        let grid = work_grid_with_devices(
+            &env,
+            &[(true, true, true), (false, false, false)],
+            &[],
+        );
+        let uid = grid.cells[0].user_id.clone();
+
+        let mut file = load_accounts_for(TraeVariant::TraeWork);
+        file.device_bindings.insert(uid.clone(), "dev-old".into());
+        save_accounts_for(TraeVariant::TraeWork, &file).expect("造绑定");
+
+        import_local_for(TraeVariant::TraeWork).expect("有登录态时导入必须成功");
+
+        assert_eq!(
+            bound_device_id(TraeVariant::TraeWork, &uid).as_deref(),
+            Some("dev-old"),
+            "取不到设备身份时不得清空既有绑定"
+        );
+    }
+
+    /// ★【T13-4 ④】`refresh_jwt_for` 的设备身份来自**账号绑定**（唯一取值点 [`bound_device_id`]）。
+    ///
+    /// 「读到的值确实被传下去」由签名保证：`exchange_token_for` 必须收第三个实参，
+    /// 少传一个就编不过 —— 所以这里钉的是**值的来源**，不是传参动作本身。
+    #[test]
+    fn refresh_reads_the_account_device_binding() {
+        with_temp_home(|| {
+            let variant = TraeVariant::TraeWork;
+            assert_eq!(bound_device_id(variant, "u1"), None, "无绑定时必须是 None");
+
+            let mut file = load_accounts_for(variant);
+            file.device_bindings.insert("u1".into(), "dev-1".into());
+            save_accounts_for(variant, &file).expect("写绑定");
+
+            assert_eq!(bound_device_id(variant, "u1").as_deref(), Some("dev-1"));
+            // 变体分家：另一条线读不到这条绑定。
+            assert_eq!(
+                bound_device_id(TraeVariant::TraeCn, "u1"),
+                None,
+                "绑定必须按变体分家"
+            );
+        });
+    }
+
+    /// ★【T13-4 ②】绑定生效时取的是**绑定那台设备**的凭证，且**与活跃度无关**：
+    /// 活跃目录翻转后仍取同一台。
+    ///
+    /// 判据用 `source_app`（凭证来自哪个候选目录）而不是私钥字节 ——
+    /// 合成 fixture 里各目录的设备信封共用同一份测试私钥，比不出差别。
+    #[cfg(windows)]
+    #[test]
+    fn refresh_credential_follows_the_binding_across_an_activity_flip() {
+        use crate::modules::trae::icube::test_support as fixtures;
+        let env = crate::modules::trae::test_support::TempEnv::empty();
+        let variant = TraeVariant::TraeWork;
+        // 两个候选都注册了设备身份，各给不同 deviceId；首位活跃。
+        let cells =
+            fixtures::write_device_entries_grid(&env.appdata(), variant, &[(true, true), (true, false)]);
+        let (bound_id, bound_name, bound_dir) = &cells[1];
+        let (other_id, other_name, other_dir) = &cells[0];
+        assert_ne!(bound_id, other_id, "前置：两台设备必须是不同的 id");
+
+        let credential =
+            resolve_refresh_credential(variant, Some(bound_id)).expect("绑定的设备必须能找到");
+        assert_eq!(credential.device_id.as_str(), bound_id.as_str());
+        assert_eq!(
+            credential.source_app.as_str(),
+            *bound_name,
+            "必须取**绑定**那台设备的私钥"
+        );
+
+        // 翻转活跃度：把**绑定那台**（次位）钉旧、把首位钉新。
+        let storage = |dir: &std::path::Path| dir.join("User").join("globalStorage").join("storage.json");
+        fixtures::pin_activity(&storage(other_dir), 0);
+        fixtures::pin_activity(&storage(bound_dir), 24);
+
+        // 先证明翻转**真的生效**，否则下面那条断言是空的（「碰巧一致」= 假绿）。
+        let fallback =
+            resolve_refresh_credential(variant, None).expect("无绑定回落时也应能取到凭证");
+        assert_eq!(
+            fallback.source_app.as_str(),
+            *other_name,
+            "前置：活跃度翻转未生效，下一条断言就没有意义"
+        );
+
+        let still = resolve_refresh_credential(variant, Some(bound_id)).expect("仍应能找到");
+        assert_eq!(
+            still.source_app.as_str(),
+            *bound_name,
+            "活跃目录翻转后，绑定仍必须指向**来源设备**"
+        );
+        assert_ne!(still.source_app, fallback.source_app);
+    }
+
+    /// ★【T13-4 ③ / ⑤】无绑定（旧账号）⇒ 回落「当前目录的那一条」，**且必须留痕**。
+    ///
+    /// 留痕不是装饰：这条路径拿到的私钥可能与账号当初用的那台不一致，
+    /// 出问题时（20403/20405）必须能从日志里看出「这次是猜的」。
+    #[cfg(windows)]
+    #[test]
+    fn refresh_credential_falls_back_and_leaves_a_trace_when_binding_is_absent() {
+        use crate::modules::trae::icube::test_support as fixtures;
+        let env = crate::modules::trae::test_support::TempEnv::empty();
+        let variant = TraeVariant::TraeWork;
+        let cells =
+            fixtures::write_device_entries_grid(&env.appdata(), variant, &[(true, true), (true, false)]);
+        let (_, active_name, _) = &cells[0];
+
+        let credential = resolve_refresh_credential(variant, None).expect("有设备身份，应能取到");
+        assert_eq!(
+            credential.source_app.as_str(),
+            *active_name,
+            "无绑定应回落**当前目录**那一条"
+        );
+
+        let log = std::fs::read_to_string(paths::checkin_log_file_for(variant))
+            .expect("回落必须写一条留痕日志");
+        assert!(log.contains("回落"), "日志必须写明「回落」：{log}");
+    }
+
+    /// ★【T13-4 ⑦ / I-2】删账号必须一并删绑定，且**另一 uid 的绑定不受影响**。
+    #[test]
+    fn delete_account_removes_device_binding() {
+        with_temp_home(|| {
+            let variant = TraeVariant::TraeWork;
+            let mut file = load_accounts_for(variant);
+            file.accounts.push(raw("u1", "一号"));
+            file.accounts.push(raw("u2", "二号"));
+            file.device_bindings.insert("u1".into(), "dev-1".into());
+            file.device_bindings.insert("u2".into(), "dev-2".into());
+            save_accounts_for(variant, &file).expect("造绑定");
+
+            delete_for(variant, "u1", false).expect("删除应成功");
+
+            let after = load_accounts_for(variant);
+            assert!(
+                !after.device_bindings.contains_key("u1"),
+                "被删账号的绑定必须一并删除，否则 uid 被复用时拿旧设备的私钥去签名"
+            );
+            assert_eq!(
+                after.device_bindings.get("u2").map(String::as_str),
+                Some("dev-2"),
+                "另一 uid 的绑定不得受影响"
+            );
+        });
+    }
+
+    /// ★【T13-4 ⑧ / I-3】换 JWT 导致 uid 变化时，旧 uid 的绑定被删除、新 uid **无绑定**；
+    /// uid 未变时绑定保留。
+    #[test]
+    fn update_for_clears_binding_when_uid_changes() {
+        with_temp_home(|| {
+            let variant = TraeVariant::TraeWork;
+            let mut file = load_accounts_for(variant);
+            file.accounts.push(raw("old-uid", "旧号"));
+            file.device_bindings.insert("old-uid".into(), "dev-old".into());
+            save_accounts_for(variant, &file).expect("造绑定");
+
+            // ① uid 未变（只改名）⇒ 绑定必须保留。
+            update_for(variant, "old-uid", Some("改名".into()), None).expect("改名应成功");
+            assert_eq!(
+                bound_device_id(variant, "old-uid").as_deref(),
+                Some("dev-old"),
+                "uid 未变时绑定不得被清掉"
+            );
+
+            // ② 换 JWT ⇒ uid 变化 ⇒ 旧绑定删除、新 uid 不继承。
+            update_for(variant, "old-uid", None, Some(make_jwt("new-uid"))).expect("换 JWT 应成功");
+            assert_eq!(
+                bound_device_id(variant, "old-uid"),
+                None,
+                "旧 uid 的绑定属于旧账号，必须删除"
+            );
+            assert_eq!(
+                bound_device_id(variant, "new-uid"),
+                None,
+                "旧设备的私钥对新账号本就不适用，不得搬过去"
+            );
+            assert!(find_for(variant, "new-uid").is_some(), "账号应已改挂到新 uid");
+        });
+    }
+
+    /// ★【T13-4 ⑨】同一 uid 在两条产品线各绑不同设备，**互不污染**。
+    #[test]
+    fn same_uid_binds_independently_per_variant() {
+        with_temp_home(|| {
+            let mut work = load_accounts_for(TraeVariant::TraeWork);
+            work.device_bindings.insert("same-uid".into(), "dev-work".into());
+            save_accounts_for(TraeVariant::TraeWork, &work).expect("写 TraeWork 绑定");
+
+            let mut cn = load_accounts_for(TraeVariant::TraeCn);
+            cn.device_bindings.insert("same-uid".into(), "dev-cn".into());
+            save_accounts_for(TraeVariant::TraeCn, &cn).expect("写 TraeCn 绑定");
+
+            assert_eq!(
+                bound_device_id(TraeVariant::TraeWork, "same-uid").as_deref(),
+                Some("dev-work")
+            );
+            assert_eq!(
+                bound_device_id(TraeVariant::TraeCn, "same-uid").as_deref(),
+                Some("dev-cn")
+            );
+
+            // 只清一条线，另一条不得受影响。
+            let mut work = load_accounts_for(TraeVariant::TraeWork);
+            work.device_bindings.remove("same-uid");
+            save_accounts_for(TraeVariant::TraeWork, &work).expect("清 TraeWork 绑定");
+
+            assert_eq!(bound_device_id(TraeVariant::TraeWork, "same-uid"), None);
+            assert_eq!(
+                bound_device_id(TraeVariant::TraeCn, "same-uid").as_deref(),
+                Some("dev-cn"),
+                "另一条产品线的绑定不得被污染"
+            );
+        });
     }
 }

@@ -707,10 +707,6 @@ pub(crate) fn cloudide_auth_info_from_dir(
 /// - 所有候选目录里**一条 `icube-dc` 都没有** ⇒ [`IcubeError::DeviceIdentityMissing`]；
 /// - 有若干条、但**没有一条**绑定请求的 `deviceId` ⇒ [`IcubeError::DeviceIdentityMismatch`]
 ///   （载荷列出本机有的那些 id 的**脱敏**值，便于用户判断是不是换过设备）。
-///
-/// ⚠️ `allow(dead_code)`：消费方是 T13-4「续期按账号绑定的设备取」。本轮只落地接口，
-/// 接线后**必须**删掉这个属性。
-#[allow(dead_code)]
 pub(crate) fn device_credential_by_device_id(
     variant: TraeVariant,
     device_id: &str,
@@ -1157,7 +1153,11 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEc5xtFi4XpzYjFuYwN0sBaUzcnrds\n\
     ///
     /// 这里给第 `i` 个候选钉 `now - (n-1-i)` 小时：**首位最旧、末位最新**，
     /// 与真机 Trae Work 同形（首位 `TRAE SOLO CN` 有登录态、末位 `TRAE SOLO` 更活跃）。
-    fn pin_activity(file: &std::path::Path, age_hours: usize) {
+    /// 把 `storage.json` 的 mtime 钉到 `age_hours` 小时之前（= 活跃度）。
+    ///
+    /// `pub(crate)` 是给 `account.rs` 的「活跃目录**翻转**后绑定仍指向来源设备」用例用的：
+    /// 那需要先铺好 fixture、再**事后**改活跃度，而网格构造器只在构造时钉一次。
+    pub(crate) fn pin_activity(file: &std::path::Path, age_hours: usize) {
         let pinned = std::time::SystemTime::now()
             - std::time::Duration::from_secs(age_hours as u64 * 3_600);
         // 必须带 `write(true)`：Windows 上 `SetFileTime` 需要 `FILE_WRITE_ATTRIBUTES`，
