@@ -190,7 +190,8 @@ impl CoreEntry {
 ///
 /// **主来源**是 `storage.json` 里 `iCubeAuthInfo://icube.cloudide` 的 tc 信封
 /// （见 [`icube_login_candidate`]）—— 它是**两条产品线都有**、且可解密的来源。
-/// 下面描述的只是**兜底**那一半，只在主来源不可用时才会走到。
+/// 下面描述的只是**兜底**那一半，**授权条件是「该目录没有信封键」**（R6，见
+/// [`local_login_from_dir`]）：信封键存在却不可用（已过期 / 解不开）时不会走到这里。
 ///
 /// ## 兜底扫哪些文件（两处，不能只扫第一处）
 ///
@@ -275,10 +276,10 @@ impl std::fmt::Debug for LocalLogin {
 ///
 /// ## 来源优先级（**顺序不可调换**）
 ///
-/// | 序 | 来源 | 覆盖范围 | 实现 |
+/// | 序 | 来源 | 覆盖范围 | 授权条件 |
 /// |:--|:--|:--|:--|
-/// | 1 | `storage.json` 的 `iCubeAuthInfo://icube.cloudide` **tc 信封** | **两条产品线都有** | [`icube_login_candidate_from_dir`] |
-/// | 2 | `storage.json` / `state.vscdb` 明文 + 扩展日志 | 只有装了 `trae.ai-code-completion` 的产品线 | [`collect_log_candidates`] |
+/// | 1 | `storage.json` 的 `iCubeAuthInfo://icube.cloudide` **tc 信封** | **两条产品线都有** | 恒为第一顺位 |
+/// | 2 | `storage.json` / `state.vscdb` 明文 + 扩展日志 | 只有装了 `trae.ai-code-completion` 的产品线 | **仅当该目录没有信封键**（`storage_has_key`） |
 ///
 /// **为什么主来源必须是 tc 信封**：`TRAE SOLO CN`（Trae Work）实测 355 个日志文件、
 /// **0** 个 `completion.log`、0 处 `Cloud-IDE-JWT` —— 明文来源在它身上**根本不存在**，
@@ -289,6 +290,11 @@ impl std::fmt::Debug for LocalLogin {
 /// （`logs/` 会跨账号留存，见 [`restore_from_slot_for`] 的不变式），tc 信封才是客户端
 /// **当前**的登录态。若按 `exp` 取最大，切换账号后残留的上一账号日志可能胜出
 /// ⇒ 导入到错账号，症状正是「切换后账号不变」。
+///
+/// ⚠️ **R6：兜底的授权条件是「该目录没有信封**键**」，不是「信封没给出可用凭据」**。
+/// 两者只在「信封键存在但过期/解不开」时分叉 —— 而那一格正是上面那条不变式**唯一会被绕过**
+/// 的地方：信封一过期就被整条丢弃，兜底于是捞到 `logs/` 里**上一账号仍然有效**的 token。
+/// 收口按「键」这一个 bit 做（[`storage_has_key`]，不解密），理由见 [`local_login_from_dir`]。
 ///
 /// ## 返回值的形态约定
 ///
@@ -378,6 +384,19 @@ pub fn import_local_login_for(variant: TraeVariant) -> Result<LocalLogin, String
 /// 取的是**首个存在的候选**，不再恒等于 `names[0]`。在只装了 `TRAE SOLO`
 /// （没有 `TRAE SOLO CN`）的机器上，这两者**不是同一个目录** —— 正是 R3 修掉的缺陷。
 /// 共用的是这个原语，不是目录选择器。
+///
+/// ## 明文兜底的**授权条件**（R6）
+///
+/// 「主来源没给出可用凭据」**不等于**「可以去看明文」。兜底只在
+/// **该目录没有 `iCubeAuthInfo://icube.cloudide` 键**时才被授权
+/// （[`storage_has_key`]，只看键名、不解密）；键存在却不可用（**已过期**或**解不开**）
+/// 时一律 `Err`。
+///
+/// 理由：明文来源（`logs/` 里的 `Cloud-IDE-JWT`）是**跨账号留存**的 —— 客户端切换过账号
+/// 之后，上一账号的 token 仍在日志里。信封一过期就被整条丢弃、转而扫明文，就会捞到
+/// **上一账号仍然有效**的 token ⇒ **静默导入到另一个账号**。
+/// 所以判据必须是「**键**存在与否」这一个 bit，而不是「是否过期」——
+/// 「解不开」那一格同样可达、同样没有回落的正当性。
 fn local_login_from_dir(data_dir: &Path, variant: TraeVariant) -> Result<LocalLogin, String> {
     // 设备身份取**同一个目录**的；取不到即 `None`，**不**回落去别的目录 ——
     // 否则「凭据来自 A、设备身份来自 B」，正是本项目反复栽的不同源。
@@ -399,6 +418,26 @@ fn local_login_from_dir(data_dir: &Path, variant: TraeVariant) -> Result<LocalLo
     }
 
     // ── 兜底：明文来源（旧版 storage.json / state.vscdb，新版只剩扩展日志） ──
+    //
+    // 🔴 **兜底的授权条件 = 「该目录没有客户端写下的登录态信封」**（R6）。
+    // 走到这里说明信封**没给出可用凭据**，但那有两种截然不同的情形：
+    //   1. 信封**键不存在** ⇒ 该目录从未登录过（或版本太旧），明文是唯一来源 ⇒ 回落**正确**；
+    //   2. 信封**键存在**但不可用（已过期 / 解不开）⇒ 客户端**当前**登录态就在信封里，
+    //      只是用不了；此时回落明文是**错的**：`logs/` 是**跨账号留存**的，
+    //      会捞到上一账号**仍然有效**的 token ⇒ **静默导入到另一个账号**。
+    // 所以这里按「**键**存在与否」这一个 bit 收口，而不是按「是否过期」——
+    // 「解不开」那一格同样可达，且语义上同样没有回落正当性。
+    if storage_has_key(data_dir, icube::CLOUDIDE_KEY) {
+        return Err(format!(
+            "在【{}】的数据目录（{}）里找到了 iCube 登录态副本，但它已过期或无法解密；\
+             为避免导入到另一个账号，这里**不再**回退到明文来源（客户端日志会跨账号留存）。\
+             请在 Trae 中重新登录后重试；或改用「OAuth 网页登录」——\
+             它不依赖本地文件，且能获得可自动续期的凭据。",
+            variant.display_name(),
+            data_dir.display()
+        ));
+    }
+
     let mut candidates: Vec<(PathBuf, &'static str)> = vec![
         (
             data_dir.join("User").join("globalStorage").join("storage.json"),
@@ -483,8 +522,10 @@ fn extract_local_jwt_from_dir(
 ///
 /// - `Ok(Some((uid, header_value)))` —— 拿到可用凭据，`header_value` **已含**
 ///   `Cloud-IDE-JWT ` 前缀（信封里存的是裸 token，补前缀是本函数的职责）；
-/// - `Ok(None)` —— 这条来源不可用（目录/键缺失、信封解不开、或凭据已过期），
-///   调用方继续走明文兜底。**不在这里报错**：主来源缺失不代表导入该失败；
+/// - `Ok(None)` —— 这条来源不可用（目录/键缺失、信封解不开、或凭据已过期）。
+///   **不在这里报错**：主来源缺失不代表导入该失败。⚠️ **R6**：调用方**不得**
+///   无条件继续走明文兜底 —— 授权条件是「该目录没有信封**键**」（[`storage_has_key`]），
+///   键存在却不可用时必须直接 `Err`，理由见 [`local_login_from_dir`]；
 /// - `Err` —— 信封**可用**但归属解析不出。宁可报错，也不要往账号库落一条无主凭据。
 ///
 /// ## 到期判定
@@ -2555,6 +2596,37 @@ mod tests {
             .collect()
     }
 
+    /// 往该变体**每一个**候选目录的扩展日志里写一条**仍然有效**的明文 token。
+    ///
+    /// 写进全部候选（而不是某一个）是刻意的：用例于是**不依赖**目录选择器选中哪一个 ——
+    /// 无论选中谁，明文来源都"看得到"那个 token，R6 的收口若失效就必然被这条用例抓住。
+    #[cfg(windows)]
+    fn write_stale_plaintext_logs(
+        env: &crate::modules::trae::test_support::TempEnv,
+        variant: TraeVariant,
+        uid: &str,
+        exp: i64,
+    ) {
+        let token = icube::test_support::bare_jwt(uid, exp);
+        for name in platform::data_dir_names_for(variant) {
+            let log = env
+                .appdata()
+                .join(name)
+                .join("logs")
+                .join("20260918T000000")
+                .join("window1")
+                .join("exthost")
+                .join("trae.ai-code-completion")
+                .join("completion.log");
+            std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+            std::fs::write(
+                &log,
+                format!(r#"{{"Authorization":"Cloud-IDE-JWT {token}"}}"#),
+            )
+            .unwrap();
+        }
+    }
+
     /// ★ Trae Work 的「导入本机账号」必须成功：凭据**只在 tc 信封里**时也要能导入。
     ///
     /// fixture 刻意做成「只有 tc 信封」：没有 `icube-dc` 设备凭证、没有任何明文
@@ -2645,6 +2717,127 @@ mod tests {
             extract_local_jwt_for(TraeVariant::TraeWork).expect("有 tc 信封时导入必须成功");
         assert_ne!(uid, stale_uid, "不得读回上一账号（尽管它的 exp 更晚）");
         assert!(work_uids.contains(&uid), "应返回信封里的账号，实际：{uid}");
+    }
+
+    /// ★【R6 / 护栏 #17】信封**已过期**时，导入必须**拒绝**回落到明文。
+    ///
+    /// 否则会捞到 `logs/` 里上一账号**仍然有效**的 token ⇒ **静默导入到另一个账号**。
+    /// 这是**实测可达**的真缺陷（不是推演）：上一条用例覆盖的是「信封**有效**」，
+    /// 而这里信封一过期就被整条丢弃，那条「tc 优先于明文」的不变式随之被绕过。
+    ///
+    /// 反向验证：删掉 `local_login_from_dir` 里的收口分支 ⇒ 本用例必红。
+    #[cfg(windows)]
+    #[test]
+    fn import_refuses_plaintext_when_the_envelope_is_expired() {
+        let now = chrono::Utc::now().timestamp();
+        let env = crate::modules::trae::test_support::TempEnv::empty();
+        // 信封**存在且解得出**，但 `expiredAt` 已过期。
+        icube::test_support::write_cloudide_only_user_data(&env.appdata(), now - 3600);
+
+        // 上一账号的 token 仍有效，且残留在**每一个**候选目录的日志里。
+        let stale_uid = "1111222233334444";
+        write_stale_plaintext_logs(&env, TraeVariant::TraeWork, stale_uid, now + 86_400);
+
+        let error = extract_local_jwt_for(TraeVariant::TraeWork)
+            .expect_err("信封已过期时必须拒绝，不得回落到跨账号留存的明文日志");
+        assert!(
+            !error.contains(stale_uid),
+            "错误里不得出现另一个账号的 uid：{error}"
+        );
+        assert!(error.contains("重新登录"), "文案要给出下一步：{error}");
+        assert!(
+            error.contains("OAuth"),
+            "文案要给出不依赖本地文件的替代路径：{error}"
+        );
+    }
+
+    /// ★【R6 / 护栏 #18】`storage.json` 存在但**没有**信封键 ⇒ 明文兜底**仍须可用**。
+    ///
+    /// 它钉住「授权位是**键**，不是文件」：若把收口写成「`storage.json` 存在就不许回落」，
+    /// 本用例会红 —— 而旧版布局（凭据只落在明文里）的用户将再也导入不了。
+    #[cfg(windows)]
+    #[test]
+    fn import_still_uses_plaintext_when_the_envelope_key_is_absent() {
+        let now = chrono::Utc::now().timestamp();
+        let env = crate::modules::trae::test_support::TempEnv::empty();
+        let uid = "1111222233334444";
+        // 每个候选目录都有 storage.json，但**不含** cloudide 键（旧版布局）。
+        for name in platform::data_dir_names_for(TraeVariant::TraeWork) {
+            let dir = env.appdata().join(name).join("User").join("globalStorage");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("storage.json"), r#"{"aha":{"account":"legacy"}}"#).unwrap();
+        }
+        write_stale_plaintext_logs(&env, TraeVariant::TraeWork, uid, now + 86_400);
+
+        let (imported, header) = extract_local_jwt_for(TraeVariant::TraeWork)
+            .expect("没有信封键时，明文兜底必须仍然可用（旧版布局的唯一来源）");
+        assert_eq!(imported, uid);
+        assert!(
+            header.starts_with("Cloud-IDE-JWT "),
+            "明文来源捞出的是裸 token，落库前必须补前缀：{header}"
+        );
+    }
+
+    /// ★【R6 / 护栏 #19】信封**解不开**时同样必须拒绝回落。
+    ///
+    /// 这一条是「收口范围是『**键存在**』而不是『已过期』」的**证明**：
+    /// 若只按 `exp` 收口（即「过期才不回落」），本用例会红而 #17 仍绿。
+    /// 「解不开」与「已过期」在可达性上没有区别（都让主来源给不出凭据），
+    /// 而回落的后果完全相同 —— 捞到另一个账号的明文 token。
+    #[cfg(windows)]
+    #[test]
+    fn import_refuses_plaintext_when_the_envelope_is_undecryptable() {
+        let now = chrono::Utc::now().timestamp();
+        let env = crate::modules::trae::test_support::TempEnv::empty();
+        let stale_uid = "1111222233334444";
+        // 每个候选目录都写一个**坏**信封值：键在、值解不开。
+        for name in platform::data_dir_names_for(TraeVariant::TraeWork) {
+            let dir = env.appdata().join(name).join("User").join("globalStorage");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("storage.json"),
+                format!(r#"{{"{}":"tC-not-a-valid-envelope"}}"#, icube::CLOUDIDE_KEY),
+            )
+            .unwrap();
+        }
+        write_stale_plaintext_logs(&env, TraeVariant::TraeWork, stale_uid, now + 86_400);
+
+        let error = extract_local_jwt_for(TraeVariant::TraeWork)
+            .expect_err("信封解不开时同样不得回落到明文");
+        assert!(
+            !error.contains(stale_uid),
+            "错误里不得出现另一个账号的 uid：{error}"
+        );
+    }
+
+    /// ★【R6 / 护栏 #20】**守卫链同一处收口**：写侧目录的信封过期时，守卫必须 `Err`
+    /// （拒绝写槽位），而不是拿日志里残留的明文 token 给这次保存「盖章」。
+    ///
+    /// 它钉住「一处收口、两条链受益」：R6 的分支在 [`local_login_from_dir`] 里，
+    /// 守卫（[`save_current_login_for`] → `ensure_save_target_matches_client`）
+    /// 与导入共用它 —— **不需要**在守卫里再写一遍。
+    ///
+    /// 明文 token 的 uid 与要保存的目标账号**故意一致**：旧实现因此会放行，
+    /// 把「客户端其实没登录（凭据已过期）」的状态当成「已登录这个账号」存进槽位。
+    #[cfg(windows)]
+    #[test]
+    fn save_guard_refuses_when_the_envelope_is_expired() {
+        let now = chrono::Utc::now().timestamp();
+        let env = crate::modules::trae::test_support::TempEnv::empty();
+        let variant = TraeVariant::TraeWork;
+        // 写侧目录（首个存在的候选）的信封**已过期**。
+        let fixtures =
+            icube::test_support::write_cloudide_only_user_data(&env.appdata(), now - 3600);
+        let first_name = platform::data_dir_names_for(variant)[0];
+        let first_uid = fixtures
+            .iter()
+            .find(|(_, name)| name == first_name)
+            .map(|(uid, _)| uid.clone())
+            .expect("首位候选必须在 fixture 里");
+        write_stale_plaintext_logs(&env, variant, &first_uid, now + 86_400);
+
+        save_current_login_for(variant, &first_uid)
+            .expect_err("信封过期时守卫必须拒绝，而不是拿残留明文给这次保存盖章");
     }
 
     /// 诊断必须说清**主来源**（tc 信封）的状态。
