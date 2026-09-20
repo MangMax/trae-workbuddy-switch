@@ -213,24 +213,71 @@ pub fn extract_local_jwt() -> Result<(String, String), String> {
     extract_local_jwt_for(TraeVariant::default())
 }
 
-/// 按**产品线变体**提取当前登录账号的 JWT。
+/// 从本机客户端导入的一份登录态（**带来源自证**）。
+///
+/// ## 为什么不止 `(uid, header)` 两个值
+///
+/// 「导入本机账号」失败时，用户与支持者最需要知道的是**「读的到底是哪个目录、
+/// 哪条来源」** —— 本模块恰恰有两个语义不同的目录选择器（见 [`extract_local_jwt_from_dir`]），
+/// 「明明登录了却导入失败」几乎都是**读错了目录**。把 `source_dir` / `source`
+/// 随返回值一起交出去，调用方才能在响应里让用户自证，而不是只能看到一句「没找到凭据」。
+///
+/// ## `device_id` 为什么是 `Option` 且**不回落**
+///
+/// 它取的是**同一个 `source_dir`** 里的设备身份（[`icube::device_identity_from_dir`]）。
+/// 取不到就是 `None` —— **不得**退回去别的目录取：那会让「凭据来自 A、设备身份来自 B」，
+/// 正是本项目反复栽的「校验的对象与操作的对象不同源」。宁可留空。
+///
+/// ## `Debug` 手写脱敏
+///
+/// `authorization` 是**完整请求头值（含令牌）**，`#[derive(Debug)]` 会让一次
+/// `dbg!` / `{:?}` 就把它打进日志 —— 与 `icube::CloudideAuthInfo` 同守脱敏红线。
+#[derive(Clone)]
+pub struct LocalLogin {
+    /// 账号 ID（`userId`，或从 JWT payload 解出）。
+    pub user_id: String,
+    /// **完整**请求头值，**恒含** `Cloud-IDE-JWT ` 前缀。
+    pub authorization: String,
+    /// 同一 `source_dir` 里的设备身份（`icube-dc` 键内嵌）；取不到为 `None`。
+    pub device_id: Option<String>,
+    /// 实际读取的那个 userData 目录（给用户自证「读的是哪个目录」）。
+    pub source_dir: PathBuf,
+    /// 凭据来源（iCube 信封 / 登录态文件 / 令牌数据库 / 扩展日志）。
+    pub source: &'static str,
+}
+
+impl std::fmt::Debug for LocalLogin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalLogin")
+            .field("user_id", &self.user_id)
+            .field("authorization", &"<redacted>")
+            .field("device_id", &self.device_id)
+            .field("source_dir", &self.source_dir)
+            .field("source", &self.source)
+            .finish()
+    }
+}
+
+/// 按**产品线变体**提取当前登录账号的 JWT（[`import_local_login_for`] 的兼容壳）。
+///
+/// 本函数**只保留签名**：全仓库的生产调用点是 `account.rs` 的「导入本机账号」，
+/// 它要的就是这两个值。目录选择与来源判定已全部下沉到 [`import_local_login_for`]，
+/// 那里会**先找「装着登录态的那个候选目录」**—— 这是修用户机器上「导入必然失败」的关键
+/// （本机 `TRAE SOLO CN` 有登录态、更活跃的 `TRAE SOLO` 没有；旧实现只取活跃目录 ⇒ 必然读不到）。
 ///
 /// ## 为什么必须带 `variant`（这是「导入报错说错产品线」的修复点）
 ///
 /// 旧签名走 [`platform::detect_data_dir`]，它**横跨全部变体**挑最近活跃的目录。
 /// 于是用户在 Trae Work 分区点「导入本机账号」时，若本机 `Trae CN` 更活跃，
 /// 代码会去读 `Trae CN` 的目录 —— 报错文案也会跟着说成 Trae CN，把用户往错误
-/// 的排障方向带。本函数把候选**限定在传入变体之内**（[`platform::select_data_dir_for`]），
+/// 的排障方向带。现在候选**严格限定在传入变体之内**，
 /// 使「用户在哪个分区操作」真正进入代码。
-///
-/// 该变体没有任何存在的候选目录时，给出**指向该变体**的明确错误，
-/// 而不是含糊的「未检测到 Trae 客户端数据目录」。
 ///
 /// ## 来源优先级（**顺序不可调换**）
 ///
 /// | 序 | 来源 | 覆盖范围 | 实现 |
 /// |:--|:--|:--|:--|
-/// | 1 | `storage.json` 的 `iCubeAuthInfo://icube.cloudide` **tc 信封** | **两条产品线都有** | [`icube_login_candidate`] |
+/// | 1 | `storage.json` 的 `iCubeAuthInfo://icube.cloudide` **tc 信封** | **两条产品线都有** | [`icube_login_candidate_from_dir`] |
 /// | 2 | `storage.json` / `state.vscdb` 明文 + 扩展日志 | 只有装了 `trae.ai-code-completion` 的产品线 | [`collect_log_candidates`] |
 ///
 /// **为什么主来源必须是 tc 信封**：`TRAE SOLO CN`（Trae Work）实测 355 个日志文件、
@@ -248,17 +295,47 @@ pub fn extract_local_jwt() -> Result<(String, String), String> {
 /// `Ok((uid, header_value))` 的第二个值**恒为完整请求头值**（含 `Cloud-IDE-JWT ` 前缀），
 /// 与 OAuth 路径落库的形态一致（`account.rs` 里的 `jwt::authorization_header`）。
 /// 调用方**不得**再自行拼前缀，也**不得**把裸 token 当完整头值落库。
+/// 需要 `device_id` / `source_dir`（给用户自证读的是哪个目录）时用
+/// [`import_local_login_for`]，不要在这里加参数。
 pub fn extract_local_jwt_for(variant: TraeVariant) -> Result<(String, String), String> {
-    let data_dir = platform::select_data_dir_for(variant).ok_or_else(|| {
-        format!(
-            "未找到【{}】的数据目录，请先启动一次该客户端并登录",
-            variant.display_name()
-        )
-    })?;
-    extract_local_jwt_from_dir(&data_dir, variant)
+    let login = import_local_login_for(variant)?;
+    Ok((login.user_id, login.authorization))
 }
 
-/// 从**指定数据目录**读凭据（显式入参）。
+/// 导入该变体本机的登录态（**先找「装着登录态」的目录，再回落「最近活跃」**）。
+///
+/// ## 目录选择顺序（**不可调换**）
+///
+/// | 序 | 目录 | 选择器 | 理由 |
+/// |:--|:--|:--|:--|
+/// | 1 | 该变体**装着登录态**的候选 | [`icube::login_state_dir_for`] | 登录态在哪，就该读哪 |
+/// | 2 | 该变体**最近活跃**的候选 | [`platform::select_data_dir_for`] | 回落：至少有目录可读、可给出诊断 |
+///
+/// ⚠️ **不能反过来**。「最近活跃」只说明**用户最近在用**，不说明**那里有登录态** ——
+/// 本机实测：`TRAE SOLO CN` 有登录态、更活跃的 `TRAE SOLO` 没有。只取活跃目录
+/// ⇒ 读不到凭据 ⇒ 用户看到「明明登录了，导入却说找不到登录态」，且**必然复现**。
+/// 回落分支存在的意义只是「给一个指向该变体的诊断」，不是「碰运气读到一个凭据」。
+///
+/// 一个候选目录都不存在时，给出**指向该变体**的错误（而不是含糊的「未检测到数据目录」）。
+pub fn import_local_login_for(variant: TraeVariant) -> Result<LocalLogin, String> {
+    // 目录选择：**先**「装着登录态的候选」，**取不到才**回落「最近活跃的候选」。
+    // 顺序不可调换（理由见函数文档）。
+    //
+    // ⚠️ 这里刻意**不抽成函数**：只有一个调用点、一行逻辑；抽出去会让「唯一取值点」
+    // 的命名空间（`*_dir_for`）多一个同形符号，误导静态检查（`check_round3.py` 的 R1-1
+    // 正是按 `fn *_dir_for` 找取值点）与后来的读者。
+    let data_dir = icube::login_state_dir_for(variant)
+        .or_else(|| platform::select_data_dir_for(variant))
+        .ok_or_else(|| {
+            format!(
+                "未找到【{}】的数据目录，请先启动一次该客户端并登录",
+                variant.display_name()
+            )
+        })?;
+    local_login_from_dir(&data_dir, variant)
+}
+
+/// 从**指定数据目录**读登录态（显式入参）—— 导入侧的**唯一实现**。
 ///
 /// ## 为什么要有这个「显式目录」的形态
 ///
@@ -266,7 +343,7 @@ pub fn extract_local_jwt_for(variant: TraeVariant) -> Result<(String, String), S
 ///
 /// | 选择器 | 语义 | 谁在用 |
 /// |:--|:--|:--|
-/// | [`platform::select_data_dir_for`] | **最近活跃**的候选 | 导入（`extract_local_jwt_for`） |
+/// | [`platform::select_data_dir_for`] | **最近活跃**的候选 | 导入的**回落**分支、`variants_status` 展示 |
 /// | [`platform::detect_data_dir_for`] | **首个存在**的候选 | 备份 / 恢复 / 守卫要守护的那个操作 |
 ///
 /// 实测（Trae Work，本机）：`select` 给 `TRAE SOLO`（客户端启动过、**从未登录**），
@@ -282,28 +359,43 @@ pub fn extract_local_jwt_for(variant: TraeVariant) -> Result<(String, String), S
 /// 所以：**校验的对象与操作的对象必须用同一个目录**。本函数把「读哪个目录」
 /// 变成调用方的显式入参，让两件事能锁定同一个目录。
 ///
-/// ⚠️ 两个入口**各取所需，不要合并**。它们的差别是**目录选择器的语义**，不是「要不要传目录」：
+/// ## 三个入口各取所需，**不要合并**
 ///
 /// | 入口 | 读哪个目录 | 选择器 |
 /// |:--|:--|:--|
-/// | 导入（[`extract_local_jwt_for`]） | 该变体**最近活跃**的候选 | [`platform::select_data_dir_for`] |
+/// | 导入（[`import_local_login_for`]） | 该变体**装着登录态**的候选；取不到才回落**最近活跃**的 | [`icube::login_state_dir_for`] → [`platform::select_data_dir_for`] |
 /// | 备份 / 恢复 / 守卫 | 该变体**首个存在**的候选（写侧来源） | [`snapshot_data_dir_for`]，即 [`platform::detect_data_dir_for`] |
 ///
-/// 导入必须读**活跃**目录：用户在活跃客户端里刚登录完就点导入，若读写侧目录会读到
-/// 另一份旧登录态。反之，备份 / 恢复 / 守卫必须读**写侧**目录 —— 那是「快照要读写
-/// 哪个目录」的唯一来源，改它会动到切换行为。
+/// **导入为什么不能只读活跃目录**：本机实测 `TRAE SOLO CN` 有登录态、更活跃的
+/// `TRAE SOLO` 没有 —— 只取活跃 ⇒ **必然**读不到凭据，用户看到「明明登录了却导入失败」。
+/// 两个候选**都有**登录态时，[`icube::login_state_dir_for`] 取其中**最活跃**的那个
+/// （遍历顺序即活跃度降序），所以「刚在活跃客户端里登录完就点导入」仍读到新那份。
+///
+/// 反之，备份 / 恢复 / 守卫必须读**写侧**目录 —— 那是「快照要读写哪个目录」的唯一来源，
+/// 改它会动到切换行为。
 ///
 /// ⚠️ **不要按「候选表首位」理解写侧**：R3 之后 [`platform::detect_data_dir_for`]
 /// 取的是**首个存在的候选**，不再恒等于 `names[0]`。在只装了 `TRAE SOLO`
 /// （没有 `TRAE SOLO CN`）的机器上，这两者**不是同一个目录** —— 正是 R3 修掉的缺陷。
 /// 共用的是这个原语，不是目录选择器。
-fn extract_local_jwt_from_dir(
-    data_dir: &Path,
-    variant: TraeVariant,
-) -> Result<(String, String), String> {
+fn local_login_from_dir(data_dir: &Path, variant: TraeVariant) -> Result<LocalLogin, String> {
+    // 设备身份取**同一个目录**的；取不到即 `None`，**不**回落去别的目录 ——
+    // 否则「凭据来自 A、设备身份来自 B」，正是本项目反复栽的不同源。
+    // 它只是附带信息，缺失不影响「导入本身是否可用」。
+    let device_id = icube::device_identity_from_dir(data_dir, variant)
+        .ok()
+        .map(|identity| identity.device_id);
+    let source_dir = data_dir.to_path_buf();
+
     // ── 主来源：iCube 登录态副本（tc 信封；Trae Work 唯一可用的来源） ──────────
-    if let Some(found) = icube_login_candidate_from_dir(data_dir, variant)? {
-        return Ok(found);
+    if let Some((user_id, authorization)) = icube_login_candidate_from_dir(data_dir, variant)? {
+        return Ok(LocalLogin {
+            user_id,
+            authorization,
+            device_id,
+            source_dir,
+            source: "iCube 登录态副本",
+        });
     }
 
     // ── 兜底：明文来源（旧版 storage.json / state.vscdb，新版只剩扩展日志） ──
@@ -346,7 +438,7 @@ fn extract_local_jwt_from_dir(
     }
 
     let (token, exp, source) =
-        best.ok_or_else(|| diagnose_missing_credential(&data_dir, variant))?;
+        best.ok_or_else(|| diagnose_missing_credential(data_dir, variant))?;
     if exp > 0 && exp < chrono::Utc::now().timestamp() {
         return Err(format!(
             "在{source}找到的登录凭据已过期，请先在 Trae 中重新登录后再导入；\
@@ -358,7 +450,25 @@ fn extract_local_jwt_from_dir(
         .ok_or_else(|| "解析到登录凭据但无法确定账号归属".to_string())?;
     // 统一形态：明文来源捞出的是**裸** token（`scan_jwt_tokens` 已剥前缀），
     // 落库前补成完整请求头值 —— 与主来源、与 OAuth 路径三者一致。
-    Ok((uid, crate::modules::trae::jwt::authorization_header(&token)))
+    Ok(LocalLogin {
+        user_id: uid,
+        authorization: crate::modules::trae::jwt::authorization_header(&token),
+        device_id,
+        source_dir,
+        source,
+    })
+}
+
+/// 从**指定数据目录**读凭据（显式入参）—— [`local_login_from_dir`] 的兼容壳。
+///
+/// 只保留「两个字符串」的旧签名（守卫与既有测试用它）。需要 `device_id` /
+/// `source_dir` / `source` 时用 [`local_login_from_dir`] 或 [`import_local_login_for`]。
+fn extract_local_jwt_from_dir(
+    data_dir: &Path,
+    variant: TraeVariant,
+) -> Result<(String, String), String> {
+    let login = local_login_from_dir(data_dir, variant)?;
+    Ok((login.user_id, login.authorization))
 }
 
 /// 主来源：iCube 登录态副本（`storage.json` 的 `iCubeAuthInfo://icube.cloudide` tc 信封）。
@@ -2805,8 +2915,13 @@ mod tests {
     ///
     /// fixture 构造成**首位候选有凭据、最近活跃的那个没有** —— 真机 Trae Work 就是这个形态
     /// （`TRAE SOLO CN` 有登录态、`TRAE SOLO` 更活跃但没有）。
-    /// 旧实现用 `extract_local_jwt_for`（走 `select_data_dir_for`）取证 ⇒ 读不到 ⇒
+    /// 旧实现用 `extract_local_jwt_for`（当时走 `select_data_dir_for`）取证 ⇒ 读不到 ⇒
     /// fail-open ⇒ **静默放行**，守卫等于不存在。
+    ///
+    /// ⚠️ T13-3 之后 `extract_local_jwt_for` 已改为「**先找装着登录态的目录**」，
+    /// 所以**不能**再用它来陈述「读活跃目录会失败」这个前置（它现在会成功）。
+    /// 本用例改用**显式传入活跃目录**的读取来陈述同一事实 ——
+    /// 「守卫必须自己传目录、不得回头调选择器」这个结论不因那条语义变化而改变。
     #[cfg(windows)]
     #[test]
     fn save_guard_reads_the_same_dir_as_the_guarded_operation() {
@@ -2843,9 +2958,13 @@ mod tests {
             platform::select_data_dir_for(variant).unwrap(),
             "前置：fixture 必须让两个选择器分叉"
         );
+        // ⚠️ 这里**不能**用 `extract_local_jwt_for` 来证明「活跃目录没凭据」：
+        // T13-3 之后它会先找装着登录态的目录（首位有凭据）⇒ 会成功。
+        // 直接读**活跃目录**才是这条前置要陈述的事实。
+        let active_dir = platform::select_data_dir_for(variant).expect("活跃候选应存在");
         assert!(
-            extract_local_jwt_for(variant).is_err(),
-            "前置：活跃目录没有凭据 —— 旧实现正是靠这一点静默 fail-open"
+            extract_local_jwt_from_dir(&active_dir, variant).is_err(),
+            "前置：活跃目录没有凭据 —— 守卫若从活跃目录取证就会静默 fail-open"
         );
         assert_eq!(
             extract_local_jwt_from_dir(&first_dir, variant)
@@ -3233,5 +3352,203 @@ mod tests {
             RestoreCheck::Unverifiable,
             "读不到时必须 fail-open，不能把正常切换判成失败"
         );
+    }
+
+    // ---------- T13-3：导入侧先找「装着登录态」的目录 ----------
+
+    /// ★【T13-3 核心】登录态在**不活跃**的候选、活跃候选**没有** ⇒ 导入仍必须成功，
+    /// 且 `source_dir` 指向**装着登录态的那个** —— 这就是用户机器上的形态
+    /// （`TRAE SOLO CN` 有登录态、更活跃的 `TRAE SOLO` 没有）。
+    ///
+    /// 旧实现只取「最近活跃」⇒ 读不到凭据 ⇒「导入必然失败」，且**必然复现**。
+    #[cfg(windows)]
+    #[test]
+    fn import_local_login_reads_the_dir_that_holds_the_credential_not_the_active_one() {
+        let env = crate::modules::trae::test_support::TempEnv::empty();
+        let variant = TraeVariant::TraeWork;
+        let grid = icube::test_support::write_selection_grid(
+            &env.appdata(),
+            variant,
+            &[(true, false, true), (true, true, false)],
+            chrono::Utc::now().timestamp() + 3600,
+        );
+        // 前置：活跃的那个**没有**登录态、有登录态的那个**不活跃**。
+        // 若两者恰好一致，本用例证明不了任何事（假绿）。
+        assert!(
+            grid.cells[0].active && !grid.cells[0].logged_in,
+            "前置：首位必须活跃且无登录态"
+        );
+        assert!(
+            !grid.cells[1].active && grid.cells[1].logged_in,
+            "前置：次位必须不活跃且有登录态"
+        );
+
+        let login = import_local_login_for(variant).expect("登录态在次位候选，导入必须成功");
+        assert_eq!(
+            login.user_id, grid.cells[1].user_id,
+            "必须导入**装着登录态**那个目录的账号"
+        );
+        assert_eq!(
+            login.source_dir, grid.cells[1].dir,
+            "source_dir 必须是实际读的那个目录"
+        );
+        assert_eq!(login.source, "iCube 登录态副本");
+        assert!(
+            login.authorization.starts_with("Cloud-IDE-JWT "),
+            "落库形态必须含 Cloud-IDE-JWT 前缀（不打印值，见脱敏红线）"
+        );
+
+        // 对照：活跃目录选择器给的是**首位** —— 两个问题答案不同，别混用。
+        assert_eq!(
+            platform::select_data_dir_for(variant)
+                .and_then(|dir| dir.file_name().map(|n| n.to_string_lossy().to_string())),
+            Some(grid.cells[0].name.to_string()),
+            "对照：select_data_dir_for 仍取最近活跃的那个（首位）"
+        );
+    }
+
+    /// 两个候选**都有**登录态 ⇒ 取 [`icube::login_state_dir_for`] 认定的那个
+    /// （即**最活跃**的），而不是「候选表首个」。
+    #[cfg(windows)]
+    #[test]
+    fn import_local_login_prefers_the_active_one_when_both_hold_a_credential() {
+        let env = crate::modules::trae::test_support::TempEnv::empty();
+        let variant = TraeVariant::TraeWork;
+        let grid = icube::test_support::write_selection_grid(
+            &env.appdata(),
+            variant,
+            &[(true, true, false), (true, true, true)],
+            chrono::Utc::now().timestamp() + 3600,
+        );
+        assert!(
+            !grid.cells[0].active && grid.cells[1].active,
+            "前置：次位必须活跃"
+        );
+
+        let login = import_local_login_for(variant).expect("两个候选都有登录态，必须成功");
+        assert_eq!(
+            login.source_dir, grid.cells[1].dir,
+            "两处都有登录态时应取**最活跃**的那个（用户在活跃客户端刚登录完）"
+        );
+        assert_eq!(login.user_id, grid.cells[1].user_id);
+    }
+
+    /// 任何候选都**没有**登录态 ⇒ 报错指向该变体，且**不**指向写侧目录。
+    ///
+    /// fixture 让「最近活跃」与「写侧（首个存在）」指向**不同**目录，
+    /// 这样「回落的是活跃目录、不是写侧目录」才可区分 —— 两者同目录时本用例证明不了。
+    #[cfg(windows)]
+    #[test]
+    fn import_local_login_reports_variant_specific_error_without_falling_back_to_write_side() {
+        let env = crate::modules::trae::test_support::TempEnv::empty();
+        let variant = TraeVariant::TraeWork;
+        let grid = icube::test_support::write_selection_grid(
+            &env.appdata(),
+            variant,
+            &[(true, false, false), (true, false, true)],
+            chrono::Utc::now().timestamp() + 3600,
+        );
+        // 前置：活跃的是**次位**、写侧（首个存在）是**首位** —— 两者不同目录。
+        assert!(!grid.cells[0].active && grid.cells[1].active);
+        assert_eq!(
+            snapshot_data_dir_for(variant).and_then(|dir| dir
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())),
+            Some(grid.cells[0].name.to_string()),
+            "前置：写侧来源必须解析到首位"
+        );
+
+        let error = import_local_login_for(variant).expect_err("两处都没有登录态，必须报错");
+        assert!(error.contains("Trae Work"), "错误必须指向该变体: {error}");
+        assert!(
+            error.contains(&grid.cells[1].dir.display().to_string()),
+            "诊断应显示**导入侧实际选定**的目录（活跃的那个）: {error}"
+        );
+        assert!(
+            !error.contains(&grid.cells[0].dir.display().to_string()),
+            "诊断**不得**指向写侧目录（那是另一个问题）: {error}"
+        );
+    }
+
+    /// ★ 导入的 `device_id` 必须取自**同一个 `source_dir`**；那里取不到就是 `None`，
+    /// **不得**回头去别的候选目录取 —— 否则「凭据来自 A、设备身份来自 B」。
+    #[cfg(windows)]
+    #[test]
+    fn import_local_login_never_takes_device_id_from_another_dir() {
+        let env = crate::modules::trae::test_support::TempEnv::empty();
+        let variant = TraeVariant::TraeWork;
+        // 首位：有登录态、**没有** `icube-dc`；次位：**有** `icube-dc`、没有登录态。
+        let grid = icube::test_support::write_selection_grid(
+            &env.appdata(),
+            variant,
+            &[(true, true, false), (true, false, true)],
+            chrono::Utc::now().timestamp() + 3600,
+        );
+        icube::test_support::attach_device_entry(
+            &env.appdata(),
+            grid.cells[1].name,
+            "22929298067000009",
+        );
+
+        let login = import_local_login_for(variant).expect("首位有登录态，必须成功");
+        assert_eq!(login.source_dir, grid.cells[0].dir);
+        assert!(
+            login.device_id.is_none(),
+            "source_dir 里没有 icube-dc ⇒ 必须为 None，**不得**去次位取: {:?}",
+            login.device_id
+        );
+    }
+
+    /// `source_dir` 里**有** `icube-dc` 时，`device_id` 必须取到（同源）。
+    #[cfg(windows)]
+    #[test]
+    fn import_local_login_takes_device_id_from_the_same_dir() {
+        let env = crate::modules::trae::test_support::TempEnv::empty();
+        let variant = TraeVariant::TraeWork;
+        let grid = icube::test_support::write_selection_grid(
+            &env.appdata(),
+            variant,
+            &[(true, true, true), (true, false, false)],
+            chrono::Utc::now().timestamp() + 3600,
+        );
+        let device_id = "22929298067000007";
+        icube::test_support::attach_device_entry(
+            &env.appdata(),
+            grid.cells[0].name,
+            device_id,
+        );
+
+        let login = import_local_login_for(variant).expect("首位有登录态，必须成功");
+        assert_eq!(login.source_dir, grid.cells[0].dir);
+        assert_eq!(login.device_id.as_deref(), Some(device_id));
+    }
+
+    /// `extract_local_jwt_for` 退化为兼容壳后，**签名与返回形态不变**，
+    /// 且与 [`import_local_login_for`] **同一个实现**（不允许两套目录选择）。
+    #[cfg(windows)]
+    #[test]
+    fn extract_local_jwt_for_stays_a_compatible_shell_over_import_local_login() {
+        let env = crate::modules::trae::test_support::TempEnv::empty();
+        let variant = TraeVariant::TraeWork;
+        let grid = icube::test_support::write_selection_grid(
+            &env.appdata(),
+            variant,
+            &[(true, false, true), (true, true, false)],
+            chrono::Utc::now().timestamp() + 3600,
+        );
+
+        let (uid, header) = extract_local_jwt_for(variant).expect("兼容壳也必须走新目录选择");
+        assert_eq!(
+            uid, grid.cells[1].user_id,
+            "兼容壳必须与 import_local_login_for 同源（不得读活跃目录）"
+        );
+        assert!(
+            header.starts_with("Cloud-IDE-JWT "),
+            "返回形态不变：第二个值恒含前缀"
+        );
+
+        let login = import_local_login_for(variant).unwrap();
+        assert_eq!(uid, login.user_id);
+        assert_eq!(header, login.authorization, "两者必须是同一个实现");
     }
 }

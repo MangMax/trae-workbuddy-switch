@@ -779,10 +779,6 @@ pub(crate) fn device_credential_by_device_id(
 ///
 /// ⚠️ **不判过期**：本函数只回答「凭据在哪个目录」，token 是否过期、是否可用
 /// 是调用方的策略（`profile` 侧还要比对 `exp` / `userId`）。
-///
-/// ⚠️ `allow(dead_code)`：消费方是 T13-3「导入侧先找装着登录态的那个目录」。
-/// 本轮只落地接口，接线后**必须**删掉这个属性。
-#[allow(dead_code)]
 pub(crate) fn login_state_dir_for(variant: TraeVariant) -> Option<std::path::PathBuf> {
     platform::data_dirs_by_activity_for(variant)
         .into_iter()
@@ -1222,6 +1218,49 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEc5xtFi4XpzYjFuYwN0sBaUzcnrds\n\
             out.push((device_id, *name, dir));
         }
         out
+    }
+
+    /// 往**已存在的**候选目录的 `storage.json` 里追加一条 `icube-dc` 设备凭证。
+    ///
+    /// 用于构造「登录态在 A、设备身份在 B」这类**跨目录**形态：导入必须只读 A，
+    /// 在 A 里取不到设备身份就是 `None` —— **不得**回头去 B 取（那会让「凭据来自 A、
+    /// 设备身份来自 B」，正是本项目反复栽的不同源）。
+    ///
+    /// ⚠️ 写回会刷新 `storage.json` 的 mtime，故这里**把原 mtime 恢复回去** ——
+    /// 否则会打乱 [`write_selection_grid`] 钉好的活跃度（那正是它要防的坑）。
+    pub(crate) fn attach_device_entry(
+        base: &std::path::Path,
+        name: &str,
+        device_id: &str,
+    ) -> std::path::PathBuf {
+        let file = base
+            .join(name)
+            .join("User")
+            .join("globalStorage")
+            .join("storage.json");
+        let previous = std::fs::metadata(&file)
+            .and_then(|meta| meta.modified())
+            .ok();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&file).expect("fixture storage.json 应存在"))
+                .expect("fixture storage.json 应是合法 JSON");
+        value
+            .as_object_mut()
+            .expect("fixture storage.json 顶层应是对象")
+            .insert(
+                format!("{ICUBE_DC_PREFIX}{device_id}"),
+                serde_json::json!(synthetic_device_envelope()),
+            );
+        std::fs::write(&file, serde_json::to_vec_pretty(&value).unwrap())
+            .expect("fixture storage.json 应能写回");
+        if let Some(previous) = previous {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&file)
+                .and_then(|handle| handle.set_modified(previous))
+                .expect("应能把 storage.json 的 mtime 恢复回去");
+        }
+        file
     }
 
     /// 在 `base` 下铺一份**合成**的 Trae userData 目录树，覆盖全部变体的候选目录名。
