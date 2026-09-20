@@ -57,6 +57,7 @@ use serde_json::{json, Map, Value};
 use sha2::Digest as _;
 
 use crate::modules::trae::platform;
+use crate::modules::trae::store;
 use crate::modules::trae::variant::TraeVariant;
 
 /// `tc` 信封 magic：hex `746305100000`。
@@ -161,6 +162,13 @@ pub enum IcubeError {
     PrivateKeyMissing,
     /// PEM 解析失败（仅 refresh 路径可能遇到）。
     PrivateKeyInvalid(String),
+    /// 该变体的候选目录里**没有任何** `icube-dc` 条目（设备身份未注册）。
+    DeviceIdentityMissing,
+    /// 候选目录里**有** `icube-dc` 条目，但没有一条绑定请求的 `deviceId`。
+    ///
+    /// 载荷是**已脱敏**的对比描述（`store::mask` 口径），**不得**塞入 deviceId 原文 ——
+    /// 与其余变体同守模块头的脱敏红线。
+    DeviceIdentityMismatch(String),
 }
 
 impl IcubeError {
@@ -174,6 +182,8 @@ impl IcubeError {
             IcubeError::PublicKeyMissing => "publicKeyMissing",
             IcubeError::PrivateKeyMissing => "privateKeyMissing",
             IcubeError::PrivateKeyInvalid(_) => "privateKeyInvalid",
+            IcubeError::DeviceIdentityMissing => "deviceIdentityMissing",
+            IcubeError::DeviceIdentityMismatch(_) => "deviceIdentityMismatch",
         }
     }
 
@@ -211,6 +221,14 @@ impl IcubeError {
             IcubeError::PrivateKeyInvalid(detail) => format!(
                 "【{line}】的设备私钥格式无效（{detail}），自动续期不可用；\
                  请重新启动一次该客户端以刷新凭证。"
+            ),
+            IcubeError::DeviceIdentityMissing => format!(
+                "【{line}】的 storage.json 中没有设备身份（iCubeAuthInfo://icube-dc）；\
+                 请先在客户端里完成一次登录，或改用「OAuth 网页登录」重新授权。"
+            ),
+            IcubeError::DeviceIdentityMismatch(detail) => format!(
+                "【{line}】的设备身份与账号绑定的不一致（{detail}）；\
+                 该账号绑定的设备已变更，请重新导入登录态，或改用「OAuth 网页登录」重新授权。"
             ),
         }
     }
@@ -598,9 +616,26 @@ fn find_icube_dc_entry(object: &Map<String, Value>) -> Result<(String, String), 
 
 /// 按**变体**取设备身份（AuthCode 路径 / 诊断）。
 ///
-/// 数据目录由 [`platform::select_data_dir_for`] 天然限定在该变体内。
+/// 目录取 [`platform::select_data_dir_for`]（最近活跃）。需要「与某个具体操作指向
+/// **同一个目录**」时用 [`device_identity_from_dir`]。
 pub fn device_identity_for(variant: TraeVariant) -> Result<DeviceIdentity, IcubeError> {
-    let snapshot = load_storage(variant)?;
+    let dir = platform::select_data_dir_for(variant).ok_or(IcubeError::DataDirMissing)?;
+    device_identity_from_dir(&dir, variant)
+}
+
+/// 从**指定目录**取设备身份（显式入参）。
+///
+/// 存在的理由与 [`cloudide_auth_info_from_dir`] 相同：同一变体的多个候选目录
+/// **可能装着不同设备 / 不同账号的凭据**，而两个选择器给出的目录**可能不同**。
+/// 调用方需要让「校验的对象」与「操作的对象」落在同一目录时，先自己定目录再走这里。
+///
+/// 目录里有**多个** `icube-dc` 条目时取第一个（[`find_icube_dc_entry`] 的既有语义）；
+/// 要按 `deviceId` **精确取某一条**用 [`device_credential_by_device_id`]。
+pub(crate) fn device_identity_from_dir(
+    dir: &std::path::Path,
+    variant: TraeVariant,
+) -> Result<DeviceIdentity, IcubeError> {
+    let snapshot = load_storage_from_dir(dir, variant)?;
     let (device_id, b64) = find_icube_dc_entry(&snapshot.object)?;
     let plain = tc_decrypt(&b64, TcMode::Aes)?;
     identity_from_plain(
@@ -643,6 +678,115 @@ pub(crate) fn cloudide_auth_info_from_dir(
     let snapshot = load_storage_from_dir(dir, variant)?;
     let plain = decrypt_storage_key(&snapshot.object, CLOUDIDE_KEY, TcMode::Aes)?;
     cloudide_from_plain(&plain, variant)
+}
+
+/// 按**指定 `deviceId`** 取设备凭证（refresh 路径）。
+///
+/// ## 为什么需要它（而不是复用 [`device_credential_for`]）
+///
+/// [`device_credential_for`] 取的是「该变体当前目录里的那一条」—— 客户端换过设备
+/// 或换过账号后，那一条**未必**是账号绑定的那台设备的。续期必须用**账号绑定的
+/// 那台设备的私钥**签名，用错私钥会被服务端拒绝（或更糟：静默失败）。
+///
+/// 故本函数按 `deviceId` **精确取**，并且**必须**在拿到条目后确认它确实绑定了
+/// 请求的 `deviceId` —— 这是本函数存在的全部意义。
+///
+/// ## ★ 断言为什么不是同义反复
+///
+/// `deviceId` 是从 **key 名**（`iCubeAuthInfo://icube-dc:<deviceId>`）里**解析**出来的
+/// （见 [`find_icube_dc_entry`] / 下面的遍历），**不是**用 `format!` 拼进 key 再查。
+/// 若按拼接 key 精确查表，这条断言确实恒真、等于没有 —— 那种写法会漏掉
+/// 「目录里只有别的设备的条目」这一情形，把 `DeviceIdentityMissing` 与
+/// `DeviceIdentityMismatch` 混为一谈。
+///
+/// ## 遍历顺序与失败语义
+///
+/// 候选目录按**最近活跃降序**（[`platform::data_dirs_by_activity_for`]，只含存在的）；
+/// 目录读不出 `storage.json` 时跳过（继续找下一个，而不是整体失败）。
+///
+/// - 所有候选目录里**一条 `icube-dc` 都没有** ⇒ [`IcubeError::DeviceIdentityMissing`]；
+/// - 有若干条、但**没有一条**绑定请求的 `deviceId` ⇒ [`IcubeError::DeviceIdentityMismatch`]
+///   （载荷列出本机有的那些 id 的**脱敏**值，便于用户判断是不是换过设备）。
+///
+/// ⚠️ `allow(dead_code)`：消费方是 T13-4「续期按账号绑定的设备取」。本轮只落地接口，
+/// 接线后**必须**删掉这个属性。
+#[allow(dead_code)]
+pub(crate) fn device_credential_by_device_id(
+    variant: TraeVariant,
+    device_id: &str,
+) -> Result<DeviceCredential, IcubeError> {
+    let mut others: Vec<String> = Vec::new();
+    for dir in platform::data_dirs_by_activity_for(variant) {
+        let Ok(snapshot) = load_storage_from_dir(&dir, variant) else {
+            continue;
+        };
+        // 遍历**全部** `icube-dc` 条目：不预设 key，`found_id` 一律从键名解析。
+        for (key, value) in &snapshot.object {
+            let Some(found_id) = key.strip_prefix(ICUBE_DC_PREFIX) else {
+                continue;
+            };
+            if found_id != device_id {
+                others.push(found_id.to_string());
+                continue;
+            }
+            let Some(b64) = value.as_str() else {
+                continue;
+            };
+            let plain = tc_decrypt(b64, TcMode::Aes)?;
+            let credential =
+                credential_from_plain(&plain, variant, found_id, &snapshot.source_app)?;
+            // ★ 断言：解出的凭证必须确实绑定请求的 deviceId。不匹配**不得**返回 ——
+            //   否则「绑定错了设备」会静默用错私钥（见函数文档）。
+            if credential.device_id != device_id {
+                return Err(IcubeError::DeviceIdentityMismatch(format!(
+                    "请求 {}，条目绑定 {}",
+                    store::mask(device_id),
+                    store::mask(&credential.device_id)
+                )));
+            }
+            return Ok(credential);
+        }
+    }
+    if others.is_empty() {
+        Err(IcubeError::DeviceIdentityMissing)
+    } else {
+        Err(IcubeError::DeviceIdentityMismatch(format!(
+            "请求 {}，本机仅有 {}",
+            store::mask(device_id),
+            others
+                .iter()
+                .map(|id| store::mask(id))
+                .collect::<Vec<_>>()
+                .join(" / ")
+        )))
+    }
+}
+
+/// 该变体**哪个候选目录装着登录态**（凭据副本，供导入侧定位来源）。
+///
+/// ## 为什么需要它
+///
+/// 同一变体的多个候选目录**可能只有一个装着登录态**（实测 Trae Work：
+/// `TRAE SOLO CN` 有登录态、`TRAE SOLO` 没有，而后者更**活跃**）。
+/// 导入侧若只看「最近活跃」，在用户机器上会**必然读不到凭据** ——
+/// 用户看到的症状是「明明登录了，导入却说找不到登录态」。
+///
+/// 判定口径：该目录能解出 [`CloudideAuthInfo`]（即 `iCubeAuthInfo://icube.cloudide`
+/// 存在且可解密），与 [`crate::modules::trae::profile`] 的登录态来源**同一口径**。
+///
+/// 遍历顺序按**最近活跃降序**（多个目录都有登录态时取最活跃的那个）。
+/// 返回 `None` = 该变体没有任何候选目录装着登录态。
+///
+/// ⚠️ **不判过期**：本函数只回答「凭据在哪个目录」，token 是否过期、是否可用
+/// 是调用方的策略（`profile` 侧还要比对 `exp` / `userId`）。
+///
+/// ⚠️ `allow(dead_code)`：消费方是 T13-3「导入侧先找装着登录态的那个目录」。
+/// 本轮只落地接口，接线后**必须**删掉这个属性。
+#[allow(dead_code)]
+pub(crate) fn login_state_dir_for(variant: TraeVariant) -> Option<std::path::PathBuf> {
+    platform::data_dirs_by_activity_for(variant)
+        .into_iter()
+        .find(|dir| cloudide_auth_info_from_dir(dir, variant).is_ok())
 }
 
 // ---------------------------------------------------------------------------
@@ -1029,6 +1173,57 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEc5xtFi4XpzYjFuYwN0sBaUzcnrds\n\
             .expect("fixture 应能把 storage.json 的 mtime 钉死");
     }
 
+    /// 按**显式网格**铺「设备凭证」userData（`icube-dc` 信封）。
+    ///
+    /// `cells[i]` 对应 `data_dir_names_for(variant)[i]`，每格是 `(存在?, 活跃?)`；
+    /// 存在的格子各绑**不同** deviceId（`22929298067` + 6 位序号），活跃度用
+    /// [`pin_activity`] **显式钉死**（活跃 ⇒ `now`、不活跃 ⇒ `now - 24h`）。
+    ///
+    /// ## 为什么不能复用 [`write_synthetic_user_data`]
+    ///
+    /// 那个 helper 覆盖**全部变体**且**不钉活跃度** —— 候选目录的先后取决于**写入顺序**
+    /// （后写的 mtime 更新、更活跃），而 Windows 时间粒度约 15.6ms，同刻度时会退回
+    /// 候选表原顺序。`device_credential_by_device_id` 的护栏要求「请求的 deviceId 落在
+    /// **非首个、且不活跃**的候选里」，靠写入顺序会**随机假绿**。
+    ///
+    /// 返回 `(deviceId, 目录名, 目录路径)`，按候选表顺序（不存在的格子不返回）。
+    pub(crate) fn write_device_entries_grid(
+        base: &std::path::Path,
+        variant: TraeVariant,
+        cells: &[(bool, bool)],
+    ) -> Vec<(String, &'static str, std::path::PathBuf)> {
+        let names = crate::modules::trae::platform::data_dir_names_for(variant);
+        assert_eq!(
+            cells.len(),
+            names.len(),
+            "网格格数必须等于该变体的候选目录数"
+        );
+
+        let mut out = Vec::new();
+        for (index, ((exists, active), name)) in cells.iter().zip(names).enumerate() {
+            let dir = base.join(name);
+            if !*exists {
+                let _ = std::fs::remove_dir_all(&dir);
+                continue;
+            }
+            // 每个候选给**不同** deviceId：请求的那个若落在次位，
+            // 「只查首个候选」的实现会立刻暴露。
+            let device_id = format!("22929298067{index:06}");
+            let storage_dir = dir.join("User").join("globalStorage");
+            std::fs::create_dir_all(&storage_dir).expect("fixture 目录应能创建");
+            let storage = serde_json::json!({
+                format!("{ICUBE_DC_PREFIX}{device_id}"): synthetic_device_envelope(),
+                TELEMETRY_MACHINE_ID: format!("telemetry-{device_id}"),
+            });
+            let file = storage_dir.join("storage.json");
+            std::fs::write(&file, serde_json::to_vec_pretty(&storage).unwrap())
+                .expect("fixture storage.json 应能写入");
+            pin_activity(&file, if *active { 0 } else { 24 });
+            out.push((device_id, *name, dir));
+        }
+        out
+    }
+
     /// 在 `base` 下铺一份**合成**的 Trae userData 目录树，覆盖全部变体的候选目录名。
     ///
     /// 返回 `(deviceId, 目录名)` 列表，调用方可据此断言。
@@ -1068,6 +1263,8 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEc5xtFi4XpzYjFuYwN0sBaUzcnrds\n\
 mod tests {
     use super::test_support::*;
     use super::*;
+    #[cfg(windows)]
+    use crate::modules::trae::test_support::TempEnv;
     use std::sync::atomic::Ordering;
 
     fn test_credential() -> DeviceCredential {
@@ -1435,6 +1632,11 @@ mod tests {
             (IcubeError::PublicKeyMissing, "publicKeyMissing"),
             (IcubeError::PrivateKeyMissing, "privateKeyMissing"),
             (IcubeError::PrivateKeyInvalid("x".into()), "privateKeyInvalid"),
+            (IcubeError::DeviceIdentityMissing, "deviceIdentityMissing"),
+            (
+                IcubeError::DeviceIdentityMismatch("请求 aaaa…bbbb，本机仅有 cccc…dddd".into()),
+                "deviceIdentityMismatch",
+            ),
         ];
         for (error, expected) in cases {
             assert_eq!(error.kind(), expected);
@@ -1457,5 +1659,163 @@ mod tests {
             );
         }
         assert_ne!(random_hex(32), random_hex(32), "两次调用必须不同");
+    }
+
+    // ---------- T13-2：按 deviceId 精确取凭证 / 定位装着登录态的目录 ----------
+
+    /// 从**指定目录**取设备身份（显式入参）：`source_app` 必须是被喂进去的那个目录。
+    #[cfg(windows)]
+    #[test]
+    fn device_identity_from_dir_reads_the_given_dir() {
+        let env = TempEnv::empty();
+        let variant = TraeVariant::TraeWork;
+        // 首位**不活跃**、次位**活跃** —— 断言必须落在「被喂进去的那个目录」上，
+        // 而不是活跃目录。
+        let cells = write_device_entries_grid(&env.appdata(), variant, &[(true, false), (true, true)]);
+        let (device_id, name, dir) = &cells[1];
+
+        let identity =
+            device_identity_from_dir(dir, variant).expect("次位候选目录里应有可解的设备身份");
+        assert_eq!(identity.device_id, *device_id);
+        assert_eq!(
+            identity.source_app, *name,
+            "source_app 必须是**被喂进去的那个目录**，而不是活跃目录"
+        );
+    }
+
+    /// ★【T13-2 核心】按 `deviceId` 精确取凭证必须**遍历该变体的全部候选目录**，
+    /// 而不是只看「最近活跃」或「首个」那一个。
+    ///
+    /// fixture：首位**活跃**、次位**不活跃**，且请求的 deviceId 只落在**次位**。
+    /// ⇒ 「只查首个候选」与「按活跃度挑一个候选」两种退化实现都会失败。
+    /// 活跃度由 `write_device_entries_grid` 显式钉死，**不依赖写入顺序**。
+    #[cfg(windows)]
+    #[test]
+    fn device_credential_by_device_id_finds_the_entry_in_a_non_first_candidate() {
+        let env = TempEnv::empty();
+        let variant = TraeVariant::TraeWork;
+        let cells =
+            write_device_entries_grid(&env.appdata(), variant, &[(true, true), (true, false)]);
+        let (requested, name, _) = &cells[1];
+
+        let credential = device_credential_by_device_id(variant, requested)
+            .expect("请求的 deviceId 在**不活跃**的次位候选里，必须能找到");
+        assert_eq!(credential.device_id, *requested);
+        assert_eq!(credential.source_app, *name);
+        assert!(
+            credential.private_key_pem.contains("BEGIN"),
+            "refresh 路径拿到的必须是可用私钥"
+        );
+    }
+
+    /// ★【T13-2 核心】请求一个本机**不存在**的 deviceId ⇒ `DeviceIdentityMismatch`：
+    /// 既不报「缺失」，更**不得静默返回别的设备的凭证**（那会拿错私钥去签名）。
+    ///
+    /// 同时断言错误文案**不含** deviceId 原文（模块头的脱敏红线）。
+    #[cfg(windows)]
+    #[test]
+    fn device_credential_by_device_id_refuses_a_mismatch() {
+        let env = TempEnv::empty();
+        let variant = TraeVariant::TraeWork;
+        write_device_entries_grid(&env.appdata(), variant, &[(true, true), (true, true)]);
+
+        // 用与真机同形（17 位）的长 id：`store::mask` 只对 >8 字符生效，
+        // 短串会被**原样返回**，那样「脱敏」这条断言就失去意义了。
+        let requested = "99998888777766665";
+        let error = device_credential_by_device_id(variant, requested)
+            .expect_err("本机没有这个 deviceId，必须报错而不是返回别的设备的凭证");
+        assert_eq!(error.kind(), "deviceIdentityMismatch");
+
+        let message = error.user_message(variant);
+        assert!(
+            !message.contains(requested),
+            "错误文案不得出现 deviceId 原文：{message}"
+        );
+        assert!(
+            message.contains(&crate::modules::trae::store::mask(requested)),
+            "文案应给出**脱敏**后的对比值：{message}"
+        );
+    }
+
+    /// 候选目录里**一条 `icube-dc` 都没有** ⇒ `DeviceIdentityMissing`。
+    ///
+    /// 与上一条成对：这是「本机压根没注册设备」与「注册的是别的设备」的分界。
+    /// 混为一谈会让用户拿不到正确的下一步（前者要重新登录，后者要重新导入）。
+    #[cfg(windows)]
+    #[test]
+    fn device_credential_by_device_id_reports_missing_when_no_entry_exists() {
+        let env = TempEnv::empty();
+        let variant = TraeVariant::TraeWork;
+        // 只有 cloudide 信封，没有任何 `icube-dc` 条目。
+        write_selection_grid(
+            &env.appdata(),
+            variant,
+            &[(true, true, true), (true, true, false)],
+            chrono::Utc::now().timestamp() + 3600,
+        );
+
+        let error = device_credential_by_device_id(variant, "99998888777766665")
+            .expect_err("没有任何 icube-dc 条目时必须报缺失");
+        assert_eq!(error.kind(), "deviceIdentityMissing");
+    }
+
+    /// ★【T13-2 核心】`login_state_dir_for` 必须返回**装着登录态**的那个候选目录，
+    /// 而不是「最近活跃」的那个 —— 这正是用户机器上「导入必然失败」的成因。
+    ///
+    /// fixture：首位**活跃但无登录态**、次位**不活跃但有登录态**（真机 Trae Work 同形）。
+    #[cfg(windows)]
+    #[test]
+    fn login_state_dir_for_picks_the_dir_that_actually_holds_the_credential() {
+        let env = TempEnv::empty();
+        let variant = TraeVariant::TraeWork;
+        let grid = write_selection_grid(
+            &env.appdata(),
+            variant,
+            &[(true, false, true), (true, true, false)],
+            chrono::Utc::now().timestamp() + 3600,
+        );
+        // 前置：活跃的那个**没有**登录态、有登录态的那个**不活跃**。
+        // 若两者恰好一致，本用例证明不了任何事（假绿）。
+        assert!(
+            grid.cells[0].active && !grid.cells[0].logged_in,
+            "前置：首位必须活跃且无登录态"
+        );
+        assert!(
+            !grid.cells[1].active && grid.cells[1].logged_in,
+            "前置：次位必须不活跃且有登录态"
+        );
+
+        let found = login_state_dir_for(variant).expect("次位候选装着登录态，必须能找到");
+        assert_eq!(
+            found.file_name().and_then(|n| n.to_str()),
+            Some(grid.cells[1].name),
+            "必须返回**装着登录态**的那个目录，而不是最近活跃的那个"
+        );
+        // 对照：活跃目录选择器给的确实是首位 —— 两个问题答案不同，别混用。
+        assert_eq!(
+            crate::modules::trae::platform::select_data_dir_for(variant)
+                .and_then(|dir| dir.file_name().map(|n| n.to_string_lossy().to_string())),
+            Some(grid.cells[0].name.to_string()),
+            "对照：select_data_dir_for 仍取最近活跃的那个（首位）"
+        );
+    }
+
+    /// 没有任何候选目录装着登录态 ⇒ `None`（调用方据此回落到别的来源）。
+    #[cfg(windows)]
+    #[test]
+    fn login_state_dir_for_is_none_when_no_candidate_holds_a_credential() {
+        let env = TempEnv::empty();
+        let variant = TraeVariant::TraeWork;
+        write_selection_grid(
+            &env.appdata(),
+            variant,
+            &[(true, false, true), (true, false, false)],
+            chrono::Utc::now().timestamp() + 3600,
+        );
+
+        assert!(
+            login_state_dir_for(variant).is_none(),
+            "两个候选都没有登录态时必须是 None"
+        );
     }
 }
