@@ -891,6 +891,120 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEc5xtFi4XpzYjFuYwN0sBaUzcnrds\n\
         out
     }
 
+    /// 「候选目录 × 登录态 × 活跃度」**四格**的构造结果（每个候选目录一格）。
+    ///
+    /// ## 为什么要有它
+    ///
+    /// R3 / R5 的护栏需要**显式**构造四种组合，而不是靠「写入先后」碰运气：
+    ///
+    /// | 护栏 | 需要的格子 |
+    /// |:--|:--|
+    /// | R5：目录存在 + 活跃 + **无**登录态 ⇒ 保存必须**拒绝** | `(true, false, true)` |
+    /// | R3：只存在次位候选且**已登录** ⇒ 备份 / 恢复必须**可用** | 首位 `(false, _, _)` + 次位 `(true, true, true)` |
+    ///
+    /// ## 为什么把「是否分叉」在构造时就算好
+    ///
+    /// 凡把「两个选择器必须分叉」当**前置条件**的护栏，会在两者**碰巧一致**时
+    /// **假绿** —— 而「碰巧一致」恰恰是常态：活跃度取的是 `storage.json` 的 mtime，
+    /// Windows 文件时间粒度约 15.6ms，相邻两次 fixture 写入常落在同一刻度上，
+    /// 于是稳定排序退回候选表原顺序、`select` 与 `detect` 相同（当初 P0-2 的成因）。
+    /// 故由本结构体在**构造完成时**统一算一次，用例只断言这个字段，不各写一遍比较。
+    pub(crate) struct SelectionGrid {
+        /// 每个候选目录一格的构造记录，按**候选表顺序**。
+        pub(crate) cells: Vec<SelectionCell>,
+        /// 构造完成后 `select_data_dir_for(variant) != detect_data_dir_for(variant)`。
+        pub(crate) selectors_diverge: bool,
+    }
+
+    /// 单格记录。
+    pub(crate) struct SelectionCell {
+        /// 候选目录名（如 `TRAE SOLO CN`）。
+        pub(crate) name: &'static str,
+        /// 该目录是否存在。
+        pub(crate) exists: bool,
+        /// 该目录是否有**可解登录态**（cloudide 信封）。
+        pub(crate) logged_in: bool,
+        /// 该目录是否被钉成「活跃」。
+        pub(crate) active: bool,
+        /// 登录态归属的 userId（`logged_in == false` 时为空串）。
+        pub(crate) user_id: String,
+        /// 该格对应的目录绝对路径。
+        pub(crate) dir: std::path::PathBuf,
+    }
+
+    /// 按**显式网格**构造某个变体的候选 userData 目录。
+    ///
+    /// `cells[i]` 对应 `data_dir_names_for(variant)[i]`，每格是
+    /// `(存在?, 有登录态?, 活跃?)`。
+    ///
+    /// 活跃度用 [`pin_activity`]（`File::set_modified`）**显式钉死**：
+    /// 活跃 ⇒ `now`、不活跃 ⇒ `now - 24h`。**不依赖写入顺序、不用 `sleep`**。
+    ///
+    /// 「无登录态」的格子也会写一份**与登录无关**的 `storage.json`（`aha.account`），
+    /// 而不是留空目录 —— R5 的护栏正是「目录存在、`backup_to_slot_for` 能拷到文件、
+    /// 却没有登录态」；留空目录会以「未找到任何登录态文件」失败，走的就不是那条路径了。
+    pub(crate) fn write_selection_grid(
+        base: &std::path::Path,
+        variant: TraeVariant,
+        cells: &[(bool, bool, bool)],
+        exp: i64,
+    ) -> SelectionGrid {
+        let names = crate::modules::trae::platform::data_dir_names_for(variant);
+        assert_eq!(
+            cells.len(),
+            names.len(),
+            "网格格数必须等于该变体的候选目录数"
+        );
+
+        let mut out = Vec::new();
+        for (index, ((exists, logged_in, active), name)) in cells.iter().zip(names).enumerate() {
+            let dir = base.join(name);
+            if !*exists {
+                let _ = std::fs::remove_dir_all(&dir);
+                out.push(SelectionCell {
+                    name,
+                    exists: false,
+                    logged_in: false,
+                    active: false,
+                    user_id: String::new(),
+                    dir,
+                });
+                continue;
+            }
+
+            let storage_dir = dir.join("User").join("globalStorage");
+            std::fs::create_dir_all(&storage_dir).expect("fixture 目录应能创建");
+            let user_id = format!("700000000000{:04}", index);
+            let storage = if *logged_in {
+                serde_json::json!({
+                    CLOUDIDE_KEY: synthetic_cloudide_envelope(&user_id, exp),
+                })
+            } else {
+                serde_json::json!({ "aha": { "account": "no-login-state" } })
+            };
+            let file = storage_dir.join("storage.json");
+            std::fs::write(&file, serde_json::to_vec_pretty(&storage).unwrap())
+                .expect("fixture storage.json 应能写入");
+            pin_activity(&file, if *active { 0 } else { 24 });
+
+            out.push(SelectionCell {
+                name,
+                exists: true,
+                logged_in: *logged_in,
+                active: *active,
+                user_id,
+                dir,
+            });
+        }
+
+        let selectors_diverge = crate::modules::trae::platform::select_data_dir_for(variant)
+            != crate::modules::trae::platform::detect_data_dir_for(variant);
+        SelectionGrid {
+            cells: out,
+            selectors_diverge,
+        }
+    }
+
     /// 把 fixture 文件的 mtime **钉死**在 `age_hours` 小时之前。
     ///
     /// ★ 为什么必须钉死、不能依赖「写入顺序」：`platform::data_dir_activity` 取的是

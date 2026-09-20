@@ -546,7 +546,7 @@ fn candidate_exe_paths() -> Vec<PathBuf> {
     out
 }
 
-/// 定位 Trae 客户端的 userData 目录（登录态所在处；默认变体，兼容壳）。
+/// 定位 Trae 客户端的 userData 目录（**跨变体、最近活跃**；环境自检用）。
 ///
 /// 多个渠道的 userData **可以同时存在**（实测同一台机器上 `TRAE SOLO CN` 与
 /// `Trae CN` 各有一份）。此时按**最近活跃**选，而不是按候选表顺序取第一个 ——
@@ -556,61 +556,98 @@ fn candidate_exe_paths() -> Vec<PathBuf> {
 /// 否则用户看不到「应该把客户端数据放在哪」。
 ///
 /// **注意**：本函数的候选列表横跨全部变体，只适合"环境自检"。
-/// 要按产品线取目录必须用 [`select_data_dir_for`] 或 [`detect_data_dir_for`]。
+/// 要按产品线取目录必须用 [`detect_data_dir_for`]（**写侧来源**）
+/// 或 [`select_data_dir_for`]（**读 / 展示侧**）—— 两者语义不同，见各自文档。
 pub fn detect_data_dir() -> Option<PathBuf> {
     let base = data_dir_base()?;
     Some(base.join(data_dir_names_by_activity()[0]))
 }
 
-/// 定位**指定变体**的 userData 目录（登录态所在处）。
+/// 定位**指定变体**的 userData 目录（**写侧来源**）。
 ///
-/// 与 [`detect_data_dir`] 的区别不是"多一个参数"，而是**语义**：
-/// 后者横跨全部候选按最近活跃挑，回答「本机最常用的那条产品线」；
-/// 本函数只在该变体的候选里挑，回答「这条产品线的客户端数据在哪」。
+/// ## 唯一语义（R4：两个选择器不得都自称「登录态所在处」）
 ///
-/// 候选**一个都不存在**时**不返回 `None`**，而是回落到该变体的主候选名 ——
-/// 保持 [`detect_data_dir`] 的既有契约（UI 要能展示"应该放在哪"）。
-/// 需要「该变体到底有没有装」时用 [`select_data_dir_for`]（那个会返回 `None`）。
+/// 本函数是**写**侧的唯一来源：[`crate::modules::trae::profile::backup_to_slot_for`]
+/// 从它复制、`restore_from_slot_in_dir` 的调用方向它写入、保存守卫从它取证。
+/// 因此它必须**确定**（不依赖活跃度），否则同一台机器上「写入」与「校验」会各自漂移。
+///
+/// 取值规则：**候选表里第一个存在的目录**（`is_dir`）；一个候选都不存在时，
+/// 才回落到主候选名 `names[0]`，**仅作「应该放在哪」的展示值**。
+///
+/// ## 【R3】为什么不能恒取 `names[0]`
+///
+/// 曾恒返回 `base.join(names[0])`、**完全不查存在性**。在只装了 `TRAE SOLO`
+/// （没有 `TRAE SOLO CN`）的机器上，它会返回一个**不存在**的路径，
+/// 备份 / 恢复 / 守卫全部落空 —— 症状是「Trae 明明在用，切换器却说找不到数据目录」。
+///
+/// ## 想要别的语义时，用别的函数（不要改这里）
+///
+/// - 「这条产品线**最近被用过**的是哪个目录」→ [`select_data_dir_for`]；
+/// - 「本机**跨变体**最常用的那条产品线」→ [`detect_data_dir`]（环境自检）。
+///
+/// ⚠️ **纯展示不要用本函数**：它回答的是「写哪」，不是「用户最常用哪个」。
 pub fn detect_data_dir_for(variant: super::variant::TraeVariant) -> Option<PathBuf> {
     let base = data_dir_base()?;
     let names = data_dir_names_for(variant);
-    Some(base.join(names[0]))
+    // 候选表顺序（不是活跃度顺序）：写侧必须确定，不能被「谁更活跃」左右。
+    names
+        .iter()
+        .map(|name| base.join(name))
+        .find(|dir| dir.is_dir())
+        // 一个都不存在 ⇒ 回落主候选名，仅供 UI 展示「应该放在哪」。
+        .or_else(|| Some(base.join(names[0])))
 }
 
-/// 在**单个变体**的候选目录里定位 userData 目录（登录态所在处）。
+/// 在**单个变体**的候选目录里挑**最近活跃**的那个（**读 / 展示侧**）。
 ///
-/// 与 [`detect_data_dir`] 的关键区别：后者的候选列表**横跨全部变体**，会按最近活跃
-/// 挑出「本机最常用的那一条产品线」——当用户明确要在 Trae Work 分区操作时，这个
-/// 全局视角并不成立（实测本机 `Trae CN` 更活跃，于是「在 Trae Work 分区导入」会
-/// 去读 `Trae CN` 的目录、并把报错也说成 Trae CN）。
+/// ## 唯一语义（R4：两个选择器不得都自称「登录态所在处」）
 ///
-/// 本函数把候选**限定在传入变体之内**：
+/// 本函数回答的是「这条产品线**最近被用过**的那个目录在哪」，用于**展示**与自动探测。
+/// 它**不是**写侧来源 —— 写侧是 [`detect_data_dir_for`]。两者语义不同，
+/// **同一台机器上可能给出不同目录**（实测 Trae Work：`TRAE SOLO CN` 有登录态却更旧、
+/// `TRAE SOLO` 更活跃），且**不保证同值**。任何「校验的对象必须与操作的对象同源」
+/// 的场合都必须走 [`detect_data_dir_for`]（或 profile 里的唯一取值点），不得用本函数。
 ///
-/// - 该变体有任何存在的候选目录时，返回其中**最近活跃**的那个（复用
-///   [`data_dir_activity`]，与全局视角同一套判定）；
-/// - 该变体一个候选目录都不存在时返回 `None` —— 调用方据此产出「未找到【Trae Work】的
-///   数据目录，请先启动一次该客户端」这类**指向该变体**的错误，
-///   而不是含糊的「未检测到」。
+/// ## 排序实现只有一处（消除漂移）
+///
+/// 排序由 [`data_dirs_by_activity_for`] 提供（活跃度降序、只含**存在**的候选），
+/// 与全局视角 [`data_dir_names_by_activity`] 是**同一套规则**。
+/// 本函数**不再自己写一遍排序** —— 两套实现会随维护漂移，正是本模块曾经的病根之一。
+///
+/// 该变体一个候选目录都不存在时返回 `None` —— 调用方据此产出「未找到【Trae Work】的
+/// 数据目录，请先启动一次该客户端」这类**指向该变体**的错误，而不是含糊的「未检测到」。
 ///
 /// 返回 `None` 不区分「base 取不到」与「候选都不存在」：两者对调用方的处置相同
 /// （都提示该变体没有数据目录），且后者是唯一可操作的情形。
 pub fn select_data_dir_for(variant: super::variant::TraeVariant) -> Option<PathBuf> {
-    let base = data_dir_base()?;
+    data_dirs_by_activity_for(variant).into_iter().next()
+}
+
+/// 该变体**存在**的候选目录，按「最近活跃」降序。
+///
+/// 与 [`data_dir_names_by_activity`] 共用**同一套排序规则**（活跃度降序、稳定排序保持
+/// 候选表原顺序），区别只有两点：**按变体限定**、且**只保留存在的目录**。
+/// [`select_data_dir_for`] 取它的首项，因此「按变体选活跃目录」与「跨变体选活跃目录」
+/// 永远不会因为两套排序实现而漂移。
+///
+/// 排序规则：有活跃时间的在前、新的在前；取不到活跃时间的垫底
+/// （`Option` 的 `Ord` 里 `None < Some(_)`，故反转比较）。
+fn data_dirs_by_activity_for(variant: super::variant::TraeVariant) -> Vec<PathBuf> {
+    let Some(base) = data_dir_base() else {
+        return Vec::new();
+    };
     let mut scored: Vec<(PathBuf, Option<SystemTime>)> = data_dir_names_for(variant)
         .iter()
-        .map(|name| {
-            let dir = base.join(name);
-            let activity = dir.is_dir().then(|| data_dir_activity(&dir)).flatten();
+        .map(|name| base.join(name))
+        .filter(|dir| dir.is_dir())
+        .map(|dir| {
+            let activity = data_dir_activity(&dir);
             (dir, activity)
         })
         .collect();
 
-    // 降序：`Option` 的 `Ord` 里 `None < Some(_)`，反转比较即「有活跃时间的在前、
-    // 新的在前、不存在的垫底」。稳定排序保证同分时保持候选表原顺序。
     scored.sort_by(|a, b| b.1.cmp(&a.1));
-    scored
-        .into_iter()
-        .find_map(|(dir, activity)| activity.map(|_| dir))
+    scored.into_iter().map(|(dir, _)| dir).collect()
 }
 
 /// 按「最近活跃」排序的 userData 候选名。
@@ -1799,6 +1836,132 @@ mod tests {
 
         assert!(work.is_none(), "两条候选目录都不存在时必须是 None");
         assert!(cn.is_none(), "两条候选目录都不存在时必须是 None");
+    }
+
+    // ---------- T13-1：两个选择器的语义分家（R3 / R4） ----------
+
+    /// ★【R3】`detect_data_dir_for`（**写侧来源**）必须取**候选表里第一个存在**的目录。
+    ///
+    /// 真机形态：只装了 `TRAE SOLO`（没有 `TRAE SOLO CN`）。改前恒取 `names[0]`，
+    /// 于是返回一个**不存在**的路径，备份 / 恢复 / 守卫全部落空 ——
+    /// 症状是「Trae 明明在用，切换器却说找不到数据目录」。
+    #[cfg(windows)]
+    #[test]
+    fn detect_data_dir_for_picks_the_first_existing_candidate() {
+        let env = crate::modules::trae::test_support::TempEnv::empty();
+        let variant = super::super::variant::TraeVariant::TraeWork;
+        // 首位候选**不存在**、次位候选存在且有登录态。
+        let grid = crate::modules::trae::icube::test_support::write_selection_grid(
+            &env.appdata(),
+            variant,
+            &[(false, false, false), (true, true, true)],
+            chrono::Utc::now().timestamp() + 3600,
+        );
+
+        let picked = detect_data_dir_for(variant).expect("临时 APPDATA 下应能定位目录");
+        assert_eq!(
+            picked.file_name().and_then(|n| n.to_str()),
+            Some(grid.cells[1].name),
+            "必须跳过不存在的首位候选，选中存在的次位候选"
+        );
+        assert!(
+            picked.is_dir(),
+            "返回的目录必须真实存在：{}",
+            picked.display()
+        );
+    }
+
+    /// ★【R3】候选**一个都不存在**时仍回落 `names[0]`（纯展示值），保持既有契约。
+    ///
+    /// 这条与上一条成对：不能为了「首个存在」把兜底展示值也一起去掉 ——
+    /// UI 需要显示「应该把客户端数据放在哪」。
+    #[cfg(windows)]
+    #[test]
+    fn detect_data_dir_for_falls_back_to_primary_name_when_none_exist() {
+        let env = crate::modules::trae::test_support::TempEnv::empty();
+        let variant = super::super::variant::TraeVariant::TraeWork;
+        let grid = crate::modules::trae::icube::test_support::write_selection_grid(
+            &env.appdata(),
+            variant,
+            &[(false, false, false), (false, false, false)],
+            chrono::Utc::now().timestamp() + 3600,
+        );
+
+        let picked = detect_data_dir_for(variant).expect("临时 APPDATA 下应能定位目录");
+        assert_eq!(
+            picked.file_name().and_then(|n| n.to_str()),
+            Some(grid.cells[0].name),
+            "全不存在时应回落到主候选名（展示值）"
+        );
+        assert!(
+            !picked.is_dir(),
+            "兜底展示值本就不存在 —— 调用方必须自己判存在性：{}",
+            picked.display()
+        );
+    }
+
+    /// ★【R4 + 排序唯一】`select_data_dir_for`（**读 / 展示侧**）取**最近活跃**的
+    /// **存在**候选，与 `detect_data_dir_for` 在同一 fixture 上**分叉**。
+    ///
+    /// fixture 用四格显式构造：首位存在但**不活跃**、次位存在且**活跃**。
+    /// 于是 `detect` → 首位（写侧确定）、`select` → 次位（最活跃）。
+    /// 两者分叉这件事由 [`SelectionGrid::selectors_diverge`] 在构造时算好，
+    /// 避免用例各写一遍比较（比较写错或 fixture 碰巧不分叉时会**假绿**）。
+    #[cfg(windows)]
+    #[test]
+    fn select_data_dir_for_picks_the_most_active_existing_candidate() {
+        let env = crate::modules::trae::test_support::TempEnv::empty();
+        let variant = super::super::variant::TraeVariant::TraeWork;
+        let grid = crate::modules::trae::icube::test_support::write_selection_grid(
+            &env.appdata(),
+            variant,
+            &[(true, true, false), (true, true, true)],
+            chrono::Utc::now().timestamp() + 3600,
+        );
+        assert!(
+            grid.selectors_diverge,
+            "前置：本 fixture 必须让两个选择器分叉（否则本用例证明不了任何事）"
+        );
+        assert!(
+            !grid.cells[0].active && grid.cells[1].active,
+            "前置：四格必须把「首位不活跃、次位活跃」显式钉死"
+        );
+
+        let picked = select_data_dir_for(variant).expect("应选中一个存在的候选");
+        assert_eq!(
+            picked.file_name().and_then(|n| n.to_str()),
+            Some(grid.cells[1].name),
+            "select 必须取**最近活跃**的那个（次位），而不是候选表首位"
+        );
+        assert_eq!(
+            detect_data_dir_for(variant)
+                .and_then(|d| d.file_name().map(|n| n.to_string_lossy().to_string())),
+            Some(grid.cells[0].name.to_string()),
+            "同一 fixture 下 detect 必须取候选表首个存在（首位）"
+        );
+    }
+
+    /// ★【排序唯一】`select_data_dir_for` **只**在该变体的候选里选，且**只**返回存在的目录。
+    ///
+    /// 这一条同时钉住「按变体限定」（不跨变体）与「不存在的不返回」两件事。
+    #[cfg(windows)]
+    #[test]
+    fn select_data_dir_for_only_returns_existing_dirs_of_that_variant() {
+        let env = crate::modules::trae::test_support::TempEnv::empty();
+        let variant = super::super::variant::TraeVariant::TraeWork;
+        let grid = crate::modules::trae::icube::test_support::write_selection_grid(
+            &env.appdata(),
+            variant,
+            &[(true, false, false), (false, false, false)],
+            chrono::Utc::now().timestamp() + 3600,
+        );
+
+        let picked = select_data_dir_for(variant).expect("首位存在，应能选中");
+        assert_eq!(
+            picked.file_name().and_then(|n| n.to_str()),
+            Some(grid.cells[0].name)
+        );
+        assert!(picked.is_dir());
     }
 
     #[cfg(windows)]

@@ -267,7 +267,7 @@ pub fn extract_local_jwt_for(variant: TraeVariant) -> Result<(String, String), S
 /// | 选择器 | 语义 | 谁在用 |
 /// |:--|:--|:--|
 /// | [`platform::select_data_dir_for`] | **最近活跃**的候选 | 导入（`extract_local_jwt_for`） |
-/// | [`platform::detect_data_dir_for`] | **首位**候选（`names[0]`） | 备份 / 恢复 / 守卫要守护的那个操作 |
+/// | [`platform::detect_data_dir_for`] | **首个存在**的候选 | 备份 / 恢复 / 守卫要守护的那个操作 |
 ///
 /// 实测（Trae Work，本机）：`select` 给 `TRAE SOLO`（客户端启动过、**从未登录**），
 /// `detect` 给 `TRAE SOLO CN`（**登录态在这里**）。于是「用 `select` 校验、
@@ -903,8 +903,8 @@ fn copy_dir_recursive(source: &Path, target: &Path) -> Result<u64, String> {
 ///
 /// | 选择器 | 语义 |
 /// |:--|:--|
-/// | [`platform::select_data_dir_for`] | 该变体候选里**最近活跃**的那个（导入用） |
-/// | [`platform::detect_data_dir_for`] | 该变体**首位候选**（`names[0]`） |
+/// | [`platform::select_data_dir_for`] | 该变体候选里**最近活跃**的那个（**读 / 展示侧**） |
+/// | [`platform::detect_data_dir_for`] | 该变体**首个存在**的候选（**写侧来源**） |
 ///
 /// 若调用点各自去调选择器，任一处被换成另一个（例如 `select_data_dir_for`）
 /// 都会产生「**校验读了 A、操作改了 B**」，且表现是**静默**的：守卫在真机上等于不存在
@@ -913,15 +913,20 @@ fn copy_dir_recursive(source: &Path, target: &Path) -> Result<u64, String> {
 /// 收敛到这一个函数后，调用点只表达「我要快照目录」，
 /// **选择器策略的变更只需改这一处**。调用点**不得**再各自调用 `detect_data_dir_for`。
 ///
-/// ## 本函数只负责「取路径」，不判断存在性
+/// ## 写侧的存在性判定必须**对称**（R3 附带）
 ///
-/// 是否要求目录存在由**调用方显式声明**，因为两个操作的既有语义不同：
+/// 本函数只负责「取路径」，是否要求目录存在由**调用方显式声明**。但「写侧」的两个
+/// 调用点（[`backup_to_slot_for`] 的源、[`switch_account`] 与 [`restore_from_slot_for`]
+/// 的目标）**必须用同一个判定** —— 都要求 `is_dir()`：
 ///
-/// - [`backup_to_slot_for`] 要求源目录存在（不存在 ⇒ 报「未找到客户端数据目录」）；
-/// - [`restore_from_slot_for`] **不要求**目标目录存在（会 `create_dir_all` 新建）。
+/// - 若只有 backup 要求存在、restore 不要求，则 [`platform::detect_data_dir_for`] 在
+///   「候选都不存在」时回落的**展示值** `names[0]` 会被 restore 的 `create_dir_all`
+///   **凭空造出来**（本机形态就是造 `TRAE SOLO CN`），症状是「切换成功但账号没变」；
+/// - 对称之后，这种情况会**明确报错**（「无法定位 Trae 客户端数据目录」），
+///   而不是静默写进一个用户根本没在用的目录。
 ///
-/// 把这一差异留在调用点（`.filter(|dir| dir.is_dir())`），是为了让「谁要求存在」
-/// 在代码里一眼可见，而不是被取值点悄悄统一掉（那会改变 restore 的既有行为）。
+/// 把 `.filter(|dir| dir.is_dir())` 留在调用点，是为了让「谁要求存在」在代码里一眼可见，
+/// 而不是被取值点悄悄统一掉。
 ///
 /// ## 取值点唯一 ≠ 构造同源：切换链还要**显式传值**
 ///
@@ -989,8 +994,13 @@ pub fn restore_from_slot(slot: &str) -> Result<u64, String> {
 /// 二是将来若有条目同时出现在两份清单里，**快照内容应当胜出**。
 /// 不变式的完整说明见 [`CORE_ENTRIES`]。
 pub fn restore_from_slot_for(variant: TraeVariant, slot: &str) -> Result<u64, String> {
-    // 目标目录取「快照类操作的唯一取值点」；**不要求存在** —— 委托方会 `create_dir_all` 新建。
-    let target_root = snapshot_data_dir_for(variant).ok_or("无法定位 Trae 客户端数据目录")?;
+    // 目标目录取「快照类操作的唯一取值点」，并要求**存在** —— 与 `backup_to_slot_for`
+    // 用**同一个存在性判定**（见 `snapshot_data_dir_for` 的「写侧判定必须对称」一节）。
+    // 目录不存在时明确报错，而不是把它 `create_dir_all` 出来：
+    // 凭空造出 `names[0]`（本机形态就是造 `TRAE SOLO CN`）会让「切换成功但账号没变」。
+    let target_root = snapshot_data_dir_for(variant)
+        .filter(|dir| dir.is_dir())
+        .ok_or("无法定位 Trae 客户端数据目录")?;
     restore_from_slot_in_dir(&target_root, variant, slot)
 }
 
@@ -1272,7 +1282,13 @@ where
     //   位置刻意留在第 5 步（关客户端）**之后**：accessor 取不到目录时，用户看到的
     //   失败步骤与文案必须与「由 `restore_from_slot_for` 内部报错」时**逐字一致**
     //   （stage=fatal / status=fail / 「恢复失败: 无法定位 Trae 客户端数据目录」）。
-    let restore_dir = match snapshot_data_dir_for(variant) {
+    //
+    //   ★ 存在性判定与 `backup_to_slot_for` **完全对称**（`.filter(|d| d.is_dir())`）。
+    //     R3 之后 `snapshot_data_dir_for` 在「候选都不存在」时会回落到主候选名
+    //     （展示值）—— 若这里不过滤，`create_dir_all` 会把它**凭空造出来**
+    //     （本机形态就是造 `TRAE SOLO CN`），症状是「切换成功但账号没变」。
+    //     宁可明确报错：不能往一个没装、也没启动过的客户端里恢复登录态。
+    let restore_dir = match snapshot_data_dir_for(variant).filter(|dir| dir.is_dir()) {
         Some(dir) => dir,
         None => {
             let message = "无法定位 Trae 客户端数据目录".to_string();
@@ -1434,8 +1450,8 @@ fn verify_restored_login_in(root: &Path, variant: TraeVariant, target: &str) -> 
 ///
 /// ## ★ 必须读**被守护操作所读的那个目录**（曾经在这里踩过一个 P0）
 ///
-/// 本模块有两个目录选择器：`select_data_dir_for`（最近活跃）与
-/// `detect_data_dir_for`（首位候选），**同一台机器上可能给出不同目录**
+/// 本模块有两个目录选择器：`select_data_dir_for`（最近活跃，**读 / 展示侧**）与
+/// `detect_data_dir_for`（首个存在，**写侧来源**），**同一台机器上可能给出不同目录**
 /// （实测 Trae Work：`select` → `TRAE SOLO`、`detect` → `TRAE SOLO CN`）。
 /// [`backup_to_slot_for`] 用的是 **`detect_data_dir_for`**。
 ///
@@ -1552,6 +1568,11 @@ pub fn overview() -> Value {
 ///
 /// `dataDir` / `clientRunning` 都取**该变体**的视角 —— 与槽位列表同源，
 /// 否则会出现「列出了 Trae CN 的快照，却说 Trae Work 的客户端在运行」。
+///
+/// `dataDir` **刻意取写侧来源**（[`snapshot_data_dir_for`]，即 `detect_data_dir_for`）
+/// 而不是「最近活跃」的那个：本字段的用途是让用户核对「切换器**正在操作哪个目录**」，
+/// 与快照的读写目标同源才有意义。「用户最近在用哪个」是另一个问题，
+/// 由 [`platform::select_data_dir_for`] 回答（见 `platform::variants_status` 的 `dataDir`）。
 pub fn overview_for(variant: TraeVariant) -> Value {
     json!({
         "profiles": list_profiles_for(variant).iter().map(ProfileInfo::to_json).collect::<Vec<_>>(),
@@ -2847,6 +2868,92 @@ mod tests {
         assert!(paths::profiles_dir_for(variant).join(LAST_SLOT).is_dir());
     }
 
+    /// ★【R3】只存在**次位候选**（`TRAE SOLO`）且它**已登录** ⇒ 备份与恢复都必须可用。
+    ///
+    /// 改前 `detect_data_dir_for` 恒取 `names[0]`（`TRAE SOLO CN`）—— 在只装了
+    /// `TRAE SOLO` 的机器上那是一个**不存在**的路径，于是备份 / 恢复 / 守卫全部落空。
+    /// 本用例钉住「写侧必须取首个**存在**的候选」。
+    ///
+    /// fixture 用四格显式构造：首位 `(不存在)`、次位 `(存在 + 有登录态 + 活跃)`。
+    #[cfg(windows)]
+    #[test]
+    fn backup_and_restore_work_when_only_the_secondary_candidate_exists() {
+        let env = crate::modules::trae::test_support::TempEnv::empty();
+        let variant = TraeVariant::TraeWork;
+        let grid = icube::test_support::write_selection_grid(
+            &env.appdata(),
+            variant,
+            &[(false, false, false), (true, true, true)],
+            chrono::Utc::now().timestamp() + 3600,
+        );
+        let secondary = &grid.cells[1];
+        assert!(
+            secondary.exists && secondary.logged_in,
+            "前置：次位必须是「存在 + 已登录」"
+        );
+
+        // 写侧解析到的必须是次位候选，而不是不存在的首位。
+        let op_dir = snapshot_data_dir_for(variant).expect("应解析到存在的候选");
+        assert_eq!(
+            op_dir, secondary.dir,
+            "写侧必须解析到首个**存在**的候选（{}），而不是不存在的首位",
+            secondary.name
+        );
+
+        // 备份：必须真的拷出登录态，且内容归属 == 该目录的 userId。
+        let count = backup_to_slot_for(variant, "acct-r3")
+            .expect("只存在次位候选且已登录时，备份必须可用");
+        assert!(count > 0, "必须真的复制到文件");
+        let slot = paths::profiles_dir_for(variant).join("acct-r3");
+        let (saved_uid, _) =
+            extract_local_jwt_from_dir(&slot, variant).expect("快照里必须能解出凭据");
+        assert_eq!(
+            saved_uid, secondary.user_id,
+            "快照内容的归属必须是被备份的那个账号"
+        );
+
+        // 恢复：必须能写回同一个目录。
+        let restored = restore_from_slot_for(variant, "acct-r3")
+            .expect("只存在次位候选且已登录时，恢复必须可用");
+        assert!(restored > 0, "必须真的写回文件");
+    }
+
+    /// ★【R3 附带】候选目录**一个都不存在**时，`restore_from_slot_for` 必须**明确报错**，
+    /// 而不是把回落的展示值（`names[0]`）**凭空 `create_dir_all` 出来**。
+    ///
+    /// 这是 backup / restore 存在性判定**对称**的护栏：不对称时 `create_dir_all` 会造出
+    /// 一个用户根本没在用的目录（本机形态就是 `TRAE SOLO CN`），
+    /// 症状是「切换成功但账号没变」。
+    #[cfg(windows)]
+    #[test]
+    fn restore_refuses_instead_of_creating_a_dir_when_no_candidate_exists() {
+        let env = crate::modules::trae::test_support::TempEnv::empty();
+        let variant = TraeVariant::TraeWork;
+        let _grid = icube::test_support::write_selection_grid(
+            &env.appdata(),
+            variant,
+            &[(false, false, false), (false, false, false)],
+            chrono::Utc::now().timestamp() + 3600,
+        );
+        // 造一个**存在**的槽位快照，使失败点唯一地落在「目标目录」上。
+        let slot = paths::profiles_dir_for(variant).join("acct-nodir");
+        std::fs::create_dir_all(&slot).unwrap();
+        std::fs::write(slot.join("marker"), b"x").unwrap();
+
+        let error = restore_from_slot_for(variant, "acct-nodir")
+            .expect_err("候选目录都不存在时必须报错，而不是凭空造目录");
+        assert!(
+            error.contains("无法定位 Trae 客户端数据目录"),
+            "报错必须是「无法定位…」：{error}"
+        );
+        let fallback = env.appdata().join(platform::data_dir_names_for(variant)[0]);
+        assert!(
+            !fallback.is_dir(),
+            "不得凭空造出回落的展示目录：{}",
+            fallback.display()
+        );
+    }
+
     /// 守卫必须**拒绝**「客户端读不到登录态」时的保存（R5）。
     ///
     /// ## ⚠️ 本用例由旧用例**改名 + 语义反转**而来
@@ -2862,9 +2969,22 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn save_refuses_when_the_client_has_no_login_state() {
-        // 只有设备凭证、没有登录态副本、没有明文日志 ⇒ 取证必然失败。
-        let _env = crate::modules::trae::test_support::TempEnv::with_device_fixture();
+        // 四格**显式**构造：两个候选都「存在 + 活跃」，但都**没有登录态**
+        //（`storage.json` 里只有 `aha.account` 这类与登录无关的内容）。
+        // 这一格正是 R5 护栏需要的形状 —— 目录在、能拷到文件，却没有登录态。
+        let env = crate::modules::trae::test_support::TempEnv::empty();
         let variant = TraeVariant::TraeWork;
+        let grid = icube::test_support::write_selection_grid(
+            &env.appdata(),
+            variant,
+            &[(true, false, true), (true, false, true)],
+            chrono::Utc::now().timestamp() + 3600,
+        );
+        assert!(
+            grid.cells.iter().all(|cell| cell.exists && !cell.logged_in),
+            "前置：本 fixture 必须是「存在 + 无登录态」格"
+        );
+
         // 前置断言打在**守卫真正读的那个目录**上（`detect_data_dir_for`）——
         // 打在活跃目录上会掩盖「两个选择器分叉」这类问题。
         let op_dir = platform::detect_data_dir_for(variant).expect("临时 APPDATA 下应能定位目录");
