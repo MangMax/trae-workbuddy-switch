@@ -9,6 +9,7 @@
 
 mod api;
 mod gateway_host;
+mod trae_gateway_host;
 
 use serde_json::json;
 
@@ -77,66 +78,112 @@ fn spawn_scheduled_task(task: schedule::ScheduleTask) {
     });
 }
 
-/// 后台任务：
-/// - 启动：整理历史签到日志 + 对 CN 做一次启动即核验；
-/// - 自动轮换按配置间隔执行（CodeBuddy CLI 为 CN 专有，保持 CN）；
-/// - 六类积分任务（签到 / 旅行 / 活跃上报 / 保活 / 开学季 / 夜猫子）按 `schedule` 配置
-///   **按点独立排程**。
+/// 后台任务的注册表条目：**「有哪些后台任务」的唯一事实来源**。
+///
+/// 设计意图：后台任务的**存在性**必须是**数据**，而不是散落在 [`spawn_background_loops`]
+/// 里的 `tokio::spawn` 调用。原因——本工单修复的账号池余额接入缺陷，本质就是一次
+/// 「**调用点静默消失**」：`Pool::set_credits` 存在、类型全对、构建全绿，但生产上没人
+/// 调用它，于是最大的两个选号权重因子从未生效，且**无人发现**。把「有哪些后台任务」
+/// 做成注册表数据后，就能用测试守住关键任务不被删除
+/// （见 `tests::background_task_registry_includes_credits_refresh`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackgroundTask {
+    /// 启动维护：整理历史签到日志 + 对 CN 做一次启动即核验。
+    StartupMaintenance,
+    /// 自动轮换（按 `auto_rotate_config` 间隔；CodeBuddy CLI 为 CN 专有，保持 CN）。
+    AutoRotate,
+    /// 账号池余额刷新（真实余额回填选号权重）。
+    CreditsRefresh,
+    /// 六类积分定时任务之一（各自独立排程）。
+    Scheduled(schedule::ScheduleTask),
+}
+
+/// 后台任务注册表：列出所有应启动的后台任务。
+///
+/// [`spawn_background_loops`] **严格**按本表启动；因此「增删后台任务」是数据变化，
+/// 且有测试守住关键项。**登记即执行**——不要在本表之外直接 `tokio::spawn` 后台循环。
+fn background_tasks() -> Vec<BackgroundTask> {
+    let mut tasks = vec![
+        BackgroundTask::StartupMaintenance,
+        BackgroundTask::AutoRotate,
+        BackgroundTask::CreditsRefresh,
+    ];
+    tasks.extend(
+        schedule::ScheduleTask::all()
+            .into_iter()
+            .map(BackgroundTask::Scheduled),
+    );
+    tasks
+}
+
+/// 启动全部后台任务（以 [`background_tasks`] 为唯一事实来源）。
 fn spawn_background_loops() {
-    tokio::spawn(async move {
-        if let Err(error) = config::compact_checkin_logs() {
-            eprintln!("[签到] 历史日志整理失败: {error}");
-        }
-        // 启动即核验一次（CN）；Global 无签到体系，跳过。
-        let _ = checkin::run_checkin_cycle_for(Region::Cn, checkin::CheckinCycleMode::StartupVerify).await;
-    });
-
-    tokio::spawn(async move {
-        let mut last_cycle_at: i64 = 0;
-        loop {
-            let cfg = config::load_auto_rotate_config();
-            if cfg.get("enabled").and_then(|v| v.as_bool()) == Some(true) {
-                let interval_minutes = cfg
-                    .get("check_interval_minutes")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(5)
-                    .max(1);
-                let now = config::now_ms();
-                if now - last_cycle_at >= interval_minutes * 60_000 {
-                    last_cycle_at = now;
-                    let _ = rotate::run_rotate_cycle().await;
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-        }
-    });
-
-    // 六类任务各自独立排程。
-    for task in schedule::ScheduleTask::all() {
-        spawn_scheduled_task(task);
+    for task in background_tasks() {
+        spawn_background_task(task);
     }
+}
 
-    // 账号池余额刷新：**独立**循环（不与其它循环合并成一个 tick），首次启动先跑一次，
-    // 之后按池配置 `credits_refresh_interval_ms`（默认 30 分钟）周期刷新。
-    //
-    // 为什么必须是独立后台循环：余额是慢变数据，在请求路径上同步拉余额会直接拉高
-    // 每次请求的延迟。刷新语义见 `buddy_switch_gateway::credits_refresh`。
-    tokio::spawn(async move {
-        let state = gateway_host::shared_state();
-        // 启动即刷一次：补齐上次进程遗留的「从未取过余额」账号。
-        let _ = buddy_switch_gateway::credits_refresh::refresh_once(&state).await;
-        loop {
-            let interval_ms = state
-                .pool
-                .read()
-                .await
-                .config()
-                .credits_refresh_interval_ms
-                .max(1);
-            tokio::time::sleep(std::time::Duration::from_millis(interval_ms as u64)).await;
-            let _ = buddy_switch_gateway::credits_refresh::refresh_once(&state).await;
+/// 按注册表条目派生对应的后台循环。
+fn spawn_background_task(task: BackgroundTask) {
+    match task {
+        // 启动：整理历史签到日志 + 对 CN 做一次启动即核验。
+        BackgroundTask::StartupMaintenance => {
+            tokio::spawn(async move {
+                if let Err(error) = config::compact_checkin_logs() {
+                    eprintln!("[签到] 历史日志整理失败: {error}");
+                }
+                // 启动即核验一次（CN）；Global 无签到体系，跳过。
+                let _ = checkin::run_checkin_cycle_for(Region::Cn, checkin::CheckinCycleMode::StartupVerify).await;
+            });
         }
-    });
+        // 自动轮换：按配置间隔执行。
+        BackgroundTask::AutoRotate => {
+            tokio::spawn(async move {
+                let mut last_cycle_at: i64 = 0;
+                loop {
+                    let cfg = config::load_auto_rotate_config();
+                    if cfg.get("enabled").and_then(|v| v.as_bool()) == Some(true) {
+                        let interval_minutes = cfg
+                            .get("check_interval_minutes")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(5)
+                            .max(1);
+                        let now = config::now_ms();
+                        if now - last_cycle_at >= interval_minutes * 60_000 {
+                            last_cycle_at = now;
+                            let _ = rotate::run_rotate_cycle().await;
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                }
+            });
+        }
+        // 账号池余额刷新：**独立**循环（不与其它循环合并成一个 tick），首次启动先跑一次，
+        // 之后按池配置 `credits_refresh_interval_ms`（默认 30 分钟）周期刷新。
+        //
+        // 为什么必须是独立后台循环：余额是慢变数据，在请求路径上同步拉余额会直接拉高
+        // 每次请求的延迟。刷新语义见 `buddy_switch_gateway::credits_refresh`。
+        BackgroundTask::CreditsRefresh => {
+            tokio::spawn(async move {
+                let state = gateway_host::shared_state();
+                // 启动即刷一次：补齐上次进程遗留的「从未取过余额」账号。
+                let _ = buddy_switch_gateway::credits_refresh::refresh_once(&state).await;
+                loop {
+                    let interval_ms = state
+                        .pool
+                        .read()
+                        .await
+                        .config()
+                        .credits_refresh_interval_ms
+                        .max(1);
+                    tokio::time::sleep(std::time::Duration::from_millis(interval_ms as u64)).await;
+                    let _ = buddy_switch_gateway::credits_refresh::refresh_once(&state).await;
+                }
+            });
+        }
+        // 六类积分任务各自独立排程。
+        BackgroundTask::Scheduled(task) => spawn_scheduled_task(task),
+    }
 }
 
 fn print_status() {
@@ -215,6 +262,13 @@ async fn serve(args: &[String]) {
         Err(error) => eprintln!("[gateway] 启动失败: {error}"),
     }
 
+    // 按配置启动 Trae 网关独立监听（默认关闭；默认 127.0.0.1:7864）。
+    match trae_gateway_host::apply().await {
+        Ok(Some(addr)) => println!("Trae API 网关: http://{addr}"),
+        Ok(None) => {}
+        Err(error) => eprintln!("[trae-gateway] 启动失败: {error}"),
+    }
+
     axum::serve(listener, app).await.unwrap();
 }
 
@@ -237,5 +291,47 @@ fn open_browser(addr: &str) {
     #[cfg(target_os = "linux")]
     {
         let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 护栏：余额刷新任务**必须**登记在后台任务注册表里。
+    ///
+    /// 回归背景：本次修复的缺陷正是「调用点静默消失」——`Pool::set_credits` 存在、
+    /// 类型全对、构建全绿，但生产上无人调用，于是四因子加权静默退化为两因子。
+    /// 把「有哪些后台任务」做成注册表数据后，本用例守住关键任务不被删除：
+    /// 从 [`background_tasks`] 移除 [`BackgroundTask::CreditsRefresh`] 会让本用例变红。
+    #[test]
+    fn background_task_registry_includes_credits_refresh() {
+        let tasks = background_tasks();
+        assert!(
+            tasks.contains(&BackgroundTask::CreditsRefresh),
+            "后台任务注册表必须登记 CreditsRefresh（账号池余额刷新）；缺了它生产上余额永远为 0，\
+             四因子加权会静默退化为两因子。当前注册表：{tasks:?}"
+        );
+    }
+
+    /// 注册表还须覆盖既有的启动维护 / 自动轮换 / 六类定时任务，防止被误删。
+    #[test]
+    fn background_task_registry_covers_all_existing_tasks() {
+        let tasks = background_tasks();
+        assert!(
+            tasks.contains(&BackgroundTask::StartupMaintenance),
+            "注册表缺少启动维护任务"
+        );
+        assert!(
+            tasks.contains(&BackgroundTask::AutoRotate),
+            "注册表缺少自动轮换任务"
+        );
+        for task in schedule::ScheduleTask::all() {
+            assert!(
+                tasks.contains(&BackgroundTask::Scheduled(task)),
+                "注册表缺少定时任务：{}",
+                task.as_str()
+            );
+        }
     }
 }

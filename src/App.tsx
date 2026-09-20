@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { BrowserRouter, HashRouter, Navigate, NavLink, Outlet, Route, Routes } from "react-router-dom";
+import { useEffect, useRef, useState, type ComponentType } from "react";
+import { BrowserRouter, HashRouter, Navigate, NavLink, Outlet, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import { ArrowUp, MessagesSquare, Server, Settings, Sparkles, User } from "lucide-react";
 
 import { cn } from "@/lib/utils";
@@ -10,19 +10,251 @@ import ApiServicePage from "@/pages/ApiServicePage";
 import CreditStatsPage from "@/pages/CreditStatsPage";
 import TokenStatsPage from "@/pages/TokenStatsPage";
 import SettingsPage from "@/pages/SettingsPage";
-import { StatusDot, AppIconMark } from "@/components/product-marks";
+import TraeAccountsPage from "@/pages/TraeAccountsPage";
+import TraeApiServicePage from "@/pages/TraeApiServicePage";
+import TraeCreditsPage from "@/pages/TraeCreditsPage";
+import TraeSettingsPage from "@/pages/TraeSettingsPage";
+import TraeTokenStatsPage from "@/pages/TraeTokenStatsPage";
+import { StatusDot, AppIconMark, TraeVariantMark, WorkBuddyMark } from "@/components/product-marks";
 import { UpdateInstallDialog } from "@/components/update-install-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Toaster } from "@/components/ui/sonner";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { demoModeEnabled, pagesDemoHostingEnabled } from "@/lib/demo-mode";
+import { useTraeVariant } from "@/lib/use-trae-variant";
 import { useCreditAutoRefresh } from "@/lib/use-credit-auto-refresh";
 import { useWorkbuddyStatusRefresh } from "@/lib/use-workbuddy-status-refresh";
 import { useAccountsStore } from "@/stores/accounts";
 
-function UpdateCenter({ running }: { running: boolean | undefined }) {
-  const version = useAccountsStore((s) => s.status?.version);
+/**
+ * 产品分区。
+ *
+ * WorkBuddy 与 Trae 是两套完全独立的体系（独立账号库、独立客户端、独立配置），
+ * 侧栏一次只展示其中一个产品的导航与页面，由顶部的产品 Tab 决定。
+ *
+ * ## ★ Trae 只占**一个**侧栏分区，两条产品线在分区内部切换
+ *
+ * `TRAE SOLO CN`（界面名 `Trae Work`）与 `Trae CN` 确实可以同机并存、各有独立
+ * 安装目录与账号库，但**这不意味着侧栏要排三个 Tab**：
+ *
+ * - 侧栏的职责是「选产品」，而 Trae 的两条线**共用全部页面与路由**
+ *   （`/trae/accounts` 等）。把它们拆成两个顶级分区，等于让同一组页面
+ *   在侧栏出现两遍，用户要在两个看起来一样的入口之间做无意义的二选一。
+ * - 变体是**数据维度**而非**页面维度**，因此正确的载体是 Trae 页面内部的
+ *   产品线切换器（见 `TraeAccountsPage` 的变体 Tab），而不是侧栏。
+ * - 侧栏 220px 宽度下三个 Tab 连产品名都排不下（详见 `ProductSwitch` 的注释），
+ *   压成纯图标后两条 Trae 又几乎无法区分 —— 这本身就是「不该有三个 Tab」的信号。
+ *
+ * 变体仍然由 URL 的 `?line=` 承载（`useTraeVariant`）：它决定 Trae 分区内部
+ * 看哪条线，并且刷新 / 分享 / 前进后退都能保持。
+ */
+type Product = "workbuddy" | "trae";
+
+interface NavItem {
+  to: string;
+  label: string;
+  icon: ComponentType<{ className?: string }>;
+  /** 仅在该路径完全匹配时高亮：用于产品首页，避免其子页面同时点亮两个条目。 */
+  end?: boolean;
+}
+
+/**
+ * 产品 → 导航项。
+ *
+ * 两个产品的导航刻意用同一张表描述、由同一段 JSX 渲染：
+ * 侧栏只认这张表，因此「加一个产品的页面」或「调整条目顺序」都只改数据，不改渲染逻辑。
+ *
+ * **Trae 与 WorkBuddy 之间逐字同构**：同样的五项、同样的顺序、同样的路径尾段。
+ * 这是刻意的约束而非巧合——产品页面结构一致时，用户在产品间来回切换不需要重建位置感。
+ * Trae 侧不保留「概览 / 一键签到 / 登录态快照 / 系统日志」四个独立导航项：
+ * 这些能力全部下沉到对应页面内部（签到并入账号管理、快照与运行日志并入设置），
+ * 避免同一件事在不同产品上出现在不同位置。
+ *
+ * **Trae 的两条产品线共用同一组路径**（`/trae/...`）：路由本身不带变体维度，
+ * 「当前是哪条线」由 URL 的 `?line=` 承载、由页面内部的变体切换器驱动
+ * （见 `useTraeVariant`）。这样做的理由是：变体是**数据维度**而不是**页面维度** ——
+ * 两条线的页面结构完全相同，再造一套 `/trae-cn/...` 路由会让每个页面组件被迫复制一份。
+ */
+const PRODUCT_NAV: Record<Product, readonly NavItem[]> = {
+  workbuddy: [
+    { to: "/", end: true, label: "账号管理", icon: User },
+    { to: "/token-stats", label: "Token 统计", icon: MessagesSquare },
+    { to: "/credit-stats", label: "积分统计", icon: Sparkles },
+    { to: "/api-service", label: "API 服务", icon: Server },
+    { to: "/settings", label: "设置", icon: Settings },
+  ],
+  trae: [
+    { to: "/trae/accounts", label: "账号管理", icon: User },
+    { to: "/trae/token-stats", label: "Token 统计", icon: MessagesSquare },
+    { to: "/trae/credits", label: "积分统计", icon: Sparkles },
+    { to: "/trae/api-service", label: "API 服务", icon: Server },
+    { to: "/trae/settings", label: "设置", icon: Settings },
+  ],
+};
+
+/**
+ * 产品显示名。
+ *
+ * Trae 分区**固定显示 `Trae`**，不带产品线后缀 —— 具体是哪条线由分区内部的
+ * 切换器表达。把线名写进侧栏会让「Trae Work / Trae CN」看起来像两个产品，
+ * 而它们共用同一组页面与账号管理方式。
+ */
+const PRODUCT_LABEL: Record<Product, string> = {
+  workbuddy: "WorkBuddy",
+  trae: "Trae",
+};
+
+/** 产品首页：切到某产品时，若当前路由不属于它，就落到这里。 */
+const PRODUCT_HOME: Record<Product, string> = {
+  workbuddy: "/",
+  trae: "/trae/accounts",
+};
+
+/** 路由 → 产品。Trae 的全部路由都在 `/trae` 前缀下，其余归 WorkBuddy。 */
+function productFromPath(pathname: string): Product {
+  return pathname === "/trae" || pathname.startsWith("/trae/") ? "trae" : "workbuddy";
+}
+
+function navLinkClass({ isActive }: { isActive: boolean }): string {
+  return cn(
+    "flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-sidebar-ring/50",
+    isActive
+      ? "bg-foreground/[0.06] font-medium text-foreground"
+      : "text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground",
+  );
+}
+
+/**
+ * 每条 Trae 产品线的运行状态。
+ *
+ * 只在 Trae 分区激活时探测：在 WorkBuddy 分区下这次探测没有意义，
+ * 而演示模式下 `get_trae_variants` 会直接抛错（按「未运行」处理即可）。
+ *
+ * **返回两条线各自的运行状态**（而不是单一的 true/false）：
+ * 侧栏底部那颗圆点跟随**当前选中的那条线**，若只探测「Trae 是否在运行」，
+ * 在「Trae Work 已关闭、Trae CN 在运行」时就会显示错误的绿灯。
+ */
+function useTraeVariantRunning(active: boolean): Record<string, boolean> {
+  const [running, setRunning] = useState<Record<string, boolean>>({});
+
+  useEffect(() => {
+    if (!active) return;
+    let disposed = false;
+    const load = async () => {
+      try {
+        const result = await api.getTraeVariants();
+        if (disposed) return;
+        setRunning(
+          Object.fromEntries((result.variants ?? []).map((item) => [item.variant, item.running])),
+        );
+      } catch {
+        if (!disposed) setRunning({});
+      }
+    };
+    void load();
+    const timer = window.setInterval(() => void load(), 60 * 1000);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [active]);
+
+  return running;
+}
+
+/** 侧栏顶部的产品切换：下方的导航与主区域页面都跟随它。 */
+function ProductSwitch({
+  product,
+  onChange,
+}: {
+  product: Product;
+  onChange: (next: Product) => void;
+}) {
+  /*
+   * 两个产品 Tab：**图标 + 文字**。
+   *
+   * ## 为什么现在是两个而不是三个
+   *
+   * 曾经这里是三个 Tab（WorkBuddy / Trae Work / Trae CN），因为两条 Trae 产品线
+   * 可以同机并存。但侧栏固定 220px、扣掉 `px-3` 后 tablist 只有 195px，
+   * 三等分每格约 60px，而 12px 字号下 `WorkBuddy` = 65px、`Trae Work` = 56px、
+   * `Trae CN` = 43px —— **三个全都放不下**。当时的妥协是压成纯图标 + Tooltip。
+   *
+   * 但纯图标本身就是一个更强的信号：**用户分不清两个几乎一样的 Trae 图标该点哪个**。
+   * 两条线共用全部页面与路由，拆成两个顶级入口本来就多一层无意义的二选一，
+   * 因此合并成一个 `Trae`。产品线的选择下沉到 Trae 页面内部（那里宽度充足，
+   * 可以完整展示 `Trae Work` / `Trae CN` 并带各自的运行状态）。
+   *
+   * ## 为什么两个 Tab 也**不能等分**（浏览器实测，别再改回 `grid-cols-2`）
+   *
+   * 合并成两个后，`grid-cols-2` 的等分**仍然放不下** `WorkBuddy`：
+   * tablist 外框 195px、扣 `p-1` 后内容区 187px、`gap-0.5` 占 2px ⇒ 每格 92px；
+   * 再减 `px-2`（16px）+ 图标 15px + `gap-1.5`（6px），**留给文字的只有 55px**，
+   * 而 12px/500 的 `WorkBuddy` 实测 `scrollWidth = 64px` —— 短 9px，被截成 `WorkBu…`。
+   * （此前的注释把「每格 95px」当成了文字可用宽度，漏减了图标 15px + 间距 6px +
+   * 内边距 16px，正是这次截断的来源。）
+   *
+   * 因此改成**按内容自适应并居中**（`grid-cols-[auto_auto]` + `justify-center`）：
+   * `WorkBuddy` 格 = 8+15+6+64+8 = 101px、`Trae` 格 = 8+15+6+23+8 = 60px，
+   * 加 2px 间隙共 163px ≤ 187px，放得下且有余量。
+   *
+   * 刻意**不**用「缩字号 / 压 padding 硬塞进等分格」：要等分放下 `WorkBuddy`，
+   * `padX + gap` 只能有 13px（12px 字号）或 16px（11px 字号），余量仅 1~3px；
+   * 换 DPI / 字体回退时会再次截断，不可靠。按内容排布不依赖这点余量。
+   *
+   * label 上的 `truncate` 保留，作为将来产品名变长时的兜底（当前不触发）。
+   *
+   * 两个图标仍然如实反映「这是两个独立体系」——这正是 WorkBuddy 侧的做法。
+   */
+  return (
+    <Tabs
+      value={product}
+      onValueChange={(value) => onChange(value as Product)}
+      className="mb-3 shrink-0"
+    >
+      <TabsList
+        className="grid h-9 w-full grid-cols-[auto_auto] justify-center gap-0.5 rounded-xl border border-sidebar-border bg-sidebar-accent/60 p-1"
+        aria-label="切换产品"
+      >
+        <TabsTrigger
+          value="workbuddy"
+          className="h-7 w-full min-w-0 gap-1.5 rounded-lg px-2 text-xs font-medium data-[state=active]:bg-primary/15 data-[state=active]:shadow-none"
+        >
+          <WorkBuddyMark size={15} />
+          <span className="truncate">WorkBuddy</span>
+        </TabsTrigger>
+        <TabsTrigger
+          value="trae"
+          className="h-7 w-full min-w-0 gap-1.5 rounded-lg px-2 text-xs font-medium data-[state=active]:bg-primary/15 data-[state=active]:shadow-none"
+        >
+          {/* 两个产品的图标各自如实呈现；Trae 用**不带角标**的基础款，
+              因为这里不再区分产品线（线在页面内部选）。 */}
+          <TraeVariantMark variant="trae_work" size={15} />
+          <span className="truncate">Trae</span>
+        </TabsTrigger>
+      </TabsList>
+    </Tabs>
+  );
+}
+
+/**
+ * 侧栏底部的应用信息。
+ *
+ * 这里展示的是**本应用**（BuddySwitch）的名称与版本，而不是所管理客户端的版本：
+ * `status.version` 来自 `update::APP_VERSION`，此前挂在「WorkBuddy」名下会让人
+ * 误以为它是 WorkBuddy 客户端的版本号。状态圆点跟随当前选中的产品。
+ */
+function AppFooter({
+  product,
+  running,
+  version,
+}: {
+  product: Product;
+  running: boolean;
+  version: string | undefined;
+}) {
   const [info, setInfo] = useState<UpdateInfo | null>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
 
@@ -47,15 +279,25 @@ function UpdateCenter({ running }: { running: boolean | undefined }) {
   }, []);
 
   const hasUpdate = Boolean(info?.ok && info.hasUpdate && info.latest);
+  const label = PRODUCT_LABEL[product];
 
   return (
     <>
       <section className="mt-auto border-t border-sidebar-border px-2 pt-3 text-xs">
         <div className="flex items-center gap-2 text-[13px] text-sidebar-foreground">
-          <StatusDot on={Boolean(running)} />
-          <span className="min-w-0 flex-1 truncate">WorkBuddy</span>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span className="inline-flex">
+                <StatusDot on={running} />
+              </span>
+            </TooltipTrigger>
+            <TooltipContent side="top">{running ? `${label} 运行中` : `${label} 未运行`}</TooltipContent>
+          </Tooltip>
+          <span className="min-w-0 flex-1 truncate">BuddySwitch</span>
           <div className="flex shrink-0 items-center gap-1.5">
-            <span className="text-sidebar-foreground/50">v{version || "?"}</span>
+            {/* 版本用更小的字号：侧栏只有 220px，「BuddySwitch」比原来的「WorkBuddy」长，
+                同字号下会把名称挤成省略号（有更新按钮时尤其明显）。 */}
+            <span className="shrink-0 text-[11px] tabular-nums text-sidebar-foreground/50">v{version || "?"}</span>
             {hasUpdate && (
               <Tooltip>
                 <TooltipTrigger asChild>
@@ -85,11 +327,52 @@ function UpdateCenter({ running }: { running: boolean | undefined }) {
 }
 
 function Layout() {
-  const running = useAccountsStore((s) => s.status?.running);
+  const location = useLocation();
+  const navigate = useNavigate();
+
+  /** 每个产品各自记住上次停留的页面，来回切换不会丢上下文。 */
+  const lastPathRef = useRef<Record<Product, string>>({ ...PRODUCT_HOME });
+
+  /**
+   * 当前的产品分区。
+   *
+   * 路径只能回答「是 WorkBuddy 还是 Trae」，回答不了「Trae 里是看哪条产品线」——
+   * 两条线共用 `/trae/...`。因此变体由 URL 里的 `?line=` 查询参数承载，
+   * 但它**不再是分区维度**：它决定 Trae 页面内部展示哪条线，
+   * 由 `TraeAccountsPage` 等页面自己读取（见 `useTraeVariant`）。
+   */
+  const [traeVariant, setTraeVariant] = useTraeVariant();
+  const product: Product = productFromPath(location.pathname);
+
+  const appVersion = useAccountsStore((s) => s.status?.version || s.global.status?.version);
+  const workbuddyRunning = useAccountsStore((s) =>
+    Boolean(s.status?.running || s.global.status?.running),
+  );
+  const traeRunning = useTraeVariantRunning(product === "trae");
+  // Trae 分区的状态圆点跟随**当前选中的那条产品线**（而不是「Trae 是否有任意一条在跑」）：
+  // 在「Trae Work 已关闭、Trae CN 在运行」时，只探「Trae 是否运行」会显示错误的绿灯。
+  const running =
+    product === "workbuddy" ? workbuddyRunning : Boolean(traeRunning[traeVariant]);
+
   const hasUnifiedTitleBar =
     api.isDesktop() && typeof navigator !== "undefined" && navigator.userAgent.includes("Macintosh");
   useCreditAutoRefresh();
   useWorkbuddyStatusRefresh();
+
+  useEffect(() => {
+    lastPathRef.current[product] = location.pathname;
+  }, [product, location.pathname]);
+
+  function switchProduct(next: Product) {
+    if (next === product) return;
+    // Trae 内部的产品线由 `?line=` 保持，切走再切回来时**不应该被重置**——
+    // 用户上次看的是 Trae CN，回来时就还该是 Trae CN。这里的 `setTraeVariant`
+    // 只在切**向** Trae 且 URL 尚无该参数时兜底（默认变体不写进 URL，
+    // 因此这一步通常是空操作，保留它是为了「切走时 URL 上残留了别的产品的参数」
+    // 这类边界不会让变体漂到错误的值）。
+    if (next === "trae") setTraeVariant(traeVariant);
+    navigate(lastPathRef.current[next] || PRODUCT_HOME[next]);
+  }
 
   return (
     <div className="flex h-screen min-h-0 overflow-hidden bg-background">
@@ -125,67 +408,24 @@ function Layout() {
             )}
           </div>
         </div>
-        <nav className="flex min-h-0 flex-1 flex-col gap-0.5" aria-label="主导航">
-          <NavLink
-            to="/"
-            end
-            className={({ isActive }) =>
-              cn(
-                "flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-sidebar-ring/50",
-                isActive
-                  ? "bg-foreground/[0.06] font-medium text-foreground"
-                  : "text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground",
-              )
-            }
-          >
-            <User className="size-4" />
-            账号管理
-          </NavLink>
-          <NavLink to="/token-stats" className={({ isActive }) => cn("flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm outline-none transition-colors", isActive ? "bg-foreground/[0.06] font-medium text-foreground" : "text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground")}><MessagesSquare className="size-4" />Token 统计</NavLink>
-          <NavLink
-            to="/credit-stats"
-            className={({ isActive }) =>
-              cn(
-                "flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-sidebar-ring/50",
-                isActive
-                  ? "bg-foreground/[0.06] font-medium text-foreground"
-                  : "text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground",
-              )
-            }
-          >
-            <Sparkles className="size-4" />
-            积分统计
-          </NavLink>
-          <NavLink
-            to="/api-service"
-            className={({ isActive }) =>
-              cn(
-                "flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-sidebar-ring/50",
-                isActive
-                  ? "bg-foreground/[0.06] font-medium text-foreground"
-                  : "text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground",
-              )
-            }
-          >
-            <Server className="size-4" />
-            API 服务
-          </NavLink>
-          <NavLink
-            to="/settings"
-            className={({ isActive }) =>
-              cn(
-                "flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-sidebar-ring/50",
-                isActive
-                  ? "bg-foreground/[0.06] font-medium text-foreground"
-                  : "text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground",
-              )
-            }
-          >
-            <Settings className="size-4" />
-            设置
-          </NavLink>
+
+        <ProductSwitch product={product} onChange={switchProduct} />
+
+        <nav
+          className="flex min-h-0 flex-1 flex-col gap-0.5"
+          aria-label={`${PRODUCT_LABEL[product]} 导航`}
+        >
+          {PRODUCT_NAV[product].map((item) => (
+            <NavLink key={item.to} to={item.to} end={item.end} className={navLinkClass}>
+              <item.icon className="size-4" />
+              {item.label}
+            </NavLink>
+          ))}
         </nav>
-        {api.isWebui() && !demoModeEnabled ? null : <UpdateCenter running={running} />}
+
+        {api.isWebui() && !demoModeEnabled ? null : (
+          <AppFooter product={product} running={running} version={appVersion} />
+        )}
       </aside>
       <main
         className={cn(
@@ -212,6 +452,14 @@ export default function App() {
             <Route path="/token-stats" element={<TokenStatsPage />} />
             <Route path="/api-service" element={<ApiServicePage />} />
             <Route path="/settings" element={<SettingsPage />} />
+            {/* Trae 侧与 WorkBuddy 侧逐条同构；`/trae` 本身重定向到账号管理，
+                避免旧书签或外部链接落在空路由上。 */}
+            <Route path="/trae" element={<Navigate to="/trae/accounts" replace />} />
+            <Route path="/trae/accounts" element={<TraeAccountsPage />} />
+            <Route path="/trae/token-stats" element={<TraeTokenStatsPage />} />
+            <Route path="/trae/credits" element={<TraeCreditsPage />} />
+            <Route path="/trae/api-service" element={<TraeApiServicePage />} />
+            <Route path="/trae/settings" element={<TraeSettingsPage />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Route>
         </Routes>

@@ -1,6 +1,6 @@
 {
   "name": "workbuddy-switch-darwin-arm64",
-  "version": "2026.9.16",
+  "version": "2026.9.181729",
   "description": "BuddySwitch platform binary (darwin-arm64)",
   "os": [
     "darwin"

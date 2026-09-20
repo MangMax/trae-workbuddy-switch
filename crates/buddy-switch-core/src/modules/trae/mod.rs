@@ -105,6 +105,9 @@ pub mod platform;
 pub mod profile;
 pub mod settings;
 pub mod store;
+/// 测试专用的环境隔离与 fixture 构造（`cfg(test)` 下才编译，生产代码零引用）。
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod token_stats;
 pub mod variant;
 

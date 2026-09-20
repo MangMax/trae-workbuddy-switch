@@ -16,68 +16,69 @@ use std::path::PathBuf;
 
 use crate::modules::config::{atomic_write, store_dir};
 
-/// 六类定时任务的类型标识。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScheduleTask {
-    Checkin,
-    Travel,
-    Activity,
-    Keepalive,
-    School,
-    Cat,
+/// 一次性生成「定时任务类型标识」的**唯一来源**。
+///
+/// 关键设计：枚举变体、[`ScheduleTask::all`]、标签 [`ScheduleTask::as_str`]，以及按变体
+/// 分派的 [`ScheduleTask::enabled`] / [`ScheduleTask::hours`]，**全部由同一份声明生成**，
+/// 因此「任务集合」不可能与枚举漂移——新增/删除一类任务只需改动下面
+/// `define_schedule_tasks!` 调用里的**一行**，四处自动同步。
+///
+/// 为什么必须这样：此前 `all()` 是**手工列举的固定数组**，与枚举是**两个来源**；把某一类
+/// 任务从 `all()` 删掉而枚举仍在时，编译器无从察觉，该任务会**静默消失**且测试全绿
+/// （与「`set_credits` 存在却无人调用」是同一失效模式）。现在删掉任一行会让枚举失去该
+/// 变体，而所有 `match ScheduleTask`（含 `buddy-switch-server` 的派发，**无通配**）随之
+/// **无法编译**——把「集合完整性」从运行时自证升级为编译期强制。
+macro_rules! define_schedule_tasks {
+    ($( $variant:ident => $label:literal, $enabled:ident, $hours:ident ; )+) => {
+        /// 定时任务的类型标识。
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum ScheduleTask {
+            $( $variant, )+
+        }
+
+        impl ScheduleTask {
+            /// 全部任务（顺序即声明顺序）。**由宏与枚举一并生成，二者不可能漂移。**
+            pub fn all() -> Vec<ScheduleTask> {
+                vec![ $( ScheduleTask::$variant, )+ ]
+            }
+
+            /// 稳定标识（用于日志 / 汇总）。
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $( ScheduleTask::$variant => $label, )+
+                }
+            }
+
+            /// 该任务是否在配置中被显式启用。
+            pub fn enabled(self, cfg: &ScheduleConfig) -> bool {
+                match self {
+                    $( ScheduleTask::$variant => cfg.$enabled, )+
+                }
+            }
+
+            /// 该任务配置的小时列表；任务被禁用时返回空切片
+            /// （`next_fire` 对空列表返回 `None`）。
+            pub fn hours<'a>(self, cfg: &'a ScheduleConfig) -> &'a [u32] {
+                if !self.enabled(cfg) {
+                    return &[];
+                }
+                match self {
+                    $( ScheduleTask::$variant => &cfg.$hours, )+
+                }
+            }
+        }
+    };
 }
 
-impl ScheduleTask {
-    /// 稳定标识（用于日志 / 汇总）。
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ScheduleTask::Checkin => "checkin",
-            ScheduleTask::Travel => "travel",
-            ScheduleTask::Activity => "activity",
-            ScheduleTask::Keepalive => "keepalive",
-            ScheduleTask::School => "school",
-            ScheduleTask::Cat => "cat",
-        }
-    }
-
-    /// 该任务是否在配置中被显式启用。
-    pub fn enabled(self, cfg: &ScheduleConfig) -> bool {
-        match self {
-            ScheduleTask::Checkin => cfg.checkin_enabled,
-            ScheduleTask::Travel => cfg.travel_enabled,
-            ScheduleTask::Activity => cfg.activity_enabled,
-            ScheduleTask::Keepalive => cfg.keepalive_enabled,
-            ScheduleTask::School => cfg.school_enabled,
-            ScheduleTask::Cat => cfg.cat_enabled,
-        }
-    }
-
-    /// 该任务配置的小时列表；任务被禁用时返回空切片（`next_fire` 对空列表返回 `None`）。
-    pub fn hours<'a>(self, cfg: &'a ScheduleConfig) -> &'a [u32] {
-        if !self.enabled(cfg) {
-            return &[];
-        }
-        match self {
-            ScheduleTask::Checkin => &cfg.checkin_hours,
-            ScheduleTask::Travel => &cfg.travel_hours,
-            ScheduleTask::Activity => &cfg.activity_hours,
-            ScheduleTask::Keepalive => &cfg.keepalive_hours,
-            ScheduleTask::School => &cfg.school_hours,
-            ScheduleTask::Cat => &cfg.cat_hours,
-        }
-    }
-
-    /// 全部六类任务（固定顺序，供遍历用）。
-    pub fn all() -> [ScheduleTask; 6] {
-        [
-            ScheduleTask::Checkin,
-            ScheduleTask::Travel,
-            ScheduleTask::Activity,
-            ScheduleTask::Keepalive,
-            ScheduleTask::School,
-            ScheduleTask::Cat,
-        ]
-    }
+// ⚠️ 这里是「有哪些定时任务」的**唯一来源**：新增/删除一类任务只改这一处。
+// 每行 = 变体 => 标签, 启用开关字段, 小时字段。漏改必然导致编译失败。
+define_schedule_tasks! {
+    Checkin => "checkin", checkin_enabled, checkin_hours;
+    Travel => "travel", travel_enabled, travel_hours;
+    Activity => "activity", activity_enabled, activity_hours;
+    Keepalive => "keepalive", keepalive_enabled, keepalive_hours;
+    School => "school", school_enabled, school_hours;
+    Cat => "cat", cat_enabled, cat_hours;
 }
 
 /// 排程配置（`~/.buddy-switch/schedule_config.json`）。
@@ -529,5 +530,140 @@ mod tests {
         // 合法整数边界 0 / 23 必须通过。
         let cfg = schedule_from_value(&json!({"school_hours": [0, 23]})).unwrap();
         assert_eq!(cfg.school_hours, vec![0, 23]);
+    }
+
+    /// 表驱动：把宏 [`define_schedule_tasks!`] 生成的**三张映射表**（`as_str` / `enabled` /
+    /// `hours`）逐类钉死，防止「宏正确地生成了错误映射」——即某类任务读到了**另一类**的
+    /// 开关/小时/标签，从而按错的配置静默运行（编译与既有测试都发现不了）。
+    ///
+    /// 关键：配置取值必须**互相可区分**，否则「读错字段」会得到相同观察结果、测不出。
+    /// - **label**：逐类断言 `as_str()` 等于自己的字面量。
+    /// - **hours**：六份 `*_hours` 设成互不相同的列表，逐类断言 `hours()` 等于自己的列表；
+    ///   任一跨字段错读必然得到别人的列表 → 暴露。
+    /// - **enabled**：布尔只有两态，单份配置区分不了 6 个字段，故遍历「只开一个开关」的
+    ///   六份配置，断言**被启用的任务集合**恰为该开关的属主；任一跨字段错读都会在某份
+    ///   配置里被拆穿。
+    ///
+    /// 断言的是「等于它自己那一列」（随字段变化），而非某个常量——否则改错映射仍可能蒙对。
+    #[test]
+    fn schedule_task_mappings_are_pinned_per_variant() {
+        // 全关 + 六份互异的小时列表（当作「每类自己的那一列」的探针）。
+        let off = ScheduleConfig {
+            checkin_hours: vec![1],
+            travel_hours: vec![2],
+            activity_hours: vec![3],
+            keepalive_hours: vec![4],
+            school_hours: vec![5],
+            cat_hours: vec![6],
+            checkin_enabled: false,
+            travel_enabled: false,
+            activity_enabled: false,
+            keepalive_enabled: false,
+            school_enabled: false,
+            cat_enabled: false,
+            activity_report_count: 5,
+        };
+
+        // (1) label + hours：逐类断言等于「它自己那一列」。
+        let expected: [(ScheduleTask, &str, &[u32]); 6] = [
+            (ScheduleTask::Checkin, "checkin", off.checkin_hours.as_slice()),
+            (ScheduleTask::Travel, "travel", off.travel_hours.as_slice()),
+            (ScheduleTask::Activity, "activity", off.activity_hours.as_slice()),
+            (ScheduleTask::Keepalive, "keepalive", off.keepalive_hours.as_slice()),
+            (ScheduleTask::School, "school", off.school_hours.as_slice()),
+            (ScheduleTask::Cat, "cat", off.cat_hours.as_slice()),
+        ];
+        // `hours()` 仅在任务启用时才返回自己的列表，故 hours 断言用「全启用」配置。
+        let on = ScheduleConfig {
+            checkin_enabled: true,
+            travel_enabled: true,
+            activity_enabled: true,
+            keepalive_enabled: true,
+            school_enabled: true,
+            cat_enabled: true,
+            ..off.clone()
+        };
+        for (task, label, own_hours) in expected {
+            assert_eq!(
+                task.as_str(),
+                label,
+                "as_str 映射错误（应等于自己的标签）: {label}"
+            );
+            assert_eq!(
+                task.hours(&on),
+                own_hours,
+                "hours 映射错误（应等于自己的 *_hours）: {label}"
+            );
+        }
+
+        // (2) enabled：布尔仅两态，一份配置区分不了 6 个字段；遍历「只开一个开关」的六份配置，
+        //     断言「被启用的任务集合」恰为该开关的属主。
+        let only: [(&str, ScheduleConfig); 6] = [
+            (
+                "checkin",
+                ScheduleConfig {
+                    checkin_enabled: true,
+                    ..off.clone()
+                },
+            ),
+            (
+                "travel",
+                ScheduleConfig {
+                    travel_enabled: true,
+                    ..off.clone()
+                },
+            ),
+            (
+                "activity",
+                ScheduleConfig {
+                    activity_enabled: true,
+                    ..off.clone()
+                },
+            ),
+            (
+                "keepalive",
+                ScheduleConfig {
+                    keepalive_enabled: true,
+                    ..off.clone()
+                },
+            ),
+            (
+                "school",
+                ScheduleConfig {
+                    school_enabled: true,
+                    ..off.clone()
+                },
+            ),
+            (
+                "cat",
+                ScheduleConfig {
+                    cat_enabled: true,
+                    ..off.clone()
+                },
+            ),
+        ];
+        for (owner_label, cfg) in only {
+            let enabled_labels: Vec<&str> = ScheduleTask::all()
+                .into_iter()
+                .filter(|task| task.enabled(&cfg))
+                .map(|task| task.as_str())
+                .collect();
+            assert_eq!(
+                enabled_labels,
+                vec![owner_label],
+                "enabled 映射错误：只有 {owner_label} 开关打开时，被启用的任务必须恰为该类"
+            );
+        }
+
+        // (3) 集合完整性：`all()` 恰好是这六类、不多不少（顺序 = 宏声明顺序）。
+        let labels: Vec<&str> = ScheduleTask::all()
+            .into_iter()
+            .map(|task| task.as_str())
+            .collect();
+        assert_eq!(
+            labels,
+            vec!["checkin", "travel", "activity", "keepalive", "school", "cat"],
+            "all() 必须恰好包含全部六类且顺序稳定"
+        );
     }
 }

@@ -229,6 +229,23 @@ fn credit_stats_split_view_filters_by_account_ownership() {
         assert_eq!(account["region"], "global", "region 徽标必须为 global");
     }
 
+    // ⚠️ 顺序是**故意的**，别把 global 视图那段挪到后面或与之合并：上面那次 global
+    // 查询会触发官方用量采集，而采集链路在 token 陈旧时会按 region 刷新并把账号
+    // **写回账号库**。曾经 `official_usage` 固定走 CN 的 `authenticated_post`，于是
+    // 这次 global 查询会把 `global-only`（连 `needs_relogin` 标记）写进 CN 的
+    // `accounts.json`，下面的 cn 视图随即串入 global 账号。现在采集链路带 region，
+    // 写回的是 `accounts.global.json`。
+    //
+    // 先钉住**存储层**（比投影层更贴近根因）：CN 账号库文件内容必须与夹具逐字节一致。
+    // 即使将来有人改坏 `build_statistics` 的过滤逻辑、让下面那圈投影层断言失效，
+    // 这一条仍会报警。
+    let cn_store = home.path().join(".buddy-switch/accounts.json");
+    assert_eq!(
+        fs::read_to_string(&cn_store).expect("read cn accounts"),
+        CN_ACCOUNTS,
+        "CN 账号库被写脏：global 账号被写进了 accounts.json"
+    );
+
     // cn 视图：accounts[].accountId 必须全部属于 cn 账号库。
     let cn = futures_block_on(credit_usage::get_statistics_for_filter(RegionFilter::Cn, false));
     assert_eq!(cn["region"], "cn");

@@ -1,6 +1,7 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 mod commands;
 mod gateway;
+mod trae_gateway;
 #[cfg(desktop)]
 mod tray;
 
@@ -122,6 +123,8 @@ pub fn run() {
             }
             // 网关运行时句柄（管理命令依赖它查询/切换独立监听）。
             app.manage(gateway::GatewayRuntime::new());
+            // Trae 网关运行时句柄（与上面那份**互不相干**：配置 / Key / 日志全独立）。
+            app.manage(trae_gateway::TraeGatewayRuntime::new());
             // README 截图模式只渲染前端虚构数据，禁止读取账号后执行签到、轮换或保活。
             if !is_screenshot_demo() {
                 spawn_background_loops();
@@ -133,6 +136,16 @@ pub fn run() {
                         Ok(Some(addr)) => eprintln!("[gateway] 已启动: http://{addr}"),
                         Ok(None) => {}
                         Err(error) => eprintln!("[gateway] 启动失败: {error}"),
+                    }
+                });
+                // 按配置启动 Trae 网关独立监听（默认关闭；默认 127.0.0.1:7864）。
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    let runtime = handle.state::<trae_gateway::TraeGatewayRuntime>();
+                    match runtime.apply().await {
+                        Ok(Some(addr)) => eprintln!("[trae-gateway] 已启动: http://{addr}"),
+                        Ok(None) => {}
+                        Err(error) => eprintln!("[trae-gateway] 启动失败: {error}"),
                     }
                 });
             }
@@ -203,6 +216,48 @@ pub fn run() {
             commands::save_account_strategy,
             commands::get_gateway_logs,
             commands::clear_gateway_logs,
+            // ---- Trae 模块（与 server 的 /api/trae/* 路由一一对应）----
+            commands::get_trae_env,
+            commands::get_trae_variants,
+            commands::get_trae_capabilities,
+            commands::get_trae_accounts,
+            commands::get_trae_checkin_status,
+            commands::get_trae_credits,
+            commands::get_trae_token_statistics,
+            commands::get_trae_logs,
+            commands::get_trae_profiles,
+            commands::get_trae_settings,
+            commands::save_trae_settings,
+            commands::trae_add_account,
+            commands::trae_update_account,
+            commands::trae_delete_account,
+            commands::trae_import_local_account,
+            commands::trae_oauth_start,
+            commands::trae_oauth_status,
+            commands::trae_oauth_cancel,
+            commands::trae_export_accounts,
+            commands::trae_export_accounts_to_path,
+            commands::trae_preview_import_accounts,
+            commands::trae_import_accounts,
+            commands::trae_group_op,
+            commands::trae_checkin,
+            commands::trae_refresh_credits,
+            commands::trae_refresh_jwt,
+            commands::trae_clear_cooldown,
+            commands::trae_switch_account,
+            commands::trae_save_login,
+            commands::trae_backup_profile,
+            commands::trae_restore_profile,
+            commands::trae_delete_profile,
+            commands::trae_reset_device,
+            // Trae API 网关（管理面）——与上面 WorkBuddy 网关的一组命令平行。
+            commands::get_trae_gateway_config,
+            commands::save_trae_gateway_config,
+            commands::trae_gateway_status,
+            commands::get_trae_gateway_models,
+            commands::regenerate_trae_api_key,
+            commands::get_trae_gateway_logs,
+            commands::clear_trae_gateway_logs,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

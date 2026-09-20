@@ -34,6 +34,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
+use crate::modules::trae::icube;
+use crate::modules::trae::jwt;
 use crate::modules::trae::paths;
 use crate::modules::trae::platform;
 use crate::modules::trae::store;
@@ -64,6 +66,25 @@ pub struct CoreEntry {
 /// 9 类，与参考实现 `Backup-CurrentProfile` 逐条对应。顺序无关紧要，
 /// 但**每一条都要保留**：漏掉 `state.vscdb` 会丢令牌、漏掉 `Network/` 会丢 Cookie、
 /// 漏掉 `machineid` 会让上游把恢复后的账号识别成新设备。
+///
+/// ## ★ 切换不变式（**加新条目/新来源前必读**）
+///
+/// > **切换完成后，任何「未参与本清单快照」的凭据来源，都不得残留上一账号的内容。**
+///
+/// 本清单是**白名单**，所以每漏一个凭据来源，切换就会把它留在原地、带进下一个账号。
+/// 两类已知来源按不同方式满足这条不变式，**两条都不能省**：
+///
+/// 1. **本清单内的条目**：`restore_from_slot_for` 用 `copy_entry` 覆盖，
+///    目录类条目还会先 `remove_dir_all`（见 [`copy_entry`]）—— 靠**覆盖**满足；
+/// 2. **清单外的凭据来源**：`restore_from_slot_for` 逐个**主动清除** ——
+///    见 [`RESTORE_PURGE_RELATIVES`]。目前有两项：
+///    - `logs/`：`extract_local_jwt_for` 会扫
+///      `logs/**/trae.ai-code-completion/completion.log` 里的明文 JWT。
+///      不清 ⇒ 切到 A 之后导入仍读到 B 的 token，症状就是「切换后账号不变」。
+///    - SQLite 边车文件（`-wal` / `-shm` / `-journal`）：不删会让 SQLite
+///      下次打开时**回放旧事务**，把上一账号的页写回刚恢复的库里，症状同上。
+///
+/// **因此：新增任何凭据来源时，要么把它加进本清单，要么加进清除清单。**
 pub const CORE_ENTRIES: &[CoreEntry] = &[
     CoreEntry {
         relative: "User/globalStorage/storage.json",
@@ -122,6 +143,28 @@ pub const CORE_ENTRIES: &[CoreEntry] = &[
     },
 ];
 
+/// 恢复快照前**主动清除**的「清单外的凭据来源」（相对 `<客户端 userData>`）。
+///
+/// 存在的唯一理由是 [`CORE_ENTRIES`] 的**切换不变式**：
+/// 任何未参与快照的凭据来源都不得残留上一账号的内容。这些来源刻意**不进快照**
+/// （体积与副作用都不划算），所以必须靠清除来满足不变式。
+///
+/// | 相对路径 | 为什么必须清 | 不清的后果 |
+/// |:--|:--|:--|
+/// | `logs` | [`extract_local_jwt_for`] 会扫其中的 `completion.log` 明文 JWT | 切到 A 后导入仍读到 B 的 token（症状：**切换后账号不变**） |
+/// | `User/globalStorage/state.vscdb-wal` 等 | SQLite 会在下次打开时**回放**这些文件里的事务 | 旧事务把上一账号的页写回刚恢复的库（症状同上） |
+///
+/// 目录条目按「整目录删除」处理，文件条目按「单文件删除、不存在即跳过」处理。
+const RESTORE_PURGE_RELATIVES: &[&str] = &[
+    // ── 明文凭据来源：客户端扩展日志（跨账号累积，且不在快照内） ──
+    "logs",
+    // ── SQLite 边车文件：三件套都要清，缺一个就会回放 ──
+    // 主库 `state.vscdb` 本身由 `CORE_ENTRIES` 覆盖，这里只处理它的附属文件。
+    "User/globalStorage/state.vscdb-wal",
+    "User/globalStorage/state.vscdb-shm",
+    "User/globalStorage/state.vscdb-journal",
+];
+
 impl CoreEntry {
     /// 把相对路径解析到给定根目录下（同时支持 `/` 与平台分隔符）。
     pub fn resolve(&self, root: &Path) -> PathBuf {
@@ -143,7 +186,13 @@ impl CoreEntry {
 /// 新代码请直接调用 [`extract_local_jwt_for`] 并显式传入变体，不要再依赖此壳——
 /// 否则会重新落入「用户在 A 分区操作、代码却读 B 产品线」的老坑（见下一函数的说明）。
 ///
-/// ## 扫哪些文件（两处，不能只扫第一处）
+/// ## 来源顺序（主来源 + 兜底）
+///
+/// **主来源**是 `storage.json` 里 `iCubeAuthInfo://icube.cloudide` 的 tc 信封
+/// （见 [`icube_login_candidate`]）—— 它是**两条产品线都有**、且可解密的来源。
+/// 下面描述的只是**兜底**那一半，只在主来源不可用时才会走到。
+///
+/// ## 兜底扫哪些文件（两处，不能只扫第一处）
 ///
 /// Trae 是 VSCode 系客户端，旧版登录凭据落在 `state.vscdb`（SQLite，键值表
 /// `ItemTable`）与 `storage.json`（JSON）里，形态是 `Cloud-IDE-JWT <token>`。
@@ -176,6 +225,29 @@ pub fn extract_local_jwt() -> Result<(String, String), String> {
 ///
 /// 该变体没有任何存在的候选目录时，给出**指向该变体**的明确错误，
 /// 而不是含糊的「未检测到 Trae 客户端数据目录」。
+///
+/// ## 来源优先级（**顺序不可调换**）
+///
+/// | 序 | 来源 | 覆盖范围 | 实现 |
+/// |:--|:--|:--|:--|
+/// | 1 | `storage.json` 的 `iCubeAuthInfo://icube.cloudide` **tc 信封** | **两条产品线都有** | [`icube_login_candidate`] |
+/// | 2 | `storage.json` / `state.vscdb` 明文 + 扩展日志 | 只有装了 `trae.ai-code-completion` 的产品线 | [`collect_log_candidates`] |
+///
+/// **为什么主来源必须是 tc 信封**：`TRAE SOLO CN`（Trae Work）实测 355 个日志文件、
+/// **0** 个 `completion.log`、0 处 `Cloud-IDE-JWT` —— 明文来源在它身上**根本不存在**，
+/// 只扫明文等于「Trae Work 永远导入不了」，用户看到的是「明明登录了却识别不到」。
+/// 而它的凭据一直都在，只是躺在加密信封里：**不是提不出，是找错了地方**。
+///
+/// **为什么 tc 优先于明文，而不是「两边取 `exp` 最大者」**：明文来源是**历史累积**的
+/// （`logs/` 会跨账号留存，见 [`restore_from_slot_for`] 的不变式），tc 信封才是客户端
+/// **当前**的登录态。若按 `exp` 取最大，切换账号后残留的上一账号日志可能胜出
+/// ⇒ 导入到错账号，症状正是「切换后账号不变」。
+///
+/// ## 返回值的形态约定
+///
+/// `Ok((uid, header_value))` 的第二个值**恒为完整请求头值**（含 `Cloud-IDE-JWT ` 前缀），
+/// 与 OAuth 路径落库的形态一致（`account.rs` 里的 `jwt::authorization_header`）。
+/// 调用方**不得**再自行拼前缀，也**不得**把裸 token 当完整头值落库。
 pub fn extract_local_jwt_for(variant: TraeVariant) -> Result<(String, String), String> {
     let data_dir = platform::select_data_dir_for(variant).ok_or_else(|| {
         format!(
@@ -184,7 +256,12 @@ pub fn extract_local_jwt_for(variant: TraeVariant) -> Result<(String, String), S
         )
     })?;
 
-    // 主来源（旧版明文所在）+ 次来源（新版唯一明文来源）。
+    // ── 主来源：iCube 登录态副本（tc 信封；Trae Work 唯一可用的来源） ──────────
+    if let Some(found) = icube_login_candidate(variant)? {
+        return Ok(found);
+    }
+
+    // ── 兜底：明文来源（旧版 storage.json / state.vscdb，新版只剩扩展日志） ──
     let mut candidates: Vec<(PathBuf, &'static str)> = vec![
         (
             data_dir.join("User").join("globalStorage").join("storage.json"),
@@ -234,24 +311,74 @@ pub fn extract_local_jwt_for(variant: TraeVariant) -> Result<(String, String), S
     let uid = crate::modules::trae::jwt::user_id_of(&token)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "解析到登录凭据但无法确定账号归属".to_string())?;
-    Ok((uid, token))
+    // 统一形态：明文来源捞出的是**裸** token（`scan_jwt_tokens` 已剥前缀），
+    // 落库前补成完整请求头值 —— 与主来源、与 OAuth 路径三者一致。
+    Ok((uid, crate::modules::trae::jwt::authorization_header(&token)))
+}
+
+/// 主来源：iCube 登录态副本（`storage.json` 的 `iCubeAuthInfo://icube.cloudide` tc 信封）。
+///
+/// 客户端把当前登录态加密写进**与设备凭证同一个 `storage.json`** 的另一个键，
+/// 信封格式与设备凭证完全相同（见 [`crate::modules::trae::icube::tc_decrypt`]），
+/// 解出来是 `{token, refreshToken, host, userId, expiredAt, …}`。
+///
+/// ## 三态返回值
+///
+/// - `Ok(Some((uid, header_value)))` —— 拿到可用凭据，`header_value` **已含**
+///   `Cloud-IDE-JWT ` 前缀（信封里存的是裸 token，补前缀是本函数的职责）；
+/// - `Ok(None)` —— 这条来源不可用（目录/键缺失、信封解不开、或凭据已过期），
+///   调用方继续走明文兜底。**不在这里报错**：主来源缺失不代表导入该失败；
+/// - `Err` —— 信封**可用**但归属解析不出。宁可报错，也不要往账号库落一条无主凭据。
+///
+/// ## 到期判定
+///
+/// 优先用信封的 `expiredAt`（客户端自己算好的 epoch 秒，比解 JWT 直接）；
+/// 取不到时回落 JWT 的 `exp`；两者都没有时按「未知 = 可用」处理 ——
+/// 与明文兜底路径的既有口径一致（只拦 `exp > 0 && exp < now`）。
+fn icube_login_candidate(variant: TraeVariant) -> Result<Option<(String, String)>, String> {
+    let Ok(info) = icube::cloudide_auth_info_for(variant) else {
+        return Ok(None);
+    };
+    // 🔴 信封里是**裸** token（实测 1004 字符、三段、无前缀）。直接落库会让
+    // 「账号库里的值」与 OAuth 路径落库的值形态不同，故此处统一补前缀。
+    let header_value = jwt::authorization_header(&info.token);
+    if jwt::normalize(&header_value).is_empty() {
+        return Ok(None);
+    }
+    let exp = info
+        .expired_at
+        .or_else(|| jwt::parse(&header_value).exp_timestamp)
+        .unwrap_or(0);
+    if exp > 0 && exp < chrono::Utc::now().timestamp() {
+        return Ok(None);
+    }
+    // `userId` 直接取（比从 JWT payload 猜更直接、且不依赖 payload 结构）；缺失时才解 token。
+    let uid = info
+        .user_id
+        .filter(|value| !value.is_empty())
+        .or_else(|| jwt::user_id_of(&header_value))
+        .ok_or_else(|| "在 iCube 登录态副本中找到凭据，但无法确定账号归属".to_string())?;
+    Ok(Some((uid, header_value)))
 }
 
 /// 找不到凭据时，产出**可操作**的诊断信息（而不是一句笼统的"没找到"）。
 ///
 /// ## 为什么需要它（2026-09-18 实测成因）
 ///
-/// 本机装有两条产品线，实测差异极大：
+/// 本机装有两条产品线，**明文**来源的覆盖差异极大：
 ///
-/// | 产品线 | `storage.json` 明文 | 扩展日志明文 | 结论 |
-/// |:--|:--|:--|:--|
-/// | `Trae CN` | 无（`iCubeAuthInfo://*` 是 iCube 自有加密，非 DPAPI） | 有（`trae.ai-code-completion` 扩展写） | 可提取 |
-/// | `TRAE SOLO CN` | 无 | **无** —— 该产品线**没装** `trae.ai-code-completion` 扩展 | 无论如何都提不出 |
+/// | 产品线 | `storage.json` 明文 | 扩展日志明文（`completion.log`） |
+/// |:--|:--|:--|
+/// | `Trae CN` | 无（`iCubeAuthInfo://*` 是 iCube 自有加密，非 DPAPI） | 有（`trae.ai-code-completion` 扩展写） |
+/// | `TRAE SOLO CN` | 无 | **无** —— 该产品线**没装** `trae.ai-code-completion` 扩展 |
 ///
-/// 用户看到的现象是「明明装了、也登录了，却识别不到账号」。真正的原因是
-/// **该产品线的客户端不写明文凭据**，与我们的代码无关、也无法通过改代码绕过。
-/// 因此这里必须说清「是哪条产品线、缺的是什么来源」，并给出唯一可行的替代路径
-/// （OAuth 网页登录）——否则用户会反复重试导入。
+/// 但**主来源不是明文**：两条产品线的 `storage.json` 都有
+/// `iCubeAuthInfo://icube.cloudide` 的 tc 信封，那是唯一对 Trae Work 也成立、
+/// 且可解密的来源（见 [`icube_login_candidate`]）。
+/// 因此本函数只负责**兜底那一半**：走到这里说明主来源也没给出可用凭据
+/// （信封缺失 / 解不开 / 已过期），于是必须说清「哪条产品线、主来源什么状态、
+/// 明文来源缺什么」，并给出可行替代路径（OAuth 网页登录）——
+/// 否则用户会反复重试导入，甚至去重装客户端。
 ///
 /// ## 标签取自**传入的变体**，不再全局探测
 ///
@@ -272,31 +399,66 @@ fn diagnose_missing_credential(data_dir: &Path, variant: TraeVariant) -> String 
         "客户端日志目录不存在 —— 请先启动一次该客户端并确认已登录。"
     };
 
-    // `storage.json` 里若已有 iCube 认证条目，说明**登录确实发生过**，
-    // 只是内容被 iCube 自己加密（`tC\\x05\\x10` 魔数，非 Windows DPAPI，无法离线解密）。
-    let auth_rows = storage_auth_entry_count(data_dir);
-    let auth_note = if auth_rows > 0 {
-        format!(
-            "检测到 {auth_rows} 条 iCube 认证记录，说明**该客户端确实已登录**；\
-             但内容由 iCube 自行加密（非 Windows DPAPI），不可离线解密。"
-        )
+    // 主来源（tc 信封）的状态。它才是 Trae Work 唯一可用的来源，所以「在不在、
+    // 为什么用不上」必须出现在诊断里，否则用户会把「凭据过期」误判成「没登录」。
+    // 只查键名、不解密，读的正是上面那个 `data_dir`，与 `device_note` 口径自洽。
+    let envelope_note = if storage_has_key(data_dir, icube::CLOUDIDE_KEY) {
+        "iCube 登录态副本键**存在**，但其中的凭据已过期或无法解密 —— \
+         请在 Trae 中重新登录后重试。"
     } else {
-        "未在存储中发现 iCube 认证记录，可能未登录或登录态尚未落盘。".to_string()
+        "storage.json 中没有 iCube 登录态副本键 —— 该客户端在此数据目录下可能从未登录过。"
+    };
+
+    // 设备身份（`icube-dc`）是**另一件事**：客户端首次启动就会写入，从未登录也存在。
+    // 早先这里数的是全部 `iCubeAuthInfo://*` 键，于是「只有一个 `icube-dc`」被说成
+    // 「该客户端确实已登录」—— 与上面那条 bullet 直接矛盾（真机 `TRAE SOLO` 实测如此）。
+    // 现在它只陈述「客户端是否在此目录启动过」，不与登录态混为一谈。
+    let device_note = if storage_device_entry_count(data_dir) > 0 {
+        "检测到设备身份（`icube-dc`），说明客户端在此数据目录下启动过 —— \
+         但**设备身份不代表登录过**，登录态请看上一条。"
+    } else {
+        "未检测到设备身份（`icube-dc`）—— 该客户端可能从未在此数据目录下启动过。"
     };
 
     format!(
         "未在【{label}】的数据目录（{}）中找到可用的登录凭据。\n\
+         · {envelope_note}\n\
          · {log_note}\n\
-         · {auth_note}\n\
+         · {device_note}\n\
          请改用「OAuth 网页登录」——它不依赖本地文件，且能获得可自动续期的凭据。",
         data_dir.display()
     )
 }
 
-/// 统计 `storage.json` 里 `iCubeAuthInfo://*` 条目数（仅用于诊断，读失败返回 0）。
+/// `storage.json` 里是否存在指定键（**只看键名，不解密**；读失败返回 `false`）。
 ///
-/// 不解析内容：这些值由 iCube 自有格式加密，我们只关心"登录是否发生过"。
-fn storage_auth_entry_count(data_dir: &Path) -> usize {
+/// 与 [`storage_device_entry_count`] 同源同风格：诊断专用，
+/// 三种退化输入（文件缺失 / JSON 损坏 / 顶层非对象）一律返回 `false`，绝不 panic。
+fn storage_has_key(data_dir: &Path, key: &str) -> bool {
+    let path = data_dir
+        .join("User")
+        .join("globalStorage")
+        .join("storage.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return false;
+    };
+    value
+        .as_object()
+        .map(|map| map.contains_key(key))
+        .unwrap_or(false)
+}
+
+/// 统计 `storage.json` 里 `iCubeAuthInfo://icube-dc:*` 条目数（仅用于诊断，读失败返回 0）。
+///
+/// 不解析内容：这些值由 iCube 自有格式加密，我们只关心「客户端是否在此目录启动过」。
+///
+/// **刻意不数** `iCubeAuthInfo://icube.cloudide`（登录态副本）—— 那是另一件事，
+/// 由 [`storage_has_key`] 单独回答。两者混在一个计数里，就会出现
+/// 「只有一个设备身份」被解读成「已经登录」的错误结论。
+fn storage_device_entry_count(data_dir: &Path) -> usize {
     let path = data_dir
         .join("User")
         .join("globalStorage")
@@ -311,7 +473,7 @@ fn storage_auth_entry_count(data_dir: &Path) -> usize {
         .as_object()
         .map(|map| {
             map.keys()
-                .filter(|key| key.starts_with("iCubeAuthInfo://"))
+                .filter(|key| key.starts_with(icube::ICUBE_DC_PREFIX))
                 .count()
         })
         .unwrap_or(0)
@@ -733,6 +895,15 @@ pub fn restore_from_slot(slot: &str) -> Result<u64, String> {
 ///
 /// 返回恢复的文件数。槽位不存在时报错，而不是「静默成功」——
 /// 切换流程据此判定失败并停下，避免留下「关掉了客户端但没恢复」的中间态。
+///
+/// ## 两步，顺序不可颠倒
+///
+/// 1. **先清「清单外的凭据来源」**（[`RESTORE_PURGE_RELATIVES`]）；
+/// 2. **再用快照覆盖「清单内条目」**（[`CORE_ENTRIES`]）。
+///
+/// 先清后覆盖有两个理由：一是覆盖期间旧日志/旧 WAL 不应与新库并存；
+/// 二是将来若有条目同时出现在两份清单里，**快照内容应当胜出**。
+/// 不变式的完整说明见 [`CORE_ENTRIES`]。
 pub fn restore_from_slot_for(variant: TraeVariant, slot: &str) -> Result<u64, String> {
     if !paths::safe_slot_name(slot) {
         return Err(format!("非法的槽位名: {slot}"));
@@ -745,6 +916,8 @@ pub fn restore_from_slot_for(variant: TraeVariant, slot: &str) -> Result<u64, St
         .ok_or("无法定位 Trae 客户端数据目录")?;
     std::fs::create_dir_all(&target_root)
         .map_err(|e| format!("创建客户端数据目录失败: {e}"))?;
+
+    let unpurged = purge_restore_relatives(&target_root);
 
     let mut restored = 0u64;
     for entry in CORE_ENTRIES {
@@ -759,7 +932,55 @@ pub fn restore_from_slot_for(variant: TraeVariant, slot: &str) -> Result<u64, St
     // 恢复后一并清掉，代价极小。
     let _ = std::fs::remove_file(target_root.join("code.lock"));
 
+    // 不变式被破坏时必须留痕（不阻断切换，理由见 `purge_restore_relatives`）。
+    if !unpurged.is_empty() {
+        store::append_log(
+            &paths::switcher_log_file_for(variant),
+            &format!(
+                "恢复快照时未能清除 {} 项「清单外的凭据来源」：{}。\
+                 这些来源可能仍残留上一账号的内容，下次切换前请先关闭客户端再试",
+                unpurged.len(),
+                unpurged.join("、")
+            ),
+        );
+    }
+
     Ok(restored)
+}
+
+/// 清除 [`RESTORE_PURGE_RELATIVES`] 列出的「清单外的凭据来源」。
+///
+/// 返回**未能清除**的项（`"<相对路径>（<原因>）"`），全部清干净时返回空表。
+///
+/// ## 为什么是「尽力而为」而不是硬失败
+///
+/// Windows 上 `taskkill /F` 之后文件句柄不一定立刻释放（`platform::kill_client_for`
+/// 的 Windows 分支不会等待），此时删 `logs/` 下的个别文件会失败。
+/// 让整次切换因此失败**比残留一份日志更糟**：用户会卡在「切不了」，
+/// 而且没有任何替代路径（恢复已经被拒绝，客户端也已经被关掉了）。
+///
+/// 但**不静默**：调用方把失败项写进 `switcher.log`，
+/// 使「不变式被破坏」这件事始终有人知道。
+/// 这与本模块既有的取舍一致（见 [`copy_dir_recursive`] 对单文件失败的容忍）。
+fn purge_restore_relatives(target_root: &Path) -> Vec<String> {
+    let mut failed = Vec::new();
+    for relative in RESTORE_PURGE_RELATIVES {
+        let path = relative
+            .split('/')
+            .fold(target_root.to_path_buf(), |acc, part| acc.join(part));
+        // 不存在 ⇒ 不变式已满足，静默跳过（不是错误）。
+        let result = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else if path.is_file() {
+            std::fs::remove_file(&path)
+        } else {
+            continue;
+        };
+        if let Err(error) = result {
+            failed.push(format!("{relative}（{error}）"));
+        }
+    }
+    failed
 }
 
 /// 删除指定槽位的快照（默认变体，兼容壳）。
@@ -962,13 +1183,66 @@ where
     outcome
 }
 
+/// 保存前的守卫：客户端**此刻实际登录**的账号必须与目标槽位一致。
+///
+/// ## 为什么必须有它
+///
+/// [`backup_to_slot_for`] 的源是 `detect_data_dir_for(variant)`，也就是**客户端此刻
+/// 真实的登录态**。若调用方指定的槽位是另一个账号，快照就会被贴到错误的账号名下：
+/// `profiles/<B>/` 里装的是 A 的内容，`currentAccount` 却记成 B ⇒ 之后切到 B，
+/// 恢复出来的还是 A。用户看到的症状是「**切换怎么切都是同一个账号**」。
+///
+/// 这不是假想：参考实现把它当**实测事故**修过（`switch.rs` 的「F2-5 保存守卫」——
+/// CodeBuddy 两个槽位互相污染后内容完全相同，切换怎么切都是同一个账号）。
+///
+/// ## 校验依据必须是「客户端实际状态」，不能是程序自己写的标签
+///
+/// `currentAccount` 这类由本程序自己维护的标签**正是被这条缺陷写坏的** ——
+/// 拿它做门禁，等于用被污染的值去判断污染。所以这里回到
+/// [`extract_local_jwt_for`] 读客户端真实凭据（与 `restore` 路径同源）。
+///
+/// ## 为什么不能放进 `backup_to_slot_for`
+///
+/// [`switch_account`] 自己会调 `backup_to_slot_for(variant, LAST_SLOT)`
+/// 把当前状态存进**回滚槽**。`last` 不是 userId，拿 uid 比必然不等 ⇒
+/// 守卫会**整体废掉切换的回滚兜底**。故守卫只加在「用户主动把登录态存进
+/// 某个账号槽位」的两个入口：[`save_current_login_for`] 与
+/// [`crate::modules::trae::handlers::backup_profile_for`]。
+///
+/// ## fail-open（与参考实现语义一致）
+///
+/// 客户端未安装 / 从未登录 / 凭据读不出来时**放行**。守卫的目的是拦住
+/// 「明明登录着别人、却往这个槽位存」，而不是把「读不到」也算成不一致 ——
+/// 后者会让「先启动客户端再保存」这个正常流程被误挡。读不到时由既有兜底
+/// （[`backup_to_slot_for`] 的「未找到客户端数据目录」/「未找到任何登录态文件」）
+/// 承担，用户仍会看到真实原因。
+pub(crate) fn ensure_save_target_matches_client(
+    variant: TraeVariant,
+    user_id: &str,
+) -> Result<(), String> {
+    let Ok((client_uid, _)) = extract_local_jwt_for(variant) else {
+        return Ok(());
+    };
+    if client_uid == user_id {
+        return Ok(());
+    }
+    Err(format!(
+        "客户端当前登录的是另一个账号（{client_uid}），不能把它的登录态保存到【{user_id}】名下 —— \
+         否则之后切到该账号，恢复出来的还是现在这个人（症状：切换怎么切都是同一个账号）。\
+         请先在 Trae 客户端里登录【{user_id}】再保存，或改用「OAuth 网页登录」。"
+    ))
+}
+
 /// 保存当前登录态到指定账号槽位（不切换、不重启客户端；默认变体，兼容壳）。
 pub fn save_current_login(user_id: &str) -> Result<u64, String> {
     save_current_login_for(TraeVariant::default(), user_id)
 }
 
 /// 保存当前登录态到指定账号槽位（不切换、不重启客户端；按变体分家）。
+///
+/// 先过 [`ensure_save_target_matches_client`]：客户端登录着谁，就只能存进谁的槽位。
 pub fn save_current_login_for(variant: TraeVariant, user_id: &str) -> Result<u64, String> {
+    ensure_save_target_matches_client(variant, user_id)?;
     let count = backup_to_slot_for(variant, user_id)?;
     let _ = set_current_account_for(variant, user_id);
     store::append_log(
@@ -1201,17 +1475,21 @@ mod tests {
 
         let (uid, found) = result.expect("应能从扩展日志取到凭据");
         assert_eq!(uid, "9988776655443322");
-        assert_eq!(found, token);
+        // 返回值是**完整请求头值**：明文兜底捞出的是裸 token，落库前统一补前缀
+        // （与 tc 信封主来源、与 OAuth 路径三者同形）。
+        assert_eq!(found, format!("Cloud-IDE-JWT {token}"));
     }
 
-    /// `storage_auth_entry_count` 必须**只**数 `iCubeAuthInfo://` 前缀的键。
+    /// `storage_device_entry_count` 必须**只**数 `iCubeAuthInfo://icube-dc:*` 前缀的键。
     ///
-    /// 它不是业务逻辑，而是诊断文案的事实依据（「登录是否发生过」）。
-    /// 数多了会把「没登录」说成「登录了」，数少了会把「登录了」说成「没登录」，
+    /// 它不是业务逻辑，而是诊断文案的事实依据（「客户端是否在此目录启动过」）。
+    /// 早先它数的是全部 `iCubeAuthInfo://*` 键，于是真机 `TRAE SOLO`（只有一个
+    /// `icube-dc`、没有登录态副本）被诊断成「该客户端确实已登录」，与同一段文案里
+    /// 「没有登录态副本键」**自相矛盾**。数多了会把「没登录」说成「登录了」，
     /// 两种错法都会把用户引向错误的排障方向。
     #[test]
-    fn storage_auth_entry_count_only_counts_icube_auth_keys() {
-        let root = std::env::temp_dir().join(format!("trae-auth-count-{}", std::process::id()));
+    fn storage_device_entry_count_excludes_the_login_state_copy() {
+        let root = std::env::temp_dir().join(format!("trae-device-count-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let global = root.join("User").join("globalStorage");
         std::fs::create_dir_all(&global).unwrap();
@@ -1219,23 +1497,41 @@ mod tests {
         std::fs::write(
             &path,
             r#"{
-                "iCubeAuthInfo://icube.cloudide": "tC\u0005\u0010AAAA",
-                "iCubeAuthInfo://other.realm": "tC\u0005\u0010BBBB",
+                "iCubeAuthInfo://icube-dc:2292929806738024": "tC\u0005\u0010AAAA",
+                "iCubeAuthInfo://icube.cloudide": "tC\u0005\u0010BBBB",
+                "iCubeAuthInfo://usertag": "tC\u0005\u0010CCCC",
                 "telemetry.machineId": "abc",
-                "icubeAuthInfo://lowercase.prefix": "should-not-count"
+                "icubeAuthInfo://icube-dc:lowercase": "should-not-count"
             }"#,
         )
         .unwrap();
 
-        assert_eq!(storage_auth_entry_count(&root), 2, "前缀匹配必须区分大小写");
+        // 三个 iCube 键里只有一个是设备身份 —— 登录态副本与 usertag 都不算。
+        assert_eq!(
+            storage_device_entry_count(&root),
+            1,
+            "只有 icube-dc: 前缀算设备身份；登录态副本与 usertag 不得计入"
+        );
+
+        // 只有登录态副本、没有设备身份时必须是 0（反向：两者不能互相顶替）。
+        std::fs::write(
+            &path,
+            r#"{"iCubeAuthInfo://icube.cloudide": "tC\u0005\u0010BBBB"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            storage_device_entry_count(&root),
+            0,
+            "登录态副本不得被当成设备身份"
+        );
 
         // 三种退化输入都必须是 0，而不是 panic —— 诊断函数在读失败时也要能出文案。
         std::fs::write(&path, r#"{"iCubeAuthInfo://x":"y""#).unwrap();
-        assert_eq!(storage_auth_entry_count(&root), 0, "JSON 损坏时返回 0");
+        assert_eq!(storage_device_entry_count(&root), 0, "JSON 损坏时返回 0");
         std::fs::write(&path, r#"["not","an","object"]"#).unwrap();
-        assert_eq!(storage_auth_entry_count(&root), 0, "顶层不是对象时返回 0");
+        assert_eq!(storage_device_entry_count(&root), 0, "顶层不是对象时返回 0");
         let _ = std::fs::remove_file(&path);
-        assert_eq!(storage_auth_entry_count(&root), 0, "文件缺失时返回 0");
+        assert_eq!(storage_device_entry_count(&root), 0, "文件缺失时返回 0");
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1259,7 +1555,12 @@ mod tests {
 
         let text = diagnose_missing_credential(&root, TraeVariant::TraeWork);
         assert!(text.contains("OAuth"), "必须给出可行替代路径：{text}");
-        assert!(text.contains("1 条 iCube 认证记录"), "必须报告登录确实发生过：{text}");
+        // 该 fixture 只有登录态副本、**没有** `icube-dc` 设备身份 ⇒ 第三条 bullet
+        // 必须说「没检测到设备身份」。设备身份与登录态是两件事，不得互相顶替。
+        assert!(
+            text.contains("未检测到设备身份"),
+            "必须如实报告设备身份缺失：{text}"
+        );
         assert!(
             text.contains("trae.ai-code-completion"),
             "必须点明缺失的明文来源：{text}"
@@ -1281,12 +1582,16 @@ mod tests {
             "缺 logs/ 时应提示先启动客户端：{no_logs}"
         );
 
-        // 无 iCube 记录时必须换另一套说法（可能没登录）。
+        // storage.json 整个不存在时必须换另一套说法：主来源缺失 + 从未在此目录启动过。
         std::fs::remove_file(global.join("storage.json")).unwrap();
-        let no_auth = diagnose_missing_credential(&root, TraeVariant::TraeWork);
+        let no_storage = diagnose_missing_credential(&root, TraeVariant::TraeWork);
         assert!(
-            no_auth.contains("未在存储中发现"),
-            "无认证记录时应提示未登录：{no_auth}"
+            no_storage.contains("没有 iCube 登录态副本键"),
+            "缺 storage.json 时应报主来源缺失：{no_storage}"
+        );
+        assert!(
+            no_storage.contains("未检测到设备身份"),
+            "缺 storage.json 时应报设备身份缺失：{no_storage}"
         );
 
         let _ = std::fs::remove_dir_all(&root);
@@ -1407,14 +1712,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
 
         // 无论另一条产品线多活跃，TraeWork 请求都只能取到 TraeWork 的凭据。
+        // 返回值是**完整请求头值**（主来源与明文兜底同形），故这里带前缀比对。
         let (work_uid, work_found) = work_result.expect("应取到 Trae Work 目录里的凭据");
         assert_eq!(work_uid, "1111111111111111", "不得回落到 Trae CN 的凭据");
-        assert_eq!(work_found, work_token);
+        assert_eq!(work_found, format!("Cloud-IDE-JWT {work_token}"));
 
         // 反向也成立：TraeCn 请求只取自己目录里的凭据。
         let (cn_uid, cn_found) = cn_result.expect("应取到 Trae CN 目录里的凭据");
         assert_eq!(cn_uid, "2222222222222222");
-        assert_eq!(cn_found, cn_token);
+        assert_eq!(cn_found, format!("Cloud-IDE-JWT {cn_token}"));
     }
 
     /// 该变体一个候选目录都不存在时，错误必须**指向该变体**，而不是含糊的「未检测到」。
@@ -1793,5 +2099,390 @@ mod tests {
         // token 之后紧跟引号/逗号时，不能把引号吞进 token。
         let text = r#"k":"Cloud-IDE-JWT aaa.bbb.ccc","next":1"#;
         assert_eq!(scan_jwt_tokens(text), vec!["aaa.bbb.ccc".to_string()]);
+    }
+
+    // -----------------------------------------------------------------------
+    // 导入来源：tc 信封（主来源）
+    // -----------------------------------------------------------------------
+
+    /// 从 fixture 列表里挑出某个变体的候选目录对应的 `userId`。
+    fn fixture_uids(fixtures: &[(String, String)], variant: TraeVariant) -> Vec<String> {
+        let names = platform::data_dir_names_for(variant);
+        fixtures
+            .iter()
+            .filter(|(_, name)| names.contains(&name.as_str()))
+            .map(|(uid, _)| uid.clone())
+            .collect()
+    }
+
+    /// ★ Trae Work 的「导入本机账号」必须成功：凭据**只在 tc 信封里**时也要能导入。
+    ///
+    /// fixture 刻意做成「只有 tc 信封」：没有 `icube-dc` 设备凭证、没有任何明文
+    /// `Cloud-IDE-JWT`、**连 `logs/` 目录都没有** —— 这正是 `TRAE SOLO CN`
+    /// （Trae Work）的真机形态（实测 355 个日志文件、0 个 `completion.log`、0 处明文）。
+    ///
+    /// 修之前该产品线**恒导入失败**：旧实现只扫明文，而明文在它身上不存在。
+    /// 反向验证：删掉 `extract_local_jwt_for` 里取主来源那一步，本用例必红。
+    #[cfg(windows)]
+    #[test]
+    fn extract_local_jwt_reads_the_icube_envelope_when_no_plaintext_exists() {
+        let exp = chrono::Utc::now().timestamp() + 3600;
+        let env = crate::modules::trae::test_support::TempEnv::empty();
+        let fixtures = icube::test_support::write_cloudide_only_user_data(&env.appdata(), exp);
+
+        let work_uids = fixture_uids(&fixtures, TraeVariant::TraeWork);
+        let cn_uids = fixture_uids(&fixtures, TraeVariant::TraeCn);
+        assert_eq!(work_uids.len(), 2, "Trae Work 应有两个候选目录");
+        assert_eq!(cn_uids.len(), 2, "Trae CN 应有两个候选目录");
+
+        let (work_uid, work_header) =
+            extract_local_jwt_for(TraeVariant::TraeWork).expect("Trae Work 必须能从 tc 信封导入");
+        let (cn_uid, cn_header) =
+            extract_local_jwt_for(TraeVariant::TraeCn).expect("Trae CN 必须能从 tc 信封导入");
+
+        assert!(work_uids.contains(&work_uid), "读到了别的目录的账号：{work_uid}");
+        assert!(cn_uids.contains(&cn_uid), "读到了别的目录的账号：{cn_uid}");
+        assert_ne!(work_uid, cn_uid, "两条产品线必须各自读到自己的目录");
+
+        // 落库形态：**完整请求头值**（含 `Cloud-IDE-JWT ` 前缀），与 OAuth 路径一致。
+        for (label, header) in [("Trae Work", &work_header), ("Trae CN", &cn_header)] {
+            assert!(
+                header.starts_with("Cloud-IDE-JWT "),
+                "{label} 的落库值必须含前缀，实际：{header}"
+            );
+            assert_eq!(
+                header.matches('.').count(),
+                2,
+                "{label} 补前缀后仍应是三段 JWT：{header}"
+            );
+        }
+        // 前缀之后必须**逐字**等于信封里那个裸 token（证明是「补前缀」而不是另造）。
+        assert_eq!(
+            jwt::normalize(&work_header),
+            icube::test_support::bare_jwt(&work_uid, exp),
+            "前缀后必须逐字等于信封里的裸 token"
+        );
+    }
+
+    /// ★ tc 信封**优先于**明文兜底 —— 「切换后账号不变」的直接护栏。
+    ///
+    /// 场景：客户端当前登录的是 A（tc 信封里是 A），但 `logs/` 里残留着上一账号 B
+    /// 的明文 token，且 **B 的 `exp` 更晚**。旧实现按 `exp` 取最大 ⇒ 导入到 B。
+    /// tc 信封才是客户端**当前**登录态，因此必须返回 A。
+    #[cfg(windows)]
+    #[test]
+    fn extract_local_jwt_prefers_icube_envelope_over_stale_plaintext_log() {
+        let now = chrono::Utc::now().timestamp();
+        let env = crate::modules::trae::test_support::TempEnv::empty();
+        // A：信封里的当前登录态（exp 较近）。
+        let fixtures =
+            icube::test_support::write_cloudide_only_user_data(&env.appdata(), now + 600);
+        let work_uids = fixture_uids(&fixtures, TraeVariant::TraeWork);
+
+        // B：上一账号，明文残留在**每一个** Trae Work 候选目录的日志里，且 exp 更晚
+        //    （这样用例不依赖 `select_data_dir_for` 选中哪个候选目录）。
+        let stale_uid = "1111222233334444";
+        let stale = icube::test_support::bare_jwt(stale_uid, now + 86_400);
+        for name in platform::data_dir_names_for(TraeVariant::TraeWork) {
+            let log = env
+                .appdata()
+                .join(name)
+                .join("logs")
+                .join("20260918T000000")
+                .join("window1")
+                .join("exthost")
+                .join("trae.ai-code-completion")
+                .join("completion.log");
+            std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+            std::fs::write(
+                &log,
+                format!(r#"{{"Authorization":"Cloud-IDE-JWT {stale}"}}"#),
+            )
+            .unwrap();
+        }
+
+        let (uid, _) =
+            extract_local_jwt_for(TraeVariant::TraeWork).expect("有 tc 信封时导入必须成功");
+        assert_ne!(uid, stale_uid, "不得读回上一账号（尽管它的 exp 更晚）");
+        assert!(work_uids.contains(&uid), "应返回信封里的账号，实际：{uid}");
+    }
+
+    /// 诊断必须说清**主来源**（tc 信封）的状态。
+    ///
+    /// 它现在是 Trae Work 唯一可用的来源，所以「在不在、为什么用不上」不能缺席：
+    /// 否则用户会把「凭据已过期 / 解不开」误判成「没登录」，去重装客户端。
+    #[test]
+    fn diagnose_reports_the_icube_envelope_state() {
+        let root = std::env::temp_dir().join(format!("trae-diag-env-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let global = root.join("User").join("globalStorage");
+        std::fs::create_dir_all(&global).unwrap();
+
+        // ① 信封键存在（哪怕内容解不开）⇒ 必须说「存在但用不上」并给出下一步。
+        std::fs::write(
+            global.join("storage.json"),
+            r#"{"iCubeAuthInfo://icube.cloudide":"tC\u0005\u0010AAAA"}"#,
+        )
+        .unwrap();
+        let with_key = diagnose_missing_credential(&root, TraeVariant::TraeWork);
+        assert!(with_key.contains("登录态副本键"), "必须报告主来源：{with_key}");
+        assert!(with_key.contains("重新登录"), "必须给出下一步：{with_key}");
+
+        // ② 信封键不存在 ⇒ 必须明说主来源缺失，而不是笼统的「没找到凭据」。
+        std::fs::write(global.join("storage.json"), r#"{"telemetry.machineId":"x"}"#).unwrap();
+        let without_key = diagnose_missing_credential(&root, TraeVariant::TraeWork);
+        assert!(
+            without_key.contains("没有 iCube 登录态副本键"),
+            "必须报告主来源缺失：{without_key}"
+        );
+
+        // ③ **只有设备身份、没有登录态副本** ⇒ 文案不得自相矛盾。
+        //
+        // 真机 `TRAE SOLO` 就是这个形态（客户端首次启动过、用户从未登录），
+        // 而早先的实现会因为「有一条 iCubeAuthInfo 记录」直接断言「该客户端确实已登录」，
+        // 与同一段里的「没有登录态副本键」正面冲突。设备身份不是登录证据。
+        std::fs::write(
+            global.join("storage.json"),
+            r#"{"iCubeAuthInfo://icube-dc:2292929806738024":"tC\u0005\u0010AAAA"}"#,
+        )
+        .unwrap();
+        let device_only = diagnose_missing_credential(&root, TraeVariant::TraeWork);
+        assert!(
+            device_only.contains("不代表登录过"),
+            "设备身份必须与登录态分开陈述：{device_only}"
+        );
+        assert!(
+            !device_only.contains("确实已登录"),
+            "只有设备身份时不得断言已登录：{device_only}"
+        );
+        assert!(
+            device_only.contains("没有 iCube 登录态副本键"),
+            "设备身份存在也不影响「主来源缺失」这一事实：{device_only}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // -----------------------------------------------------------------------
+    // 快照 / 恢复：切换不变式与主干往返
+    // -----------------------------------------------------------------------
+
+    /// ★ 恢复快照必须清掉「清单外的凭据来源」—— 这是 [`CORE_ENTRIES`] 的切换不变式。
+    ///
+    /// fixture：目标客户端里有上一账号的两类残留 ——
+    /// `logs/`（明文 JWT，`extract_local_jwt_for` 会扫）与 SQLite 边车文件
+    /// （`-wal`/`-shm`/`-journal`，SQLite 下次打开会**回放**）。
+    /// 恢复之后这两类都必须不存在；不清就会「切换后账号不变」。
+    #[cfg(windows)]
+    #[test]
+    fn restore_purges_sources_outside_the_snapshot() {
+        let _env = crate::modules::trae::test_support::TempEnv::empty();
+        let variant = TraeVariant::TraeWork;
+        let target = platform::detect_data_dir_for(variant).expect("临时 APPDATA 下应能定位目录");
+
+        // 「上一账号」的残留。
+        let stale_log = target
+            .join("logs")
+            .join("20260918T000000")
+            .join("window1")
+            .join("exthost")
+            .join("trae.ai-code-completion")
+            .join("completion.log");
+        std::fs::create_dir_all(stale_log.parent().unwrap()).unwrap();
+        std::fs::write(&stale_log, "Authorization: Cloud-IDE-JWT old.old.old").unwrap();
+        let global = target.join("User").join("globalStorage");
+        std::fs::create_dir_all(&global).unwrap();
+        for sidecar in ["state.vscdb-wal", "state.vscdb-shm", "state.vscdb-journal"] {
+            std::fs::write(global.join(sidecar), b"stale").unwrap();
+        }
+
+        // 快照：只放 `CORE_ENTRIES` 里的一件文件 —— 正好证明「清单外的东西不进快照」。
+        let slot = "acctA";
+        let snapshot = paths::profiles_dir_for(variant).join(slot);
+        std::fs::create_dir_all(snapshot.join("User").join("globalStorage")).unwrap();
+        std::fs::write(
+            snapshot.join("User").join("globalStorage").join("storage.json"),
+            br#"{"aha":{"account":"A"}}"#,
+        )
+        .unwrap();
+
+        let restored = restore_from_slot_for(variant, slot).expect("恢复应成功");
+        assert_eq!(restored, 1, "快照里只有一件文件");
+
+        assert!(
+            !target.join("logs").exists(),
+            "logs/ 必须被清除，否则导入会读到上一账号的明文 token"
+        );
+        for sidecar in ["state.vscdb-wal", "state.vscdb-shm", "state.vscdb-journal"] {
+            assert!(
+                !global.join(sidecar).exists(),
+                "{sidecar} 必须被清除，否则 SQLite 会回放旧事务"
+            );
+        }
+        // 正向对照：快照内容确实到位了（别把「清干净」做成「什么都没恢复」）。
+        assert!(global.join("storage.json").is_file(), "快照内容必须被恢复");
+    }
+
+    /// ★ 切换的主干：A → B → A 之后，**A 的登录态真的回来了**。
+    ///
+    /// 现有用例只覆盖 precheck / 形状（缺快照、非法 userId），主干（备份 → 恢复）
+    /// 一直没有正向护栏。本用例在**文件级**做完整的 A→B→A 往返，并再切一次到 B
+    /// 证明恢复是**双向**的、不是「只认第一份」。
+    ///
+    /// **刻意不调 `switch_account`**：那条路径会走 `platform::kill_client_for`，
+    /// 在开发机上会**真的杀掉用户正在用的 Trae**。这里只测快照/恢复的实体部分，
+    /// 也就是「登录态有没有真的换回来」。
+    #[cfg(windows)]
+    #[test]
+    fn snapshot_round_trip_restores_account_a_login_state() {
+        let _env = crate::modules::trae::test_support::TempEnv::empty();
+        let variant = TraeVariant::TraeWork;
+        let target = platform::detect_data_dir_for(variant).expect("临时 APPDATA 下应能定位目录");
+        let storage = target
+            .join("User")
+            .join("globalStorage")
+            .join("storage.json");
+        std::fs::create_dir_all(storage.parent().unwrap()).unwrap();
+
+        // A 登录 → 存快照。
+        std::fs::write(&storage, br#"{"aha":{"account":"A"}}"#).unwrap();
+        backup_to_slot_for(variant, "acctA").expect("A 的登录态应能快照");
+
+        // 切到 B（客户端文件被 B 覆盖）→ 存快照。
+        std::fs::write(&storage, br#"{"aha":{"account":"B"}}"#).unwrap();
+        backup_to_slot_for(variant, "acctB").expect("B 的登录态应能快照");
+
+        // 切回 A。
+        restore_from_slot_for(variant, "acctA").expect("恢复 A 应成功");
+        assert_eq!(
+            std::fs::read_to_string(&storage).unwrap(),
+            r#"{"aha":{"account":"A"}}"#,
+            "A 的登录态必须真的回来"
+        );
+
+        // 再切到 B：证明双向。
+        restore_from_slot_for(variant, "acctB").expect("恢复 B 应成功");
+        assert_eq!(
+            std::fs::read_to_string(&storage).unwrap(),
+            r#"{"aha":{"account":"B"}}"#,
+            "恢复必须是双向的，不能只认第一份快照"
+        );
+
+        // `restore_from_slot_for` 是**纯文件操作**：记录「当前账号」是 `switch_account`
+        // 的职责（且只在整个流程都成功后写）。这条把两者的边界钉住。
+        assert_eq!(
+            current_account_for(variant),
+            None,
+            "只做快照恢复不应凭空产生「当前账号」记录"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 保存守卫：客户端登录着谁，就只能存进谁的槽位
+    // -----------------------------------------------------------------------
+
+    /// ★ 客户端登录着 A 时，不得把 A 的登录态存进 B 的槽位。
+    ///
+    /// 这是用户报障「**切换怎么切都是同一个账号**」的直接成因：快照的源是客户端
+    /// 此刻的真实登录态，槽位却是调用方指定的 userId ⇒ 存错槽位后
+    /// `profiles/<B>/` 装的是 A 的内容，切到 B 恢复出来还是 A。
+    /// 参考实现把它当**实测事故**修过（两个槽位被污染成完全相同）。
+    #[cfg(windows)]
+    #[test]
+    fn save_refuses_to_store_the_client_state_under_another_account() {
+        let exp = chrono::Utc::now().timestamp() + 3600;
+        let env = crate::modules::trae::test_support::TempEnv::empty();
+        let fixtures = icube::test_support::write_cloudide_only_user_data(&env.appdata(), exp);
+        let work_uids = fixture_uids(&fixtures, TraeVariant::TraeWork);
+        assert!(work_uids.len() >= 2, "需要至少两个候选目录才能构造「存错槽位」");
+
+        let (client_uid, _) =
+            extract_local_jwt_for(TraeVariant::TraeWork).expect("fixture 必须可读");
+        let other_uid = work_uids
+            .iter()
+            .find(|uid| uid.as_str() != client_uid)
+            .expect("必须存在一个与客户端不同的账号")
+            .clone();
+        let other_slot = paths::profiles_dir_for(TraeVariant::TraeWork).join(&other_uid);
+
+        // ① 存到**别人**的槽位 ⇒ 必须拒绝，且不得留下半个槽位目录。
+        let error = save_current_login_for(TraeVariant::TraeWork, &other_uid)
+            .expect_err("登录着 A 却往 B 的槽位存，必须被拒绝");
+        assert!(
+            error.contains(&client_uid),
+            "错误必须说清客户端当前是谁：{error}"
+        );
+        assert!(
+            error.contains(&other_uid),
+            "错误必须说清目标槽位是谁：{error}"
+        );
+        assert!(
+            !other_slot.exists(),
+            "被拒绝的保存不得留下槽位目录：{}",
+            other_slot.display()
+        );
+
+        // ② `backup_profile_for` 是同一操作的另一条入口，必须同样被拦 ——
+        //    只在 `save_login` 上加守卫，等于留下一扇可绕过的大门。
+        let backup_error =
+            crate::modules::trae::handlers::backup_profile_for(TraeVariant::TraeWork, &other_uid)
+                .expect_err("另一条入口也必须被拦");
+        assert!(
+            backup_error.contains(&other_uid),
+            "另一条入口的报错同样要说清目标槽位：{backup_error}"
+        );
+        assert!(!other_slot.exists(), "另一条入口也不得留下槽位目录");
+
+        // ③ 存到**自己**的槽位 ⇒ 必须成功（守卫不得把正常流程一起挡掉）。
+        let count = save_current_login_for(TraeVariant::TraeWork, &client_uid)
+            .expect("客户端登录着 A、存进 A 的槽位必须成功");
+        assert!(count > 0, "必须真的复制到文件");
+        assert_eq!(
+            current_account_for(TraeVariant::TraeWork).as_deref(),
+            Some(client_uid.as_str())
+        );
+    }
+
+    /// 守卫**不得**下沉到 `backup_to_slot_for`：`switch_account` 的回滚槽
+    /// （[`LAST_SLOT`]，不是 userId）必须照旧可用。
+    ///
+    /// 天真实现会把守卫放进 `backup_to_slot_for`，于是「切换前先把当前状态存进
+    /// `last`」这一步拿 `"last"` 去和客户端 uid 比、必然不等 ⇒
+    /// **整个回滚兜底失效**（切换失败时救不回来）。
+    #[cfg(windows)]
+    #[test]
+    fn backup_primitive_still_accepts_non_account_slots() {
+        let _env = crate::modules::trae::test_support::TempEnv::empty();
+        let variant = TraeVariant::TraeWork;
+        let target = platform::detect_data_dir_for(variant).expect("临时 APPDATA 下应能定位目录");
+        let storage = target
+            .join("User")
+            .join("globalStorage")
+            .join("storage.json");
+        std::fs::create_dir_all(storage.parent().unwrap()).unwrap();
+        std::fs::write(&storage, br#"{"aha":{"account":"A"}}"#).unwrap();
+
+        backup_to_slot_for(variant, LAST_SLOT).expect("回滚槽不是 userId，必须照旧可用");
+        assert!(paths::profiles_dir_for(variant).join(LAST_SLOT).is_dir());
+    }
+
+    /// 守卫必须 **fail-open**：客户端状态读不出来时不得挡住保存。
+    ///
+    /// 否则「先启动客户端再保存」这条正常流程会被误挡，而读不到的原因
+    /// （未安装 / 未登录 / 客户端在写）本来就有既有兜底去表达。
+    #[cfg(windows)]
+    #[test]
+    fn save_guard_fails_open_when_the_client_state_is_unreadable() {
+        // 只有设备凭证、没有登录态副本、没有明文日志 ⇒ `extract_local_jwt_for` 必然失败。
+        let _env = crate::modules::trae::test_support::TempEnv::with_device_fixture();
+        let variant = TraeVariant::TraeWork;
+        assert!(
+            extract_local_jwt_for(variant).is_err(),
+            "前置条件：本 fixture 必须读不到客户端登录态"
+        );
+
+        let count = save_current_login_for(variant, "1234567890123456")
+            .expect("读不到客户端状态时必须放行，而不是挡住正常保存");
+        assert!(count > 0);
     }
 }

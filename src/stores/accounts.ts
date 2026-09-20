@@ -98,6 +98,13 @@ interface AccountsState {
   refreshStatus: (signal?: AbortSignal) => Promise<void>;
   /** 仅刷新指定 region 状态。 */
   refreshRegionStatus: (region: Region, signal?: AbortSignal) => Promise<void>;
+  /**
+   * 同时刷新 CN 与 Global 的状态。
+   *
+   * 后台轮询必须走这个入口：`status.current` 决定卡片上的「当前账号」标记，
+   * 只轮询 CN 会让国际版的状态停留在首屏快照上——切换国际账号后标记不会跟着走。
+   */
+  refreshAllStatus: (signal?: AbortSignal) => Promise<void>;
   deleteAccount: (id: string, region?: Region) => Promise<void>;
   /** Fetch credits only for ids not already cached. */
   ensureCredits: (accountIds: string[], region?: Region) => Promise<void>;
@@ -149,6 +156,14 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
     } catch {
       // 保留最后一次成功状态。
     }
+  },
+
+  async refreshAllStatus(signal) {
+    // 两个 region 各自独立：一个失败不影响另一个（`refreshRegionStatus` 内部已吞掉错误）。
+    await Promise.all([
+      get().refreshStatus(signal),
+      get().refreshRegionStatus("global", signal),
+    ]);
   },
 
   async deleteAccount(id, region = "cn") {

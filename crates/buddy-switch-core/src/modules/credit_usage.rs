@@ -901,7 +901,8 @@ pub async fn get_statistics_for_filter(filter: RegionFilter, refresh: bool) -> V
         tag_accounts_region(&mut statistics, region);
         statistics["region"] = json!(filter.as_str());
         statistics["officialUsage"] =
-            official_usage::official_usage_for_statistics(&accounts, at_ms, refresh).await;
+            official_usage::official_usage_for_statistics_for(region, &accounts, at_ms, refresh)
+                .await;
         return statistics;
     }
 
@@ -921,9 +922,18 @@ pub async fn get_statistics_for_filter(filter: RegionFilter, refresh: bool) -> V
     // refresh = true 时两边都刷新；合并 officialUsage 取最差态。
     let cn_accounts = load_accounts_for(Region::Cn);
     let global_accounts = load_accounts_for(Region::Global);
-    let cn_usage = official_usage::official_usage_for_statistics(&cn_accounts, at_ms, refresh).await;
-    let global_usage =
-        official_usage::official_usage_for_statistics(&global_accounts, at_ms, refresh).await;
+    // 两半都必须带自己的 region：该调用会按 region 刷新 token 并写回对应账号库，
+    // 传错 region 会把 global 账号写进 CN 账号库（PRD G1）。
+    let cn_usage =
+        official_usage::official_usage_for_statistics_for(Region::Cn, &cn_accounts, at_ms, refresh)
+            .await;
+    let global_usage = official_usage::official_usage_for_statistics_for(
+        Region::Global,
+        &global_accounts,
+        at_ms,
+        refresh,
+    )
+    .await;
     statistics["officialUsage"] = merge_official_usage(Some(&cn_usage), Some(&global_usage));
     statistics
 }

@@ -171,8 +171,12 @@ jobs:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           PKG_DIR="npm/platform/workbuddy-switch-${{ matrix.platform_tag }}"
-          # 用 tag 版本同步 platform 包版本（git 里的可能滞后）
-          VER="${GITHUB_REF_NAME#v}"
+          # 与桌面构建同一份版本规则（git 里的可能滞后，这里强制同步）
+          if [[ "${GITHUB_REF_NAME#v}" =~ ^[0-9] ]]; then
+            VER=$(sh scripts/stamp-version.sh --tag "$GITHUB_REF_NAME" --print)
+          else
+            VER=$(sh scripts/stamp-version.sh --print)
+          fi
           perl -pi -e "s/\"version\": \"[0-9.]+\"/\"version\": \"$VER\"/" "$PKG_DIR/package.json"
           mkdir -p "$PKG_DIR/bin"
           SRC="target/${{ matrix.target }}/release/buddy-switch"
@@ -189,11 +193,13 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
-          VER="${GITHUB_REF_NAME#v}"
-          if ! [[ "$VER" =~ ^[0-9] ]]; then
-            # 非 tag 触发（手动构建）：按当前打包日期自动计算版本号
-            # CalVer 规则 <YYYY>.<M>.<D>，月/日不补零，例如 2026.9.16
-            VER=$(date -u +%Y.%m.%d | sed -E 's/^([0-9]+)\.0?([0-9]+)\.0?([0-9]+)$/\1.\2.\3/')
+          # 版本号由 scripts/stamp-version.sh 统一推导（本地与 CI 同一份规则）。
+          # tag 触发时 tag 是唯一真相；非 tag 触发按打包时刻生成 <YYYY>.<M>.<DHHMM>。
+          # 注意必须是 3 段：Cargo 拒绝 4 段 semver（`2026.9.18.1214` 会编译失败）。
+          if [[ "${GITHUB_REF_NAME#v}" =~ ^[0-9] ]]; then
+            VER=$(sh scripts/stamp-version.sh --tag "$GITHUB_REF_NAME" --print)
+          else
+            VER=$(sh scripts/stamp-version.sh --print)
           fi
           BUNDLE_ROOT="target/${{ matrix.target }}/release/bundle"
           # cargo cache 会保留旧 NSIS/DMG/AppImage；不清理就会把旧产物带进 Release。
@@ -229,10 +235,12 @@ jobs:
           UPDATE_ARCHIVE_NAME: ${{ matrix.update_archive_name }}
           BUNDLE_DIR: target/${{ matrix.target }}/release/bundle/${{ matrix.update_bundle }}
         run: |
-          VER="${GITHUB_REF_NAME#v}"
-          if ! [[ "$VER" =~ ^[0-9] ]]; then
-            # 非 tag 触发（手动构建）：按当前打包日期自动计算版本号（同上）
-            VER=$(date -u +%Y.%m.%d | sed -E 's/^([0-9]+)\.0?([0-9]+)\.0?([0-9]+)$/\1.\2.\3/')
+          # 与 Build desktop app 同一份规则：必须用同一个 VER，
+          # 否则 updater 资产名会与上一步产出的安装包名对不上。
+          if [[ "${GITHUB_REF_NAME#v}" =~ ^[0-9] ]]; then
+            VER=$(sh scripts/stamp-version.sh --tag "$GITHUB_REF_NAME" --print)
+          else
+            VER=$(sh scripts/stamp-version.sh --print)
           fi
           echo "updater bundle dir: $BUNDLE_DIR (version $VER)"
           ls -la "$BUNDLE_DIR" || true

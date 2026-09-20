@@ -1344,7 +1344,7 @@ pub fn login_cancel(login_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::modules::config::BUDDY_SWITCH_HOME_ENV;
+    use crate::modules::trae::test_support::TempEnv;
 
     /// 造一个合成的 [`DeviceIdentity`]（无私钥字段，AuthCode 路径唯一需要的结构）。
     fn synthetic_identity() -> DeviceIdentity {
@@ -1908,16 +1908,11 @@ mod tests {
     ///
     /// 隔离测试环境：**同时**隔离 home 与 `APPDATA`，drop 时全部还原。
     ///
-    /// ## 为什么两个都要隔离
-    ///
-    /// - **home**（`BUDDY_SWITCH_HOME`）：账号库、`oauth_device.json`、日志都落在这里。
-    ///   不隔离就会覆盖用户真实 home 里的设备身份与账号数据。
-    /// - **`APPDATA`**：`icube::device_identity_for` 从
-    ///   `<APPDATA>\<产品线>\User\globalStorage\storage.json` 读设备身份，而它是
-    ///   登录的**硬依赖**（授权 URL 的 `device_id` 必须与它同源，取不到就直接失败）。
-    ///
-    /// 身份用**合成信封**铺 fixture（`icube::test_support`）：既不依赖「跑测试的机器
-    /// 装过并登录过 Trae」，也**绝不**把用户真实私钥带进仓库。
+    /// 实现已上收到 [`crate::modules::trae::test_support::TempEnv`] ——
+    /// 「改环境变量」这件事在本仓库极易写出假绿/随机红（少拿锁、还原与删目录顺序反、
+    /// 只隔离两个变量中的一个），因此**全模块只保留一份实现**。
+    /// 本函数只是给 oauth 用例保留的短名字，顺带固定「铺设备凭证 fixture」这一档
+    /// （本模块的用例都要走 `icube::device_identity_for`，那是登录的硬依赖）。
     ///
     /// ## 为什么是「返回 guard」而不是「包一层闭包」
     ///
@@ -1926,61 +1921,8 @@ mod tests {
     /// current_thread 运行时——在 runtime 里再启 runtime 会直接 panic
     /// （`Cannot start a runtime from within a runtime`）。
     /// `#[tokio::test]` 的 future **不需要 `Send`**，所以可以把 guard 持到用例结束。
-    ///
-    /// 只取**一把** `env_lock()`：`Mutex` 非可重入，若这里再用
-    /// [`crate::modules::config::HomeOverrideGuard`]（它内部也会取同一把锁）会自锁。
     fn temp_env() -> TempEnv {
-        let lock = crate::modules::config::env_lock();
-
-        let root = std::env::temp_dir().join(format!(
-            "buddy-switch-oauth-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        let home = root.join("home");
-        let appdata = root.join("appdata");
-        std::fs::create_dir_all(&home).expect("临时 home 应能创建");
-        std::fs::create_dir_all(&appdata).expect("临时 appdata 应能创建");
-        icube::test_support::write_synthetic_user_data(&appdata);
-
-        let previous_home = std::env::var_os(BUDDY_SWITCH_HOME_ENV);
-        let previous_appdata = std::env::var_os("APPDATA");
-        // 新变量名优先于旧的 `WB_SWITCH_HOME`，故设了它就无需再动旧变量。
-        std::env::set_var(BUDDY_SWITCH_HOME_ENV, &home);
-        std::env::set_var("APPDATA", &appdata);
-
-        TempEnv {
-            root,
-            previous_home,
-            previous_appdata,
-            _lock: lock,
-        }
-    }
-
-    /// [`temp_env`] 的持有者。
-    ///
-    /// drop 顺序是刻意的：自定义 `Drop::drop` 先把两个变量还原、再删临时目录——
-    /// 这样变量永远不会指向一个已不存在的目录（那会让后续用例吃一次「已忽略」
-    /// 警告并静默回落到真实 home）。
-    struct TempEnv {
-        root: std::path::PathBuf,
-        previous_home: Option<std::ffi::OsString>,
-        previous_appdata: Option<std::ffi::OsString>,
-        /// 只为持有 `env_lock`，不直接读取，故带下划线前缀。
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl Drop for TempEnv {
-        fn drop(&mut self) {
-            match self.previous_home.take() {
-                Some(value) => std::env::set_var(BUDDY_SWITCH_HOME_ENV, value),
-                None => std::env::remove_var(BUDDY_SWITCH_HOME_ENV),
-            }
-            match self.previous_appdata.take() {
-                Some(value) => std::env::set_var("APPDATA", value),
-                None => std::env::remove_var("APPDATA"),
-            }
-            let _ = std::fs::remove_dir_all(&self.root);
-        }
+        TempEnv::with_device_fixture()
     }
 
     /// 直接登记一个指定 id 的会话（绕过 `login_start` 的端口绑定）。

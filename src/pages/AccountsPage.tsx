@@ -51,6 +51,7 @@ import type {
   TravelStatus,
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { useCompactMode } from "@/lib/use-compact-mode";
 import { useAccountsStore } from "@/stores/accounts";
 
 function expiringSoonAmount(credit?: CreditExpiry): number {
@@ -271,26 +272,8 @@ function RegionPanel({ region }: { region: Region }) {
   const [deleteTarget, setDeleteTarget] = useState<AccountMeta | null>(null);
   /** 区域不匹配详情展开 */
   const [mismatchDetailOpen, setMismatchDetailOpen] = useState(false);
-  /** 紧凑模式：卡片更小、同屏更多列；默认开启，持久化到 localStorage */
-  const [compact, setCompact] = useState<boolean>(() => {
-    try {
-      return localStorage.getItem("buddy-switch.compact") !== "0";
-    } catch {
-      return true;
-    }
-  });
-
-  function toggleCompact() {
-    setCompact((value) => {
-      const next = !value;
-      try {
-        localStorage.setItem("buddy-switch.compact", next ? "1" : "0");
-      } catch {
-        /* 存储不可用时静默 */
-      }
-      return next;
-    });
-  }
+  /** 紧凑模式：卡片更小、同屏更多列；默认开启，偏好由 `useCompactMode` 统一持久化 */
+  const [compact, toggleCompact] = useCompactMode();
 
   useEffect(() => {
     let cancelled = false;
@@ -371,6 +354,12 @@ function RegionPanel({ region }: { region: Region }) {
         /* 本机无 WorkBuddy 登录态时静默，不打扰用户 */
       });
   }, [accounts.length, loading, importLocalStore, reconcileAccounts, region]);
+
+  // 切到该版本时立刻重查一次状态：`status.current` 决定卡片上的「当前账号」标记，
+  // 若沿用上一次的快照，切换账号（尤其是国际版）后标记会停在旧账号上。
+  useEffect(() => {
+    void refreshRegionStatus(region);
+  }, [refreshRegionStatus, region]);
 
   // 账号列表变化后并行查询各账号今日签到状态
   useEffect(() => {
@@ -1007,7 +996,10 @@ function RegionPanel({ region }: { region: Region }) {
         account={switchAccount}
         region={region}
         onDone={() => {
+          // 切换完成后必须同时刷新账号库与状态：账号库决定卡片内容，
+          // `status.current` 决定「当前账号」标记；只刷账号库会让标记留在旧账号上。
           void reconcileAccounts(region);
+          void refreshRegionStatus(region);
           void refreshCodebuddyCliStatus();
           void refreshCodebuddyCnIdeStatus();
         }}

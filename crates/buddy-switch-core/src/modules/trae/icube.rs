@@ -102,9 +102,16 @@ const HOE_T: [u8; 64] = [
 ];
 
 /// storage.json 里设备凭证键的前缀（键名内嵌 `<deviceId>`）。
-const ICUBE_DC_PREFIX: &str = "iCubeAuthInfo://icube-dc:";
+///
+/// **设备身份 ≠ 登录态**：这个键在客户端首次启动时就会写入，用户从未登录也照样存在。
+/// 诊断文案若拿它当「登录发生过」的证据，就会把「没登录」说成「登录了」
+/// （`profile::diagnose_missing_credential` 因此把它与登录态分开陈述）。
+pub(crate) const ICUBE_DC_PREFIX: &str = "iCubeAuthInfo://icube-dc:";
 /// storage.json 里 cloudide 登录态副本的键（**与设备凭证共用同一条解密实现**）。
-const CLOUDIDE_KEY: &str = "iCubeAuthInfo://icube.cloudide";
+///
+/// `pub(crate)` 而非私有：`profile.rs` 的导入诊断要**只看键是否存在**（不解密）
+/// 就能说清「凭据在不在」，共用同一个常量避免两处字面量漂移。
+pub(crate) const CLOUDIDE_KEY: &str = "iCubeAuthInfo://icube.cloudide";
 /// 同文件的机器标识（`DeviceInfo.MachineID` 取它）。
 const TELEMETRY_MACHINE_ID: &str = "telemetry.machineId";
 
@@ -783,6 +790,77 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEc5xtFi4XpzYjFuYwN0sBaUzcnrds\n\
     /// `iCubeAuthInfo://icube-dc:<deviceId>` 键。
     pub(crate) fn synthetic_device_envelope() -> String {
         seal(device_plain_with_both_keys().as_bytes())
+    }
+
+    /// 造一个**裸** JWT（三段；payload 含 `data.id` 与 `exp`）。
+    ///
+    /// 「裸」是刻意的：真机 `CloudideAuthInfo.token` 实测就是**不带**
+    /// `Cloud-IDE-JWT ` 前缀的裸 token，而落库必须补前缀 —— 这里复刻该形态，
+    /// 使「补前缀」这条护栏有真实输入可测。
+    pub(crate) fn bare_jwt(user_id: &str, exp: i64) -> String {
+        let b64 = |text: &str| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(text.as_bytes())
+        };
+        format!(
+            "{}.{}.{}",
+            b64(r#"{"alg":"RS256","typ":"JWT"}"#),
+            b64(&format!(r#"{{"exp":{exp},"data":{{"id":"{user_id}"}}}}"#)),
+            "c2lnbmF0dXJl"
+        )
+    }
+
+    /// 合成 `iCubeAuthInfo://icube.cloudide` 的**明文** JSON。
+    ///
+    /// 键名与客户端写入的逐字一致（即 [`cloudide_from_plain`] 的解析目标），
+    /// 取值形态按真机实测：`token` 裸 JWT、`refreshToken` 短串、
+    /// `host` 带 scheme 无尾斜杠、`expiredAt` 为 epoch 秒。
+    pub(crate) fn cloudide_plain(user_id: &str, exp: i64) -> String {
+        let token = bare_jwt(user_id, exp);
+        format!(
+            r#"{{"token":"{token}","refreshToken":"rt-{user_id}","host":"https://api.trae.cn","userRegion":"cn","userId":"{user_id}","expiredAt":{exp},"account":"acc-{user_id}"}}"#
+        )
+    }
+
+    /// 合成 cloudide 信封（base64）—— 直接塞进 fixture `storage.json` 的
+    /// [`CLOUDIDE_KEY`] 键。
+    pub(crate) fn synthetic_cloudide_envelope(user_id: &str, exp: i64) -> String {
+        seal(cloudide_plain(user_id, exp).as_bytes())
+    }
+
+    /// 铺一份**只有 tc 信封**的 userData：`storage.json` 里只有 [`CLOUDIDE_KEY`]，
+    /// **没有** `icube-dc` 设备凭证、**没有**任何明文 `Cloud-IDE-JWT`、
+    /// **连 `logs/` 目录都没有**。
+    ///
+    /// 这是「Trae Work 能导入本机账号」的护栏场景：`TRAE SOLO CN` 的真实形态就是
+    /// 只有加密信封、没有任何明文来源（实测 355 个日志文件、0 个 `completion.log`）。
+    ///
+    /// 返回 `(userId, 目录名)`（覆盖全部候选目录，各给**不同** userId，
+    /// 使「按变体限定」若退化成「跨变体取第一个命中」时断言能立刻发现）。
+    pub(crate) fn write_cloudide_only_user_data(
+        base: &std::path::Path,
+        exp: i64,
+    ) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for (variant_index, variant) in TraeVariant::all().into_iter().enumerate() {
+            for (index, name) in crate::modules::trae::platform::data_dir_names_for(variant)
+                .iter()
+                .enumerate()
+            {
+                let user_id = format!("900000000000{:04}", variant_index * 10 + index);
+                let dir = base.join(name).join("User").join("globalStorage");
+                std::fs::create_dir_all(&dir).expect("fixture 目录应能创建");
+                let storage = serde_json::json!({
+                    CLOUDIDE_KEY: synthetic_cloudide_envelope(&user_id, exp),
+                });
+                std::fs::write(
+                    dir.join("storage.json"),
+                    serde_json::to_vec_pretty(&storage).unwrap(),
+                )
+                .expect("fixture storage.json 应能写入");
+                out.push((user_id, (*name).to_string()));
+            }
+        }
+        out
     }
 
     /// 在 `base` 下铺一份**合成**的 Trae userData 目录树，覆盖全部变体的候选目录名。

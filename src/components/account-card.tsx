@@ -27,7 +27,13 @@ const AVATAR_TONES = [
   "bg-teal-100 text-teal-800",
 ] as const;
 
-function avatarTone(name: string) {
+/**
+ * 按账号名稳定地取一个头像底色。
+ *
+ * 与 `trae-account-card.tsx` 共用：两个产品分区的账号卡片必须是同一套视觉，
+ * 各自维护一份色板迟早会漂移，因此这里导出而不是复制。
+ */
+export function avatarTone(name: string) {
   let hash = 0;
   for (let i = 0; i < name.length; i += 1) hash = (hash * 31 + name.charCodeAt(i)) >>> 0;
   return AVATAR_TONES[hash % AVATAR_TONES.length];

@@ -7,7 +7,12 @@ import { useAccountsStore } from "@/stores/accounts";
 
 export const WORKBUDDY_STATUS_REFRESH_INTERVAL_MS = 60 * 1000;
 
-/** Refresh WorkBuddy status only while the main window is visible and focused. */
+/**
+ * 仅在主窗口可见且聚焦时刷新 WorkBuddy（国内版 + 国际版）运行状态与当前账号。
+ *
+ * 两个 region 都要轮询：`status.current` 同时决定「国际版/国内版」Tab 上的登录态文案
+ * 与账号卡片上的「当前账号」标记，漏掉任何一个都会让标记停留在旧值。
+ */
 export function useWorkbuddyStatusRefresh() {
   const activeRef = useRef(false);
   const timerRef = useRef<number | undefined>(undefined);
@@ -32,7 +37,9 @@ export function useWorkbuddyStatusRefresh() {
 
     function refreshStatus() {
       if (disposed || !activeRef.current) return;
-      void useAccountsStore.getState().refreshStatus(abortControllerRef.current?.signal);
+      // 必须同时刷新国内版与国际版：`status.current` 是卡片「当前账号」标记的唯一来源，
+      // 只轮询国内版会让国际版的状态永远停在首屏快照上——切换国际账号后标记不跟着走。
+      void useAccountsStore.getState().refreshAllStatus(abortControllerRef.current?.signal);
     }
 
     function startTimer() {

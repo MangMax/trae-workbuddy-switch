@@ -171,7 +171,8 @@ fn parse_credits(result: &Value) -> Option<(i64, i64)> {
                 .and_then(Value::as_bool)
                 == Some(true)
         })
-        .count() as f64;
+        .filter_map(|resource| resource.get("remaining").and_then(Value::as_f64))
+        .sum();
     Some((to_credits(total), to_credits(expiring_soon)))
 }
 

@@ -143,8 +143,14 @@ pub fn oauth_device_file() -> PathBuf {
 
 /// OAuth 登录设备身份文件（按变体分家）。
 ///
-/// 存的是**授权 URL 用的身份 A**（`seed` / `device_id` / `machine_id`），
-/// **与 `device_map.json`（身份 C，账号级）和 icube 设备凭证（身份 B，机器级）都不同源**。
+/// 存的是**授权 URL 用的身份 A2**：只有 `machine_id` 一个键（本机自造、变体级稳定）。
+///
+/// **`device_id` 不在这里**（曾经在，已移出）：授权 URL 的 `device_id` 是身份 A1，
+/// 必须与 icube 设备凭证**同源**（= 签名私钥所属的那个 `icube-dc` deviceId），
+/// 由 [`crate::modules::trae::icube::device_identity_for`] 提供 —— 否则服务端 20403/20405。
+/// 自造 `device_id` 的能力在**类型层面**就不存在（见 `OAuthLoginMachine`）。
+///
+/// 与 `device_map.json`（身份 C，账号级）仍然不同源。
 /// 分家的硬理由同 [`device_map_file_for`]：两条产品线的身份空间不同，
 /// 混用不会报错、只会让上游把它们当成两个设备。
 pub fn oauth_device_file_for(variant: TraeVariant) -> PathBuf {

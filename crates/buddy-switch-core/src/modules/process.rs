@@ -162,11 +162,17 @@ fn image_name_from_path_str(s: &str) -> &str {
 }
 
 /// 本工具自身的映像名（忽略 .exe、大小写）。
+///
+/// `wb-switch` 是**旧版 exe 名**，必须保留：`config.rs` 至今仍兼容旧目录
+/// （`WB_SWITCH_HOME` / `~/.wb-switch`），说明用户机器上可能还留着旧版二进制。
+/// 若这里不认它，工具会把正在运行的旧版自己当成「外部 WorkBuddy 进程」处理
+/// （最坏情况是误杀或重复启动），而旧版名恰恰是最容易被漏掉的一个。
 pub(crate) fn is_self_image_name(name: &str) -> bool {
     let stem = image_stem(image_name_from_path_str(name));
     stem.eq_ignore_ascii_case("workbuddy-switch")
         || stem.eq_ignore_ascii_case("buddy-switch")
         || stem.eq_ignore_ascii_case("BuddySwitch")
+        || stem.eq_ignore_ascii_case("wb-switch")
 }
 
 /// 精确匹配该 region 的 WorkBuddy / CodeBuddy **映像**（禁止子串命中

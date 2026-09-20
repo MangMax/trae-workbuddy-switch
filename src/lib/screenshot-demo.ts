@@ -5,6 +5,20 @@ import type {
   GithubConfig, Region, RotateLog, RotateStatus, ScheduleConfig, TokenStatistics, TokenStatsGroup, TokenStatsSource,
   TokenStatsTotals, TravelConfig, TravelStatus,
 } from "./types";
+import type {
+  TraeAccount,
+  TraeCapabilities,
+  TraeCheckinStatus,
+  TraeCreditsOverview,
+  TraeEnvStatus,
+  TraeVariantsStatus,
+  TraeGatewayConfigRaw,
+  TraeGatewayLogEntry,
+  TraeLogsResponse,
+  TraeProfilesOverview,
+  TraeSettings,
+  TraeTokenStatistics,
+} from "./trae-types";
 import { demoModeEnabled } from "./demo-mode";
 
 export const screenshotDemoEnabled = demoModeEnabled;
@@ -497,6 +511,373 @@ function demoGatewayLogs(): GatewayLogEntry[] {
   ];
 }
 
+// ---------------------------------------------------------------------------
+// Trae 分区（演示数据，只读）
+// ---------------------------------------------------------------------------
+//
+// 形状刻意与 `webui` 的 HTTP 响应**逐字段一致**（含 snake_case 的网关字段）：
+// 前端页面在两种模式下走同一套归一化逻辑，形状不一致会让「演示站好看、真实站崩」
+// 这类差异在打包后才暴露。数值与 `.qa-tmp/mock_api.py` 对齐，两种模式的截图可比。
+
+const traeAccounts: TraeAccount[] = [
+  {
+    userId: "7481920", name: "主号", groupId: null, jwt: "", jwtExpHours: 320.5,
+    jwtExpTimestamp: atLocalTime(0, 9, 12), jwtStatus: "ok", checkedToday: true,
+    credits: 120, remainingCredits: 120, creditsExpireAt: futureAt(26),
+    deviceIdMasked: "a1b2…9f", cooldownType: null, cooldownUntil: null, cooldownReason: null,
+    hasRefreshToken: true, jwtAutoRefresh: true,
+    addedAt: "2026-09-10T02:11:00Z", updatedAt: "2026-09-17T01:54:00Z",
+  },
+  {
+    userId: "7481999", name: "小号 A", groupId: "g1", jwt: "", jwtExpHours: 6.2,
+    jwtExpTimestamp: atLocalTime(0, 15, 20), jwtStatus: "warn", checkedToday: false,
+    credits: 0, remainingCredits: 64.5, creditsExpireAt: futureAt(5),
+    deviceIdMasked: "c3d4…7e", cooldownType: "SoftRate",
+    cooldownUntil: Math.floor(Date.now() / 1000) + 5400,
+    cooldownReason: "请求过于频繁，请稍后再试",
+    hasRefreshToken: false, jwtAutoRefresh: false,
+    addedAt: "2026-09-12T08:00:00Z", updatedAt: "2026-09-16T22:10:00Z",
+  },
+  {
+    userId: "7482044", name: "小号 B", groupId: "g1", jwt: "", jwtExpHours: -3,
+    jwtExpTimestamp: atLocalTime(0, 5, 30), jwtStatus: "expired", checkedToday: false,
+    credits: 8, remainingCredits: 8, creditsExpireAt: futureAt(3),
+    deviceIdMasked: "e5f6…1a", cooldownType: "SessionDead", cooldownUntil: 9_999_999_999,
+    cooldownReason: "会话已失效，需重新登录",
+    hasRefreshToken: true, jwtAutoRefresh: false,
+    addedAt: "2026-09-14T09:30:00Z", updatedAt: "2026-09-17T00:40:00Z",
+  },
+];
+
+const traeCheckinResults = [
+  { name: "主号", userId: "7481920", ok: true, code: 200, message: "签到成功", action: "claim", credits: 120, delta: 20, errorType: null, cooldownUntil: null },
+  { name: "小号 A", userId: "7481999", ok: true, code: 200, message: "今日已签到", action: "skip_already", credits: 64.5, delta: 0, errorType: null, cooldownUntil: null },
+  { name: "小号 B", userId: "7482044", ok: false, code: 401, message: "会话已失效，需重新登录", action: "claim", credits: null, delta: 0, errorType: "SessionDead", cooldownUntil: 9_999_999_999 },
+];
+
+function demoTraeEnv(): TraeEnvStatus {
+  return {
+    installed: true, running: true, version: "1.107.1",
+    // 演示数据刻意用「装在非系统盘」的真实形态：这正是自动探测要覆盖的场景，
+    // 也让「同机多产品线」的能力在截图里可见。平台是 win32，路径就用 Windows 形态。
+    path: "D:\\Programs\\TRAE SOLO CN\\TRAE SOLO CN.exe",
+    dataDir: "C:\\Users\\demo\\AppData\\Roaming\\TRAE SOLO CN",
+    dataDirExists: true, platform: "win32", configuredPath: null,
+    // 变体字段必须与真实 HTTP 响应同形状：fixture 少一个键，演示站就看不到
+    // 产品线标签，而这个差异只会在真机暴露。
+    variant: "trae_work", variantLabel: "Trae Work",
+  };
+}
+
+/**
+ * 演示数据：**两条** Trae 产品线并排。
+ *
+ * 刻意让两条线的状态不同（一条运行中、一条未运行），这样截图/演示站上
+ * 「并排两个图标各自独立」这件事才看得出来 —— 两条都同状态的话，
+ * 分不清是「两条独立探测」还是「同一条画了两遍」。
+ */
+function demoTraeVariants(): TraeVariantsStatus {
+  return {
+    platform: "win32",
+    variants: [
+      {
+        variant: "trae_work",
+        variantLabel: "Trae Work",
+        nameAlias: "TraeWork CN",
+        installed: true,
+        running: true,
+        version: "1.107.1",
+        path: "D:\\Programs\\TRAE SOLO CN\\TRAE SOLO CN.exe",
+        dataDir: "C:\\Users\\demo\\AppData\\Roaming\\TRAE SOLO CN",
+        dataDirExists: true,
+      },
+      {
+        variant: "trae_cn",
+        variantLabel: "Trae CN",
+        nameAlias: "TraeCode CN",
+        installed: true,
+        running: false,
+        version: "1.107.1",
+        path: "D:\\Programs\\Trae CN\\Trae CN.exe",
+        dataDir: "C:\\Users\\demo\\AppData\\Roaming\\Trae CN",
+        dataDirExists: true,
+      },
+    ],
+  };
+}
+
+function demoTraeCapabilities(): TraeCapabilities {
+  return {
+    platform: "win32", processControl: true, clientDetection: true,
+    userDataDir: "C:\\Users\\demo\\AppData\\Roaming\\TRAE SOLO CN",
+    machineGuidReset: true, scheduledTask: true, unsupported: [],
+  };
+}
+
+function demoTraeAccounts(): unknown {
+  return {
+    accounts: traeAccounts,
+    groups: [{ id: "g1", name: "备用", color: "#888", order: 0, count: 2 }],
+    total: traeAccounts.length, cooling: 1, ungrouped: 1,
+  };
+}
+
+function demoTraeCheckinStatus(): TraeCheckinStatus {
+  return {
+    summary: {
+      time: `${localDate(0)}T01:00:00+08:00`,
+      results: traeCheckinResults,
+      totalOk: 1, already: 1, failed: 1,
+      warnings: ["小号 B 会话已失效，请重新登录后再签到"],
+    },
+    summaryIsToday: true,
+    cooldowns: [
+      { userId: "7481999", type: "SoftRate", until: Math.floor(Date.now() / 1000) + 5400, reason: "请求过于频繁", permanent: false },
+      { userId: "7482044", type: "SessionDead", until: 9_999_999_999, reason: "会话已失效", permanent: true },
+    ],
+    cooldownCount: 2,
+    logFile: "/demo/buddy-switch/trae/logs/checkin.log",
+  };
+}
+
+function demoTraeCredits(): TraeCreditsOverview {
+  const daily = [188, 172.5, 180, 165.25, 158, 148.5, 140, 192.5].map((total, index, all) => ({
+    date: localDate(all.length - 1 - index),
+    total,
+    earned: [0, 0, 12, 0, 0, 0, 0, 20][index],
+    consumed: [0, 15.5, 4.5, 14.75, 7.25, 9.5, 8.5, 0][index],
+  }));
+  return {
+    remaining: { "7481920": 120, "7481999": 64.5, "7482044": 8 },
+    expireTimes: {
+      "7481920": Math.floor(futureAt(26) / 1000),
+      "7481999": Math.floor(futureAt(5) / 1000),
+      "7482044": Math.floor(futureAt(3) / 1000),
+    },
+    updatedAt: `${localDate(0)}T09:12:00+08:00`,
+    balances: traeAccounts.map((account) => ({
+      userId: account.userId,
+      credits: account.credits ?? 0,
+      date: localDate(0),
+    })),
+    records: [
+      { date: localDate(0), userId: "7481920", credits: 120, delta: 20 },
+      { date: localDate(0), userId: "7481999", credits: 64, delta: 0 },
+    ],
+    daily,
+    todayEarned: 20,
+    historyDays: 8,
+  };
+}
+
+/**
+ * 演示用的登录态快照总览（**按产品线分家**）。
+ *
+ * 两条产品线刻意给出**不同的槽位、不同的客户端数据目录**：截图上必须能一眼看出
+ * "这是两条独立产品线各自的快照"，而不是同一份数据被渲染了两次。
+ * 与 `demoTraeVariants` 同一意图（那边让运行状态不同，这边让快照内容不同）。
+ */
+function demoTraeProfiles(args?: Record<string, unknown>): TraeProfilesOverview {
+  const isCn = args?.variant === "trae_cn";
+  if (isCn) {
+    return {
+      profiles: [
+        { slot: "9201733", sizeBytes: 2_610_000, fileCount: 9, lastModified: `${localDate(1)} 14:05`, sizeText: "2.5 MB" },
+      ],
+      currentAccount: "9201733",
+      dataDir: "C:\\Users\\demo\\AppData\\Roaming\\Trae CN",
+      clientRunning: false,
+      coreEntryCount: 9,
+    };
+  }
+  return {
+    profiles: [
+      { slot: "7481920", sizeBytes: 4_820_000, fileCount: 9, lastModified: `${localDate(0)} 09:12`, sizeText: "4.6 MB" },
+      { slot: "7481999", sizeBytes: 3_140_000, fileCount: 9, lastModified: `${localDate(2)} 18:40`, sizeText: "3.0 MB" },
+    ],
+    currentAccount: "7481920",
+    dataDir: "C:\\Users\\demo\\AppData\\Roaming\\TRAE SOLO CN",
+    clientRunning: true,
+    coreEntryCount: 9,
+  };
+}
+
+function demoTraeSettings(): TraeSettings {
+  return {
+    proxyPort: 8899, theme: "dark", launchMinimized: false, autoStartProxy: true, tray: true,
+    language: "zh-CN", checkinSkipChecked: true, checkinSkipExpired: true, retry: 2,
+    notify: "system", traePath: null, browserPath: null, logRetentionDays: 7,
+    proxyDomains: "", apiPort: 7864, apiKey: "sk-trae-9f2c1a4b6d8e0f3a5b7c9d1e2f4a6b8c",
+    apiDefaultModel: "deepseek-v4-flash",
+  };
+}
+
+/**
+ * Trae 网关配置。
+ *
+ * 返回 **snake_case 原始形状**（`TraeGatewayConfigRaw`）而不是前端的 camelCase 形状：
+ * 演示模式必须与 HTTP 通道返回同一种形状，页面才会走同一套 `normalizeTraeGatewayConfig`。
+ * 用 camelCase 的话演示站能跑、真实站要等归一化才生效，差异只在真机暴露。
+ */
+function demoTraeGatewayConfig(): TraeGatewayConfigRaw {
+  return {
+    enabled: true, bind_addr: "127.0.0.1", port: 7864, allow_non_loopback: false,
+    log_keep: 200, log_bodies: false, max_body_mb: 8,
+    default_model: "deepseek-v4-flash", max_rotate: 3,
+  };
+}
+
+/** Trae 网关状态（**snake_case**，含账号池与诊断）。 */
+function demoTraeGatewayStatus(): unknown {
+  return {
+    enabled: true, running: true, addr: "127.0.0.1:7864",
+    base_url: "http://127.0.0.1:7864", bind_addr: "127.0.0.1", port: 7864,
+    allow_non_loopback: false, version: "2026.9.17", total_requests: 137,
+    last_error: null, api_key_prefix: "sk-trae-9f2c1a4b…7d31",
+    pool: { total: 3, available: 1, cooling: 1, disabled: 1, expired: 0, zero_credits: 0, total_credits: 192.5 },
+    accounts: [
+      { uid: "7481920", name: "主号", status: "available", credits: 120, creditsExpireAt: Math.floor(futureAt(26) / 1000), cooling: false, cooldownUntil: null, cooldownReason: null, disabled: false, deviceIdMasked: "a1b2…9f0e" },
+      { uid: "7481999", name: "小号 A", status: "cooling", credits: 64.5, creditsExpireAt: Math.floor(futureAt(5) / 1000), cooling: true, cooldownUntil: Math.floor(Date.now() / 1000) + 5400, cooldownReason: "请求频率超限", disabled: false, deviceIdMasked: "c3d4…1122" },
+      { uid: "7482044", name: "小号 B", status: "disabled", credits: 8, creditsExpireAt: null, cooling: false, cooldownUntil: 9_999_999_999, cooldownReason: "会话已失效", disabled: true, deviceIdMasked: "e5f6…3344" },
+    ],
+    diagnose: [
+      "主号(7481920:可用,积分=120)",
+      "小号 A(7481999:冷却中,积分=65)",
+      "小号 B(7482044:会话失效（需重新登录）,积分=8)",
+    ],
+    upstream: "https://trae-api-cn.mchost.guru",
+  };
+}
+
+const TRAE_GATEWAY_MODEL_NAMES = [
+  "doubao-seed-2.1-pro", "doubao-seed-2.1-turbo", "doubao-seed-2.0-code",
+  "deepseek-v4-flash", "deepseek-v4-pro", "glm-5.2", "glm-5.3", "glm-5-turbo",
+  "glm-5", "kimi-k2.7-code", "kimi-k3", "kimi-k2.6", "minimax-m3",
+  "qwen-3.7-plus", "sagitta", "aquila",
+];
+
+function demoTraeGatewayModels(): unknown {
+  return {
+    object: "list",
+    data: TRAE_GATEWAY_MODEL_NAMES.map((name) => ({
+      id: name, object: "model", created: 1753600000, owned_by: "trae",
+    })),
+  };
+}
+
+function demoTraeGatewayLogs(): unknown {
+  const now = Math.floor(Date.now() / 1000);
+  const logs: TraeGatewayLogEntry[] = [
+    { ts: (now - 60) * 1000, endpoint: "/v1/chat/completions", method: "POST", account: "7481920", model: "deepseek-v4-flash", status: 200, latencyMs: 1840, promptTokens: 1204, completionTokens: 386, stream: true, error: null },
+    { ts: (now - 900) * 1000, endpoint: "/v1/chat/completions", method: "POST", account: "7481963", model: "glm-5.3", status: 429, latencyMs: 220, promptTokens: 0, completionTokens: 0, stream: true, error: "账号「小号 A」上游失败（HTTP 429）" },
+    { ts: (now - 3600) * 1000, endpoint: "/v1/chat/completions", method: "POST", account: "7481920", model: "glm-5.3", status: 200, latencyMs: 3120, promptTokens: 4021, completionTokens: 1188, stream: false, error: null },
+  ];
+  return { logs };
+}
+
+/** Trae Token 统计（源 = 网关请求日志）。 */
+function demoTraeTokenStatistics(days?: number): TraeTokenStatistics {
+  const totals = [0, 0, 0, 0, 1860, 4210, 3120, 6791];
+  const inputs = [0, 0, 0, 0, 1500, 3400, 4021, 5225];
+  const outputs = [0, 0, 0, 0, 360, 810, 1188, 1566];
+  const daily = totals.map((total, index) => ({
+    key: localDate(totals.length - 1 - index),
+    total, input: inputs[index], output: outputs[index],
+    records: total === 0 ? 0 : index,
+    errors: index < 5 ? 0 : 1,
+    streamRequests: index,
+    avgLatencyMs: total === 0 ? 0 : 900 + index * 120,
+    p95LatencyMs: total === 0 ? 0 : 1800 + index * 200,
+  }));
+  return {
+    source: "trae-gateway", label: "Trae API 网关",
+    generatedAt: Date.now(), rangeDays: days ?? 30,
+    logFile: "/demo/buddy-switch/trae/api_gateway_logs.json",
+    summary: { total: 6791, input: 5225, output: 1566, records: 3, errors: 1, streamRequests: 2, avgLatencyMs: 1727, p95LatencyMs: 3120 },
+    models: [
+      { key: "deepseek-v4-flash", total: 1590, input: 1204, output: 386, records: 1, errors: 0, streamRequests: 1, avgLatencyMs: 1840, p95LatencyMs: 1840 },
+      { key: "glm-5.3", total: 5209, input: 4021, output: 1188, records: 2, errors: 1, streamRequests: 1, avgLatencyMs: 1670, p95LatencyMs: 3120 },
+    ],
+    accounts: [
+      { key: "7481920", name: "主号", shortId: "7481920", total: 6791, input: 5225, output: 1566, records: 2, errors: 0, streamRequests: 2, avgLatencyMs: 2480, p95LatencyMs: 3120 },
+      { key: "7481963", name: "小号 A", shortId: "7481963", total: 0, input: 0, output: 0, records: 1, errors: 1, streamRequests: 1, avgLatencyMs: 220, p95LatencyMs: 220 },
+    ],
+    daily,
+    hours: Array.from({ length: 24 }, (_, hour) => ({
+      key: String(hour).padStart(2, "0"),
+      total: hour === 10 ? 6791 : 0,
+      input: hour === 10 ? 5225 : 0,
+      output: hour === 10 ? 1566 : 0,
+      records: hour === 10 ? 3 : 0,
+      errors: hour === 10 ? 1 : 0,
+      streamRequests: hour === 10 ? 2 : 0,
+      avgLatencyMs: hour === 10 ? 1727 : 0,
+      p95LatencyMs: hour === 10 ? 3120 : 0,
+    })),
+    statuses: [{ key: "200", records: 2 }, { key: "429", records: 1 }],
+    filesScanned: 1, parseErrors: 0,
+    coverageStartAt: Date.now() - 3600_000, coverageEndAt: Date.now(),
+    note: "只统计经过本机 Trae 网关的调用；直接在 Trae IDE 里对话不产生记录。",
+  };
+}
+
+/**
+ * 运行日志（演示数据）。
+ *
+ * 文案逐字取自 `store::append_log` 的真实调用点，这样演示站看到的行
+ * 与真实运行时的行是同一种形状，视觉核对才有意义。
+ */
+function demoTraeLogs(args?: Record<string, unknown>): TraeLogsResponse {
+  const day0 = localDate(0);
+  const day1 = localDate(1);
+  const day2 = localDate(2);
+  const stamp = (daysAgo: number, hour: number, minute: number) => {
+    const date = new Date(atLocalTime(daysAgo, hour, minute));
+    return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")} ${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}:${String(date.getSeconds()).padStart(2, "0")}`;
+  };
+  const all = [
+    { kind: "checkin" as const, time: stamp(0, 8, 6), date: day0, message: "签到完成: 成功 1/已签到 1/失败 1/总计 3" },
+    { kind: "app" as const, time: stamp(0, 8, 41), date: day0, message: "自动解冻账号 7481999: 剩余积分 64.5，冷却已清除" },
+    { kind: "switch" as const, time: stamp(0, 9, 12), date: day0, message: "保存登录态: user=7481920 文件数=9" },
+    { kind: "checkin" as const, time: stamp(0, 9, 20), date: day0, message: "JWT 自动刷新成功: user=7481920 新到期=320.5h" },
+    { kind: "app" as const, time: stamp(0, 10, 3), date: day0, message: "设备标识重置完成: 6 项生效" },
+    { kind: "checkin" as const, time: stamp(1, 8, 5), date: day1, message: "签到完成: 成功 3/已签到 0/失败 0/总计 3" },
+    { kind: "switch" as const, time: stamp(1, 16, 20), date: day1, message: "保存登录态: user=7481999 文件数=9" },
+    { kind: "app" as const, time: stamp(2, 22, 10), date: day2, message: "自动解冻账号 7482044: 剩余积分 8，冷却已清除" },
+  ];
+
+  const kind = typeof args?.kind === "string" ? args.kind : "";
+  const date = typeof args?.date === "string" ? args.date : "";
+  const keyword = typeof args?.keyword === "string" ? args.keyword.toLowerCase() : "";
+  const entries = all.filter((entry) => {
+    if (kind && kind !== "all" && entry.kind !== kind) return false;
+    if (date && entry.date !== date) return false;
+    if (keyword && !entry.message.toLowerCase().includes(keyword)) return false;
+    return true;
+  });
+
+  const dates = [...new Set(all.map((entry) => entry.date))].sort().reverse();
+  return {
+    entries,
+    total: entries.length,
+    limit: 500,
+    dates,
+    counts: {
+      all: all.length,
+      app: all.filter((entry) => entry.kind === "app").length,
+      checkin: all.filter((entry) => entry.kind === "checkin").length,
+      switch: all.filter((entry) => entry.kind === "switch").length,
+    },
+    sources: [
+      { kind: "app", label: "运行", path: "/demo/buddy-switch/trae/logs/app.log", exists: true },
+      { kind: "checkin", label: "签到", path: "/demo/buddy-switch/trae/logs/checkin.log", exists: true },
+      { kind: "switch", label: "切换", path: "/demo/buddy-switch/trae/logs/switcher.log", exists: true },
+    ],
+    logDir: "/demo/buddy-switch/trae/logs",
+    note: "只读取本机纯文本运行日志（app / checkin / switcher）；网关请求日志在「网关请求日志」标签页。",
+  };
+}
+
 /** Read-only demo response provider. It never reads or mutates real user data. */
 export function screenshotDemoResponse(command: string, args?: Record<string, unknown>): unknown {
   const demoAccounts = hydratedAccounts();
@@ -564,6 +945,22 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
     case "get_gateway_models": return demoCatalog(args?.region === "global" ? "global" : "cn");
     case "get_account_strategy": return demoStrategyMap();
     case "get_gateway_logs": return { logs: demoGatewayLogs() };
+    // ---- Trae 分区（只读；写操作不进这里，由 DemoAction 统一拦截）----
+    case "get_trae_env": return demoTraeEnv();
+    case "get_trae_variants": return demoTraeVariants();
+    case "get_trae_capabilities": return demoTraeCapabilities();
+    case "get_trae_accounts": return demoTraeAccounts();
+    case "get_trae_checkin_status": return demoTraeCheckinStatus();
+    case "get_trae_credits": return demoTraeCredits();
+    case "get_trae_profiles": return demoTraeProfiles(args);
+    case "get_trae_settings": return demoTraeSettings();
+    case "get_trae_token_statistics":
+      return demoTraeTokenStatistics(typeof args?.days === "number" ? args.days : undefined);
+    case "get_trae_logs": return demoTraeLogs(args);
+    case "get_trae_gateway_config": return demoTraeGatewayConfig();
+    case "trae_gateway_status": return demoTraeGatewayStatus();
+    case "get_trae_gateway_models": return demoTraeGatewayModels();
+    case "get_trae_gateway_logs": return demoTraeGatewayLogs();
     default: throw new Error(`演示模式缺少只读数据: ${command}`);
   }
 }

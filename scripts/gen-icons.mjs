@@ -9,9 +9,15 @@
  * 流程（与仓库既有约定一致）：
  *   1. 校验源图：真实 PNG、正方形、边长 >= 1024（Tauri 官方要求）
  *   2. `tauri icon` 生成基础全套：png / icns / ico / Square* / StoreLogo / android / ios
- *   3. 强制同步 `icon.png` = 源图（托盘图标与步骤 4 都以它为输入，必须确保是新图）
+ *   3. 强制同步 `icon.png` = 源图（托盘图标与圆角脚本都以它为输入，必须确保是新图）
  *   4. 运行 `gen-windows-rounded-icon.py`，把 Windows 侧图标烘焙成 macOS 风格圆角
- *   5. 校验关键产物齐备，并打印清单
+ *   5. 运行 `gen-tray-icon.py`，生成 macOS 菜单栏单色模板（template image）
+ *   6. 运行 `gen-public-icons.py`，同步 `public/` 下的前端图标（侧栏标记 + favicon）
+ *   7. 校验关键产物齐备，并打印清单
+ *
+ * ⚠️ `public/` 下的图标**不在 `tauri icon` 的产出范围**内，缺少第 6 步时
+ * 换 logo 只会更新安装包图标，而**侧栏品牌标记与 Web favicon 会一直停在旧图**
+ * （曾实际发生：09-16 换了 logo，public/ 仍是 09-10 的旧绿色猫）。
  *
  * 用法：
  *   node scripts/gen-icons.mjs [源图路径]
@@ -21,8 +27,9 @@
  * 依赖：Node（本项目自带）+ Pillow（`python -m pip install Pillow`）。
  * 可用 BUDDY_SWITCH_PYTHON 指定解释器路径。
  *
- * 注意：`tray-icon-template.rgba`（macOS 菜单栏单色模板）**不由本脚本生成**，
- * 它是独立的单色剪影资源，更换彩色 logo 时需另行出图。
+ * 注意：`tray-icon-template.rgba` 是 **macOS 菜单栏单色模板**（系统只取其 alpha 通道着色），
+ * 由 `gen-tray-icon.py` 从源图剪影生成，**不是彩色图标的等比缩小**。
+ * 该文件被 `tray.rs` 以 `include_bytes!` 引用，且有 `&[u8; 36 * 36 * 4]` 的编译期长度断言。
  */
 
 import { execFileSync } from "node:child_process";
@@ -36,6 +43,7 @@ const ICONS_DIR = path.join(ROOT, "src-tauri", "icons");
 const TAURI_CLI = path.join(ROOT, "node_modules", "@tauri-apps", "cli", "tauri.js");
 const ROUNDED_SCRIPT = path.join(HERE, "gen-windows-rounded-icon.py");
 const TRAY_SCRIPT = path.join(HERE, "gen-tray-icon.py");
+const PUBLIC_SCRIPT = path.join(HERE, "gen-public-icons.py");
 
 /** `tauri icon` 未生成、但被代码/配置实际依赖的产物（缺失即视为失败）。 */
 const REQUIRED = [
@@ -52,6 +60,9 @@ const REQUIRED = [
   "tray-icon-template.png",
   "tray-icon-template.rgba",
 ];
+
+/** `public/` 下由 `gen-public-icons.py` 产出、前端实际引用的图标。 */
+const REQUIRED_PUBLIC = ["icon.png", "icon-transparent.png"];
 
 function fail(msg) {
   console.error(`\n[gen-icons] 失败：${msg}\n`);
@@ -138,13 +149,22 @@ function main() {
   execFileSync(python, [ROUNDED_SCRIPT], { cwd: ROOT, stdio: "inherit" });
 
   // ---------- 5. macOS 菜单栏单色模板 ----------
-  console.log("[gen-icons] 4/5 生成 macOS 菜单栏单色模板（template image）...");
+  console.log("[gen-icons] 4/6 生成 macOS 菜单栏单色模板（template image）...");
   execFileSync(python, [TRAY_SCRIPT, input], { cwd: ROOT, stdio: "inherit" });
 
-  // ---------- 6. 校验 ----------
-  console.log("[gen-icons] 5/5 校验产物 ...");
+  // ---------- 6. public/ 前端图标 ----------
+  // `tauri icon` 不管 public/，缺这一步会留下「安装包图标是新的、侧栏与 favicon 是旧的」。
+  console.log("[gen-icons] 5/6 同步 public/ 前端图标（侧栏标记 + favicon）...");
+  execFileSync(python, [PUBLIC_SCRIPT, input], { cwd: ROOT, stdio: "inherit" });
+
+  // ---------- 7. 校验 ----------
+  console.log("[gen-icons] 6/6 校验产物 ...");
   const missing = REQUIRED.filter((rel) => !existsSync(path.join(ICONS_DIR, rel)));
   if (missing.length) fail(`以下产物缺失：\n      ${missing.join("\n      ")}`);
+  const missingPublic = REQUIRED_PUBLIC.filter(
+    (rel) => !existsSync(path.join(ROOT, "public", rel)),
+  );
+  if (missingPublic.length) fail(`public/ 产物缺失：\n      ${missingPublic.join("\n      ")}`);
 
   const rows = REQUIRED.map((rel) => {
     const kb = (statSync(path.join(ICONS_DIR, rel)).size / 1024).toFixed(1);
@@ -152,6 +172,9 @@ function main() {
   });
   console.log(`[gen-icons] 完成 ✓ 图标已写入 ${path.relative(ROOT, ICONS_DIR)}`);
   console.log(rows.join("\n"));
+  console.log(
+    `[gen-icons] 完成 ✓ 前端图标已写入 ${path.relative(ROOT, path.join(ROOT, "public"))}（${REQUIRED_PUBLIC.join(" / ")}）`,
+  );
   console.log(
     "\n[gen-icons] 提示：MACOS 菜单栏用的是单色 template image（只取 alpha 通道着色），\n" +
       "            由 gen-tray-icon.py 从源图剪影生成；tray.rs 对尺寸有编译期断言，勿改 36x36。",

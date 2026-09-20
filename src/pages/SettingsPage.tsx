@@ -1,11 +1,12 @@
-import { useEffect, useState, type ReactElement, type ReactNode } from "react";
+import { useEffect, useState } from "react";
 import { ArrowUpCircle, CircleCheck, ExternalLink, FolderOpen, Loader2, Plus, RefreshCw, Save, X } from "lucide-react";
 import { toast } from "sonner";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent } from "@/components/ui/card";
+import { CardContent } from "@/components/ui/card";
+import { SettingsFieldRow, SettingsGroup, SettingsRow } from "@/components/settings-primitives";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -33,75 +34,12 @@ import { DemoAction } from "@/components/demo-action";
 import { useAccountsStore } from "@/stores/accounts";
 import { useGatewayStore } from "@/stores/gateway";
 
-interface SettingsGroupProps {
-  id: string;
-  title: string;
-  children: ReactNode;
-}
-
-function SettingsGroup({ id, title, children }: SettingsGroupProps) {
-  return (
-    <section className="min-w-0 space-y-2.5" aria-labelledby={id}>
-      <div className="px-1">
-        <h2 id={id} className="text-[13px] font-medium leading-5">
-          {title}
-        </h2>
-      </div>
-      <Card className="min-w-0 gap-0 overflow-hidden rounded-xl py-0 shadow-none">{children}</Card>
-    </section>
-  );
-}
-
-function SettingsRow({ children, className }: { children: ReactNode; className?: string }) {
-  return (
-    <div
-      className={cn(
-        "mx-4 flex min-w-0 items-center justify-between gap-3 border-b border-border/50 px-0 py-2.5 sm:mx-5",
-        className,
-      )}
-    >
-      {children}
-    </div>
-  );
-}
-
-interface SettingsFieldRowProps {
-  label: ReactNode;
-  description?: ReactNode;
-  htmlFor?: string;
-  children: ReactNode;
-  className?: string;
-  operational?: boolean;
-}
-
-function SettingsFieldRow({
-  label,
-  description,
-  htmlFor,
-  children,
-  className,
-  operational = false,
-}: SettingsFieldRowProps) {
-  return (
-    <SettingsRow className={cn("flex-col items-stretch gap-2 sm:flex-row sm:items-center", className)}>
-      <div className="min-w-0 flex-1">
-        {htmlFor ? (
-          <Label htmlFor={htmlFor} className="text-[13px] leading-4">
-            {label}
-          </Label>
-        ) : (
-          <div className="text-[13px] font-medium leading-4">{label}</div>
-        )}
-        {description && (
-          <p className="mt-0.5 text-xs leading-4 text-muted-foreground/75">{description}</p>
-        )}
-      </div>
-      <div className="flex min-w-0 w-full shrink-0 justify-end sm:w-auto">
-        {operational ? <DemoAction className="w-full sm:w-auto">{children as ReactElement}</DemoAction> : children}
-      </div>
-    </SettingsRow>
-  );
-}
+/**
+ * 设置页的三个行原语来自 `@/components/settings-primitives`，
+ * 与 Trae 设置页共用同一实现（原先两份是逐字重复，已发生过漂移）。
+ * 这里重新导出只是为了让既有单测/引用路径继续可用。
+ */
+export { SettingsFieldRow, SettingsGroup, SettingsRow };
 
 function formatTime(ts: number): string {
   try {

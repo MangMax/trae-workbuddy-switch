@@ -538,7 +538,12 @@ pub fn backup_profile(user_id: &str) -> Result<Value, String> {
 }
 
 /// 备份当前登录态到指定账号槽位（按变体分家）。
+///
+/// 与 [`save_login_for`] 走**同一条守卫**（[`profile::ensure_save_target_matches_client`]）：
+/// 这个入口虽然不写 `currentAccount`，但它同样把「客户端此刻的登录态」贴到
+/// `profiles/<user_id>/` 下 —— 少了守卫，快照污染与 `save_login` 完全一样。
 pub fn backup_profile_for(variant: TraeVariant, user_id: &str) -> Result<Value, String> {
+    profile::ensure_save_target_matches_client(variant, user_id)?;
     let files = profile::backup_to_slot_for(variant, user_id)?;
     Ok(json!({ "slot": user_id, "fileCount": files }))
 }

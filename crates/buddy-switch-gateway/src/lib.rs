@@ -32,6 +32,11 @@ pub mod session_headers;
 pub mod state;
 pub mod sticky;
 pub mod timeutil;
+/// Trae 的 OpenAI 兼容网关（**平行第二套实现**，与上面的 WorkBuddy 网关互不复用）。
+///
+/// 独立模块而非 `GatewayState` 的一个分支：两者归属域、凭据形态、上游协议、
+/// 响应格式、路由挂载方式全不相同，详见 [`trae`] 模块文档。
+pub mod trae;
 
 pub use account_strategy::{AccountSelector, AccountStrategy};
 pub use apikey::{ApiKeyRecord, ApiKeyStore};
@@ -81,6 +86,23 @@ pub struct GatewayHandle {
 }
 
 impl GatewayHandle {
+    /// 由监听方直接构造句柄。
+    ///
+    /// 字段是私有的，因此**平级模块**（如 `trae::spawn_listener`）无法用结构体字面量
+    /// 构造。与其把字段放宽成 `pub(crate)`（那会让「谁都能改 addr」成为可能），
+    /// 不如只开一个受控构造器：语义与 [`spawn_listener_with_state`] 内部那处完全一致。
+    pub fn new(
+        addr: SocketAddr,
+        shutdown: oneshot::Sender<()>,
+        join: tokio::task::JoinHandle<()>,
+    ) -> Self {
+        Self {
+            addr,
+            shutdown: Some(shutdown),
+            join: Some(join),
+        }
+    }
+
     /// 实际监听地址（端口为 0 时返回系统分配的端口）。
     pub fn addr(&self) -> SocketAddr {
         self.addr

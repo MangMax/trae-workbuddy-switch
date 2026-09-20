@@ -43,6 +43,32 @@ import type {
 } from "./types";
 import { DEMO_UNAVAILABLE_MESSAGE, demoModeEnabled } from "./demo-mode";
 import { screenshotDemoResponse } from "./screenshot-demo";
+import type {
+  TraeAccount,
+  TraeAccountsOverview,
+  TraeCapabilities,
+  TraeCheckinReport,
+  TraeCheckinStatus,
+  TraeCreditsOverview,
+  TraeDeviceResetReport,
+  TraeEnvStatus,
+  TraeExportRecord,
+  TraeGatewayConfigRaw,
+  TraeGatewayLogEntry,
+  TraeGatewayStatus,
+  TraeGroup,
+  TraeImportPreview,
+  TraeLogQuery,
+  TraeLogsResponse,
+  TraeOAuthPollResult,
+  TraeOAuthStartResult,
+  TraeProfilesOverview,
+  TraeSettings,
+  TraeSwitchOutcome,
+  TraeTokenStatistics,
+  TraeVariantId,
+  TraeVariantsStatus,
+} from "./trae-types";
 
 /**
  * 双通道适配层：
@@ -61,6 +87,14 @@ const DEMO_READ_COMMANDS = new Set([
   // API 网关只读命令（演示站需返回虚构数据，否则 build:demo 报错）
   "get_gateway_config", "gateway_status", "list_api_keys", "get_gateway_models",
   "get_account_strategy", "get_gateway_logs",
+  // Trae 分区只读命令（演示站需返回虚构数据，否则 build:demo 报错）。
+  // 只登记**只读**命令：写操作（签到 / 增删账号 / 切换 / 重置设备…）一律不进这里，
+  // 由 `DemoAction` 包裹后在演示模式下统一提示不可操作。
+  "get_trae_env", "get_trae_variants", "get_trae_capabilities", "get_trae_accounts",
+  "get_trae_checkin_status",
+  "get_trae_credits", "get_trae_token_statistics", "get_trae_logs", "get_trae_profiles",
+  "get_trae_settings", "get_trae_gateway_config", "trae_gateway_status",
+  "get_trae_gateway_models", "get_trae_gateway_logs",
 ]);
 
 export function isDemoMode(): boolean {
@@ -149,6 +183,56 @@ const ROUTES: Record<string, Route> = {
   save_account_strategy: { method: "POST", path: "/api/gateway/strategy" },
   get_gateway_logs: { method: "GET", path: "/api/gateway/logs" },
   clear_gateway_logs: { method: "POST", path: "/api/gateway/logs/clear" },
+
+  // ---- Trae 模块 ----
+  // 键名必须与 src-tauri/src/lib.rs 的 invoke_handler 登记名、
+  // 以及 crates/buddy-switch-server/src/api.rs 的路由 path+method 三方一致，
+  // 由 scripts/check-api-contract.cjs 在构建前校验。
+  get_trae_env: { method: "GET", path: "/api/trae/env" },
+  get_trae_variants: { method: "GET", path: "/api/trae/variants" },
+  get_trae_capabilities: { method: "GET", path: "/api/trae/capabilities" },
+  get_trae_accounts: { method: "GET", path: "/api/trae/accounts" },
+  get_trae_checkin_status: { method: "GET", path: "/api/trae/checkin/status" },
+  get_trae_credits: { method: "GET", path: "/api/trae/credits" },
+  get_trae_token_statistics: { method: "GET", path: "/api/trae/token-stats" },
+  get_trae_logs: { method: "GET", path: "/api/trae/logs" },
+  get_trae_profiles: { method: "GET", path: "/api/trae/profiles" },
+  get_trae_settings: { method: "GET", path: "/api/trae/settings" },
+  save_trae_settings: { method: "POST", path: "/api/trae/settings" },
+  trae_add_account: { method: "POST", path: "/api/trae/accounts/add" },
+  trae_update_account: { method: "POST", path: "/api/trae/accounts/update" },
+  trae_delete_account: { method: "POST", path: "/api/trae/accounts/delete" },
+  // 账号迁移：与 WorkBuddy 的 import_local / export_accounts* / import* 同构。
+  // 命令名不与 WorkBuddy 侧重名（多 `trae_` 前缀），因此 ROUTES 里必须逐条列出。
+  trae_import_local_account: { method: "POST", path: "/api/trae/accounts/import-local" },
+  // Trae OAuth 登录：与 WorkBuddy 的 oauth_start / oauth_status 同构，但**不带 region**
+  // （Trae 只有一套账号库与一套上游，见 crates/buddy-switch-core/src/modules/trae/mod.rs）。
+  trae_oauth_start: { method: "POST", path: "/api/trae/oauth/start" },
+  trae_oauth_status: { method: "POST", path: "/api/trae/oauth/status" },
+  trae_oauth_cancel: { method: "POST", path: "/api/trae/oauth/cancel" },
+  trae_export_accounts: { method: "POST", path: "/api/trae/accounts/export" },
+  trae_export_accounts_to_path: { method: "POST", path: "/api/trae/accounts/export-to-path" },
+  trae_preview_import_accounts: { method: "POST", path: "/api/trae/accounts/import/preview" },
+  trae_import_accounts: { method: "POST", path: "/api/trae/accounts/import" },
+  trae_group_op: { method: "POST", path: "/api/trae/groups" },
+  trae_checkin: { method: "POST", path: "/api/trae/checkin" },
+  trae_refresh_credits: { method: "POST", path: "/api/trae/credits/refresh" },
+  trae_refresh_jwt: { method: "POST", path: "/api/trae/refresh-jwt" },
+  trae_clear_cooldown: { method: "POST", path: "/api/trae/cooldown/clear" },
+  trae_switch_account: { method: "POST", path: "/api/trae/switch" },
+  trae_save_login: { method: "POST", path: "/api/trae/login/save" },
+  trae_backup_profile: { method: "POST", path: "/api/trae/profiles/backup" },
+  trae_restore_profile: { method: "POST", path: "/api/trae/profiles/restore" },
+  trae_delete_profile: { method: "POST", path: "/api/trae/profiles/delete" },
+  trae_reset_device: { method: "POST", path: "/api/trae/device/reset" },
+  // Trae API 网关管理面（网关本体走独立端口，见 src/pages/TraeApiServicePage）。
+  get_trae_gateway_config: { method: "GET", path: "/api/trae/gateway/config" },
+  save_trae_gateway_config: { method: "POST", path: "/api/trae/gateway/config" },
+  trae_gateway_status: { method: "GET", path: "/api/trae/gateway/status" },
+  get_trae_gateway_models: { method: "GET", path: "/api/trae/gateway/models" },
+  regenerate_trae_api_key: { method: "POST", path: "/api/trae/gateway/key/regenerate" },
+  get_trae_gateway_logs: { method: "GET", path: "/api/trae/gateway/logs" },
+  clear_trae_gateway_logs: { method: "POST", path: "/api/trae/gateway/logs/clear" },
 };
 
 function queryString(args?: Record<string, unknown>): string {
@@ -656,3 +740,404 @@ export function asError(e: unknown): string {
   if (e instanceof Error) return e.message;
   return JSON.stringify(e ?? "未知错误");
 }
+
+// ---------------------------------------------------------------------------
+// Trae 模块
+// ---------------------------------------------------------------------------
+//
+// 每个 wrapper 都必须以裸 `call(…)` 形式发起调用（字符串字面量为命令名）：
+// `scripts/check-api-contract.cjs` 正是据此扫描出调用点，再校验
+// 「ROUTES 条目 ←→ Tauri invoke_handler 登记 ←→ server 路由」三方一致。
+// 注意不要在注释里写出形如 `call(` 加引号命令名的字样——那会被扫描器当成真实调用点。
+// 演示模式（demoModeEnabled）下这些命令不在 DEMO_READ_COMMANDS 中，会统一抛出
+// 「演示模式不可用」，页面侧按空态/提示处理即可。
+
+/**
+ * 把可选的 `variant` 组装成调用参数（`undefined` 表示「不传」）。
+ *
+ * 不传与传 `null` 对 Rust 侧**是同一件事**（`Option<String>` 都反序列化成 `None`），
+ * 但少传一个键能让请求体更干净、也让「老调用点行为不变」这件事在代码里显式可见。
+ * 因此**统一走本函数**，不要在各 wrapper 里重复这段判断。
+ */
+function variantArgs(variant?: TraeVariantId | null): Record<string, unknown> | undefined {
+  if (!variant) return undefined;
+  return { variant };
+}
+
+/** Trae 客户端安装/运行/数据目录状态（**自动挑中的那一条**，单一视角）。 */
+export function getTraeEnv(): Promise<TraeEnvStatus> {
+  return call("get_trae_env");
+}
+
+/**
+ * **全部** Trae 产品线的独立环境状态（并排视角）。
+ *
+ * 与 [`getTraeEnv`] 的分工：`getTraeEnv` 回答「自动挑中的是哪一条」（用于页面标题、
+ * 诊断文案）；本函数回答「每条各自是什么状态」，用于**并排**渲染多个产品图标
+ * （对齐 WorkBuddy 右上角三个独立产品图标）。
+ *
+ * 演示模式下该命令会抛错，调用方按空数组处理即可。
+ */
+export function getTraeVariants(): Promise<TraeVariantsStatus> {
+  return call("get_trae_variants");
+}
+
+/** 当前平台的能力与受限项说明。 */
+export function getTraeCapabilities(): Promise<TraeCapabilities> {
+  return call("get_trae_capabilities");
+}
+
+/** 账号 + 分组 + 计数（`variant` 决定读哪个账号库）。 */
+export function getTraeAccounts(variant?: TraeVariantId | null): Promise<TraeAccountsOverview> {
+  return call("get_trae_accounts", variantArgs(variant));
+}
+
+/** 最近一次签到摘要与冷却明细（`variant` 决定读哪条产品线的数据）。 */
+export function getTraeCheckinStatus(variant?: TraeVariantId | null): Promise<TraeCheckinStatus> {
+  return call("get_trae_checkin_status", variantArgs(variant));
+}
+
+/** 剩余积分、签到明细与每日趋势（`variant` 决定读哪条产品线的数据）。 */
+export function getTraeCredits(variant?: TraeVariantId | null): Promise<TraeCreditsOverview> {
+  return call("get_trae_credits", variantArgs(variant));
+}
+
+/**
+ * Token 统计（聚合本机 Trae 网关请求日志）。
+ *
+ * `days` 为统计窗口天数；不传或传 `<= 0` 表示全部历史。
+ * 只统计**经过本网关**的调用——直接在 Trae IDE 里对话不产生记录。
+ */
+export function getTraeTokenStatistics(days?: number): Promise<TraeTokenStatistics> {
+  return call("get_trae_token_statistics", days === undefined ? undefined : { days });
+}
+
+/**
+ * 运行日志（系统日志页的「运行日志」标签页）。
+ *
+ * 只读本机 `logs/` 下的纯文本日志（app / checkin / switcher）；文件不存在时返回空列表，
+ * 不抛错——新装用户三个文件都还没有。
+ */
+export function getTraeLogs(query?: TraeLogQuery): Promise<TraeLogsResponse> {
+  const args: Record<string, unknown> = {};
+  if (query?.kind && query.kind !== "all") args.kind = query.kind;
+  if (query?.date) args.date = query.date;
+  if (query?.keyword) args.keyword = query.keyword;
+  if (query?.limit) args.limit = query.limit;
+  if (query?.variant) args.variant = query.variant;
+  return call("get_trae_logs", Object.keys(args).length > 0 ? args : undefined);
+}
+
+/** 登录态快照总览（按产品线分家）。 */
+export function getTraeProfiles(variant?: TraeVariantId | null): Promise<TraeProfilesOverview> {
+  return call("get_trae_profiles", variantArgs(variant));
+}
+
+/** Trae 模块设置。 */
+export function getTraeSettings(): Promise<TraeSettings> {
+  return call("get_trae_settings");
+}
+
+/** 局部更新设置：只需提交要改的键。 */
+export function saveTraeSettings(patch: Partial<TraeSettings>): Promise<TraeSettings> {
+  return call("save_trae_settings", { patch: patch as Record<string, unknown> });
+}
+
+/** 手动添加账号（粘贴 JWT）。`variant` 决定写进哪个账号库。 */
+export function traeAddAccount(
+  name: string,
+  jwt: string,
+  groupId?: string | null,
+  variant?: TraeVariantId | null,
+): Promise<{ userId: string; accounts: TraeAccount[] }> {
+  return call("trae_add_account", {
+    name,
+    jwt,
+    groupId: groupId ?? null,
+    variant: variant ?? null,
+  });
+}
+
+/** 改名 / 换 JWT。 */
+export function traeUpdateAccount(
+  userId: string,
+  patch: { name?: string; jwt?: string },
+  variant?: TraeVariantId | null,
+): Promise<{ accounts: TraeAccount[] }> {
+  return call("trae_update_account", {
+    userId,
+    name: patch.name ?? null,
+    jwt: patch.jwt ?? null,
+    variant: variant ?? null,
+  });
+}
+
+/** 删除账号（可选一并删除登录态快照）。 */
+export function traeDeleteAccount(
+  userId: string,
+  deleteProfile = false,
+  variant?: TraeVariantId | null,
+): Promise<{ deleted: string; profileDeleted: boolean; accounts: TraeAccount[] }> {
+  return call("trae_delete_account", { userId, deleteProfile, variant: variant ?? null });
+}
+
+/**
+ * 从 Trae 客户端登录态导入当前账号（对齐 WorkBuddy 的「导入本机账号」）。
+ *
+ * 客户端已登录时读 `Cloud-IDE-JWT`：账号已存在则**覆盖刷新 JWT**（保留名字与分组），
+ * 不存在则新建。因此重复点击是安全的，不会产生重复条目。
+ *
+ * `variant` 决定读**哪条产品线**的 userData（`"trae_work"` / `"trae_cn"`）：
+ * Trae 多条产品线可同机并存，不指定时后端按默认变体处理（保持向后兼容）。
+ * 分区页会把当前管理的产品线传进来，避免「在 Trae Work 分区导入却读了 Trae CN」。
+ */
+export function traeImportLocalAccount(variant?: TraeVariantId | null): Promise<{
+  userId: string;
+  name: string;
+  accounts: TraeAccount[];
+}> {
+  return call("trae_import_local_account", variantArgs(variant));
+}
+
+// ---------------------------------------------------------------------------
+// Trae OAuth 登录（浏览器授权 + 本地回调监听）
+// ---------------------------------------------------------------------------
+//
+// 与 WorkBuddy 的 `oauthStart` / `oauthStatus` 同构，但**不带 region 参数**：
+// Trae 只有一套账号库与一套上游，加 region 会是永远被忽略的假参数。
+
+/**
+ * 发起登录：后端在本机 `127.0.0.1` 起临时回调监听并返回授权 URL。
+ *
+ * **本函数不会打开浏览器**——调用方拿到 `verificationUri` 后自行打开。
+ * 分开的理由：webui 场景没有系统浏览器可开，只能把链接展示给用户点。
+ *
+ * ## `variant` 是**必填**（编译期护栏）
+ *
+ * 两条产品线各有自己的客户端、数据目录与账号库，授权页也因此不同。
+ * 漏传 = 后端按默认变体（`Trae Work`）处理，于是「在 Trae CN 页面点登录」
+ * 实际会发起 Trae Work 的登录，账号还会落到 Trae Work 的账号库 ——
+ * 用户看到的是「登录成功了但 Trae CN 的列表还是空的」。
+ *
+ * 这里**必填**是有意的：漏传从「运行时静默走错产品线」变成「编译不过」。
+ * 变体的唯一来源是 {@link useTraeVariant}（URL `?line=` 承载），它**永远**返回
+ * 一个变体，所以必填不会让任何调用点写不出来。
+ *
+ * ## 为什么只在这一层必填
+ *
+ * Tauri 命令（`src-tauri/src/commands.rs`）与 server 路由仍收 `Option<String>`：
+ * 那是**跨进程线协议**，老版本客户端可能不传，收紧会破坏兼容。
+ * **「编译期护栏」与「wire 兼容」是两个层次，不要一起改。**
+ */
+export function traeOAuthStart(variant: TraeVariantId): Promise<TraeOAuthStartResult> {
+  return call("trae_oauth_start", variantArgs(variant));
+}
+
+/**
+ * 轮询登录结果。
+ *
+ * **永不抛错**：`{ done: false }` 表示「还没好」，前端据此继续轮询。
+ * 终态时后端会把会话摘掉，再轮询会得到 `done: true` + `error: 不存在或已过期`。
+ */
+export function traeOAuthStatus(loginId: string): Promise<TraeOAuthPollResult> {
+  return call("trae_oauth_status", { loginId });
+}
+
+/** 取消登录（用户关掉对话框），后端随即释放监听端口。 */
+export function traeOAuthCancel(loginId: string): Promise<{ cancelled: boolean }> {
+  return call("trae_oauth_cancel", { loginId });
+}
+
+/** 导出勾选账号的完整记录（含 JWT），由前端落盘。 */
+export function traeExportAccounts(
+  userIds: string[],
+  variant?: TraeVariantId | null,
+): Promise<{ accounts: TraeExportRecord[] }> {
+  return call("trae_export_accounts", { userIds, variant: variant ?? null });
+}
+
+/** 桌面端：把完整记录写入用户选择的路径（系统保存对话框产物）。 */
+export function traeExportAccountsToPath(
+  userIds: string[],
+  path: string,
+  variant?: TraeVariantId | null,
+): Promise<{ path: string; count: number }> {
+  return call("trae_export_accounts_to_path", { userIds, path, variant: variant ?? null });
+}
+
+/** 解析导入文件并回传脱敏预览（不含 JWT 明文，只报有无）。 */
+export function traePreviewImportAccounts(fileText: string): Promise<TraeImportPreview> {
+  return call("trae_preview_import_accounts", { fileText });
+}
+
+/** 按选中索引导入账号，返回计数与最新账号列表。 */
+export function traeImportAccounts(
+  fileText: string,
+  indexes: number[],
+  variant?: TraeVariantId | null,
+): Promise<{ imported: number; skipped: number; overwritten: number; accounts: TraeAccount[] }> {
+  return call("trae_import_accounts", { fileText, indexes, variant: variant ?? null });
+}
+
+/** 分组操作：`create` / `update` / `delete` / `move`。 */
+export function traeGroupOp(
+  action: "create" | "update" | "delete" | "move",
+  params: Record<string, unknown>,
+  variant?: TraeVariantId | null,
+): Promise<{ id?: string; groups?: TraeGroup[]; accounts?: TraeAccount[] }> {
+  return call("trae_group_op", { action, params, variant: variant ?? null });
+}
+
+/**
+ * 批量签到。
+ *
+ * 桌面端会同时派发 `trae-checkin-progress` 事件（逐账号进度）；webui 只在结束时
+ * 拿到完整报告。两端的**返回值形状相同**。
+ *
+ * `variant` 包在 `options` 里（而不是像其他 wrapper 那样放顶层）：
+ * 签到的入参本就整体是一个 options 对象，后端也按这个契约解析，
+ * 再单独加一个顶层字段会让两条通道的契约分叉。
+ */
+export function traeCheckin(options?: {
+  scope?: "all" | "selected" | `group:${string}`;
+  userIds?: string[];
+  skipCheckedIn?: boolean;
+  skipExpired?: boolean;
+  retry?: number;
+  variant?: TraeVariantId | null;
+}): Promise<TraeCheckinReport> {
+  return call("trae_checkin", { options: options ?? {} });
+}
+
+/** 刷新剩余积分（不传 userId 即刷新该产品线全部）。 */
+export function traeRefreshCredits(
+  userId?: string,
+  variant?: TraeVariantId | null,
+): Promise<{ scope: "single" | "all"; userId?: string; credits?: number; refreshed: number }> {
+  return call("trae_refresh_credits", { userId: userId ?? null, variant: variant ?? null });
+}
+
+/** 用 refresh_token 换新 JWT。 */
+export function traeRefreshJwt(
+  userId: string,
+  variant?: TraeVariantId | null,
+): Promise<{ userId: string; jwt: string; jwtExpHours: number | null; accounts: TraeAccount[] }> {
+  return call("trae_refresh_jwt", { userId, variant: variant ?? null });
+}
+
+/** 清除冷却（不传 userId 即清除该产品线全部）。 */
+export function traeClearCooldown(
+  userId?: string,
+  variant?: TraeVariantId | null,
+): Promise<{ scope: "single" | "all"; userId?: string; cleared?: number }> {
+  return call("trae_clear_cooldown", { userId: userId ?? null, variant: variant ?? null });
+}
+
+/**
+ * 切换账号（含「先保存当前登录态」的兜底）。
+ *
+ * `variant` 决定读/写哪条产品线的快照与客户端目录。它是**数据维度**，
+ * 故与其他可选参数同层放在 `options` 里，由后端 `parse_switch_options` 一并解析。
+ */
+export function traeSwitchAccount(options: {
+  userId: string;
+  launch?: boolean;
+  proxyPort?: number | null;
+  resetDevice?: boolean;
+  variant?: TraeVariantId | null;
+}): Promise<TraeSwitchOutcome> {
+  return call("trae_switch_account", {
+    userId: options.userId,
+    launch: options.launch ?? true,
+    proxyPort: options.proxyPort ?? null,
+    resetDevice: options.resetDevice ?? false,
+    variant: options.variant ?? null,
+  });
+}
+
+/** 保存当前登录态到指定账号槽位。 */
+export function traeSaveLogin(
+  userId: string,
+  variant?: TraeVariantId | null,
+): Promise<{ userId: string; fileCount: number }> {
+  return call("trae_save_login", { userId, variant: variant ?? null });
+}
+
+/** 备份当前登录态到槽位。 */
+export function traeBackupProfile(
+  slot: string,
+  variant?: TraeVariantId | null,
+): Promise<{ slot: string; fileCount: number }> {
+  return call("trae_backup_profile", { userId: slot, variant: variant ?? null });
+}
+
+/** 用槽位快照覆盖客户端登录态（高级操作，应在客户端关闭时使用）。 */
+export function traeRestoreProfile(
+  slot: string,
+  variant?: TraeVariantId | null,
+): Promise<{ slot: string; fileCount: number }> {
+  return call("trae_restore_profile", { userId: slot, variant: variant ?? null });
+}
+
+/** 删除登录态快照。 */
+export function traeDeleteProfile(
+  slot: string,
+  variant?: TraeVariantId | null,
+): Promise<{ slot: string }> {
+  return call("trae_delete_profile", { slot, variant: variant ?? null });
+}
+
+/** 重置 6 层设备标识。 */
+export function traeResetDevice(variant?: TraeVariantId | null): Promise<TraeDeviceResetReport> {
+  return call("trae_reset_device", variantArgs(variant));
+}
+
+// ---------------------------------------------------------------------------
+// Trae API 网关（管理面）
+// ---------------------------------------------------------------------------
+//
+// 网关**本体**监听独立端口（默认 7864），不经过这里的 call()：
+// 它是给外部 OpenAI 客户端用的，本模块只负责「配置 / 状态 / 日志 / Key」这四件事。
+
+/** 读取网关配置。 */
+export function getTraeGatewayConfig(): Promise<unknown> {
+  return call("get_trae_gateway_config");
+}
+
+/**
+ * 保存配置并应用（会启动/重启独立监听）。
+ *
+ * 参数用 **snake_case 原始形状**：后端两种拼法都接受（`#[serde(alias)]`），
+ * 但磁盘上的配置文件只应该有一种风格，否则人工编辑时会出现同一个键两种写法。
+ * 页面侧用 `toTraeGatewayConfigRaw()` 从 camelCase 形状转换。
+ */
+export function saveTraeGatewayConfig(config: TraeGatewayConfigRaw): Promise<unknown> {
+  return call("save_trae_gateway_config", { config });
+}
+
+/** 网关运行状态 + 账号池摘要 + 逐账号明细。 */
+export function getTraeGatewayStatus(): Promise<unknown> {
+  return call("trae_gateway_status");
+}
+
+/** 对外暴露的模型清单（OpenAI `/v1/models` 形状）。 */
+export function getTraeGatewayModels(): Promise<unknown> {
+  return call("get_trae_gateway_models");
+}
+
+/** 重新生成 API Key：明文**仅此一次**返回。 */
+export function regenerateTraeApiKey(): Promise<{ ok: boolean; key?: string; prefix?: string }> {
+  return call("regenerate_trae_api_key");
+}
+
+/** 最近 N 条网关请求日志（元数据）。 */
+export function getTraeGatewayLogs(): Promise<unknown> {
+  return call("get_trae_gateway_logs");
+}
+
+/** 清空网关请求日志。 */
+export function clearTraeGatewayLogs(): Promise<{ ok: boolean }> {
+  return call("clear_trae_gateway_logs");
+}
+
+export type { TraeGatewayLogEntry, TraeGatewayStatus };

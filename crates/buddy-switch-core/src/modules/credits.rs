@@ -320,7 +320,16 @@ fn is_transport_error(response: &Value) -> bool {
             .is_some_and(|message| !message.trim().is_empty())
 }
 
-/// 发起需要账号身份的 JSON POST 请求（CN）。
+/// 发起需要账号身份的 JSON POST 请求（CN 薄包装）。
+///
+/// ⚠️ **跨 region 场景禁止使用本函数**，一律用 [`authenticated_post_for`]。
+///
+/// 本函数写死 `Region::Cn`，而这条链路在 token 陈旧时会
+/// **刷新账号并把结果写回该 region 的账号库**（`upsert_account_for`）。
+/// 拿它处理 global 账号的后果不是"请求打错域"这么轻，而是
+/// **global 账号被写进 `accounts.json`（CN 账号库）** ——
+/// `official_usage` 模块就这么踩过一次（Global 统计视图串出 global 账号，
+/// 违反 PRD G1「两版互不污染」）。生产代码已无调用点，保留仅为 CN 语义入口。
 pub async fn authenticated_post(account: &Value, url: &str, body: Value) -> Value {
     authenticated_post_for(Region::Cn, account, url, body).await
 }

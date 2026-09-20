@@ -50,7 +50,7 @@ foreach ($c in @("$nodeDir\npm.cmd", "$nodeDir\npm.ps1", "npm")) {
   if (Test-Path $c) { $npmExe = $c; break }
 }
 if (-not $npmExe) { $npmExe = "npm" }
-Write-Step "[1/4] 工具链: node=$nodeExe`n      npm=$npmExe"
+Write-Step "[1/5] 工具链: node=$nodeExe`n      npm=$npmExe"
 
 # cargo / rustup
 if (-not (Get-Command cargo.exe -ErrorAction SilentlyContinue)) {
@@ -68,16 +68,33 @@ if (-not (Get-Command cargo.exe -ErrorAction SilentlyContinue)) {
   exit 1
 }
 
-# ---------- 2. 更新签名密钥检测 ----------
+# ---------- 2. 打版本戳 ----------
+# 版本号改为**打包时从系统时间推导**（`<YYYY>.<M>.<DHHMM>`），不再手工 bump。
+# 必须在 tauri build **之前**执行：tauri 从 package.json / tauri.conf.json 取版本，
+# 而 4 个 crate 的 `env!("CARGO_PKG_VERSION")` 会在编译期被嵌入，
+# 漏掉任何一处都会出现「安装包版本 ≠ API 服务页显示版本」。
+# 版本形态必须是 3 段 —— Cargo 拒绝 4 段 semver，详见 stamp-version.sh 头部文档。
+Write-Step "[2/5] 计算并写入打包版本号 ..."
+$stampScript = Join-Path $PSScriptRoot "stamp-version.sh"
+if (Test-Path $stampScript) {
+  & bash $stampScript
+  if ($LASTEXITCODE -ne 0) { Write-Error "版本戳写入失败。"; exit 1 }
+} else {
+  Write-Step "  未找到 stamp-version.sh，沿用 package.json 中的既有版本。" "Yellow"
+}
+$stampedVer = ((Get-Content (Join-Path $Root "package.json") -Raw | ConvertFrom-Json).version)
+Write-Step "  本次打包版本：$stampedVer" "Green"
+
+# ---------- 3. 更新签名密钥检测 ----------
 $keyPath = Join-Path $env:USERPROFILE ".buddy-switch\buddy-switch-updater.key"
 $tempCfg = $null
 $tauriArgs = @("build")
 if (Test-Path $keyPath) {
   $env:TAURI_SIGNING_PRIVATE_KEY = (Get-Content $keyPath -Raw).Trim()
   $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = $SignPassword
-  Write-Step "[2/4] 检测到更新签名密钥，将生成 updater 产物。" "Green"
+  Write-Step "[3/5] 检测到更新签名密钥，将生成 updater 产物。" "Green"
 } else {
-  Write-Step "[2/4] 未检测到 $keyPath，仅打包本地安装包（跳过 updater 签名）。" "Yellow"
+  Write-Step "[3/5] 未检测到 $keyPath，仅打包本地安装包（跳过 updater 签名）。" "Yellow"
   # 缺密钥时若 createUpdaterArtifacts=true 会构建失败，改用临时配置关掉它
   $tempCfg = Join-Path $env:TEMP "buddy-switch-no-updater.json"
   Set-Content -Encoding UTF8 $tempCfg '{ "bundle": { "createUpdaterArtifacts": false } }'
@@ -86,17 +103,28 @@ if (Test-Path $keyPath) {
 if ($Mode -eq "debug") { $tauriArgs += "--debug" }
 $tauriArgs += "--bundles"; $tauriArgs += "nsis"
 
-# ---------- 3. 构建 ----------
-Write-Step "[3/4] 开始 tauri build ($Mode, nsis) ..."
+# ---------- 4. 构建 ----------
+Write-Step "[4/5] 开始 tauri build ($Mode, nsis, v$stampedVer) ..."
 & $npmExe run tauri -- @tauriArgs
-if ($LASTEXITCODE -ne 0) {
+$buildExit = $LASTEXITCODE
+if ($buildExit -ne 0) {
   if ($tempCfg) { Remove-Item $tempCfg -ErrorAction SilentlyContinue }
-  Write-Error "构建失败 (exit $LASTEXITCODE)。"
-  exit $LASTEXITCODE
+  if ($null -eq $buildExit) {
+    # 退出码为 $null 说明「子进程压根没启动起来」，这和「编译报错」是两回事，
+    # 不要混在一起报，否则只能看到一句 "exit " 完全没法排查。
+    # 实测成因：环境块里同时存在 http_proxy 与 HTTP_PROXY 两种写法时，
+    # .NET 构造子进程环境会抛「字典中的关键字重复」，任何原生命令都起不来
+    # （WorkBuddy 的 PowerShell 宿主就是这种情况）。遇到它请改用 bash/CMD
+    # 直接执行：npx tauri build --bundles nsis --ci
+    Write-Error "构建失败：未能启动构建进程（未取得退出码，不是编译错误）。"
+  } else {
+    Write-Error "构建失败 (exit $buildExit)。"
+  }
+  exit 1
 }
 
-# ---------- 4. 收集产物 ----------
-Write-Step "[4/4] 收集产物 ..."
+# ---------- 5. 收集产物 ----------
+Write-Step "[5/5] 收集产物 ..."
 $ver = ((Get-Content package.json -Raw | ConvertFrom-Json).version)
 $bundleDir = Join-Path $Root "src-tauri\target\$Mode\bundle\nsis"
 if (-not (Test-Path $bundleDir)) { $bundleDir = Join-Path $Root "target\$Mode\bundle\nsis" }
@@ -107,6 +135,16 @@ if ($out) {
   if (-not (Test-Path $destDir)) { New-Item -ItemType Directory -Path $destDir | Out-Null }
   Copy-Item $out.FullName (Join-Path $destDir $out.Name) -Force
   Write-Step "[ok] 已复制 -> deliverables\$($out.Name)" "Green"
+
+  # .sig 必须跟着安装包一起发布：客户端下载后要拿它做 minisign 验签，
+  # 缺了它自动更新会在「签名缺失/不匹配」处失败，而安装包本身看起来完全正常。
+  $sig = "$($out.FullName).sig"
+  if (Test-Path $sig) {
+    Copy-Item $sig (Join-Path $destDir "$($out.Name).sig") -Force
+    Write-Step "[ok] 已复制 -> deliverables\$($out.Name).sig" "Green"
+  } else {
+    Write-Step "[warn] 未找到 $($out.Name).sig（未启用 updater 签名时不会有，属正常）。" "Yellow"
+  }
 } else {
   Write-Step "[warn] 未找到 $bundleDir\*.exe，请检查构建输出。" "Yellow"
 }

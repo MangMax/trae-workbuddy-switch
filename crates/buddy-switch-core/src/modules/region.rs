@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use crate::modules::config::{home_dir, store_dir};
+use crate::modules::config::{home_dir, official_usage_cache_file, store_dir};
 
 /// 目标版本。CN 为既有默认，Global 为国际版。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -256,6 +256,25 @@ pub fn gateway_keys_file() -> PathBuf {
 /// 目录缓存文件路径：`~/.buddy-switch/gateway_models.<region>.json`。
 pub fn catalog_cache_file(region: Region) -> PathBuf {
     store_dir().join(format!("gateway_models.{}.json", region.as_str()))
+}
+
+/// 官方用量缓存文件路径。
+///
+/// CN 沿用既有 `official_usage_cache.json`（**零迁移**：老用户的缓存继续命中，
+/// 不会因为这次 region 化而白跑一次采集）；Global 用 `official_usage_cache.global.json`
+/// （与 `accounts.global.json` 同一命名习惯）。
+///
+/// **为什么必须分家**：该缓存是「一次性采集结果」，payload 里的 `accounts[]` 就是
+/// 本次采集用的账号集合。若两版共用一个文件（或一份进程内记忆），先看 Global 视图
+/// 再看 CN 视图时，CN 视图会**命中 Global 的采集结果**；而前端把
+/// `officialUsage.accounts` 直接当作账号列表用（`CreditStatsPage` 的
+/// `filterAccounts = official ? official.accounts : stats.accounts`），
+/// 结果就是 CN 视图里列出 Global 账号——违反 PRD G1「两版互不污染」。
+pub fn official_usage_cache_file_for(region: Region) -> PathBuf {
+    match region {
+        Region::Cn => official_usage_cache_file(),
+        Region::Global => store_dir().join("official_usage_cache.global.json"),
+    }
 }
 
 /// 账号库文件所在目录（与 `home_dir()` 一致），供诊断文案使用。

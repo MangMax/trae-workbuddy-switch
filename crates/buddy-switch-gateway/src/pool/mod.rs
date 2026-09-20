@@ -1615,4 +1615,29 @@ mod tests {
         assert_eq!(entry.credits_expiring, 10);
         let _ = std::fs::remove_file(&path);
     }
+
+    #[test]
+    fn thaw_requires_hard_cool_kind_even_when_reason_matches() {
+        // `reason` 是字符串匹配，将来若有人改文案、或误把软冷却的 reason 也写成「余额不足」，
+        // `cool_kind == Some(Hard)` 就是唯一防线。本用例把「软冷却 + reason 含余额不足」钉死：
+        // 余额为正也不得解冻。
+        let mut pool = Pool::new(PoolConfig::default());
+        pool.upsert("u1", Some(RealmTag::Cn), "");
+        {
+            let entry = pool.entries.get_mut("u1").unwrap();
+            entry.cool_kind = Some(CoolKind::Soft);
+            entry.until_ms = 9_999_999_999_999;
+            // 含 HARD_CREDIT_COOLDOWN_REASON 子串，但冷却类别是软冷却。
+            entry.reason = format!("上游提示：{}（soft）", HARD_CREDIT_COOLDOWN_REASON);
+        }
+
+        assert!(
+            !pool.thaw_hard_credit_if_recovered("u1", 500),
+            "软冷却即使 reason 含「余额不足」也不得解冻（唯一防线是 cool_kind==Hard）"
+        );
+        let entry = pool.get("u1").unwrap();
+        assert_eq!(entry.cool_kind, Some(CoolKind::Soft), "冷却类别不得被改动");
+        assert_eq!(entry.until_ms, 9_999_999_999_999, "冷却截止不得被清除");
+        assert!(entry.reason.contains(HARD_CREDIT_COOLDOWN_REASON), "reason 不得被改动");
+    }
 }

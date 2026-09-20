@@ -27,7 +27,10 @@ export function Toaster(props: ToasterProps) {
             "!gap-2.5 !rounded-lg !border-slate-200/90 !bg-popover !px-3 !py-2.5 !text-popover-foreground !shadow-[0_8px_24px_rgba(15,23,42,.09)]",
           content: "!gap-0.5",
           title: "!text-[13px] !font-medium !leading-5",
-          description: "!text-xs !leading-5 !text-muted-foreground",
+          // `!whitespace-pre-line`：诊断类错误是**多行**文案（说清产品线 / 缺失来源 /
+          // 下一步动作，见 `trae::profile::diagnose_missing_credential`）。默认
+          // `white-space: normal` 会把换行折叠成空格，整段挤成一坨，反而读不出重点。
+          description: "!text-xs !leading-5 !text-muted-foreground !whitespace-pre-line",
           icon: "!mr-0 !self-start !pt-0.5",
           closeButton:
             "!size-5 !border-slate-200 !bg-popover !text-muted-foreground !shadow-sm hover:!bg-accent hover:!text-foreground focus-visible:!ring-2 focus-visible:!ring-brand/30",

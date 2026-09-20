@@ -1,0 +1,530 @@
+import { ArrowRight, Check, Clock3, Coins, Ellipsis, KeyRound, Loader2, Plug, Save, Sparkles, Trash2, CircleSlash } from "lucide-react";
+import { useState } from "react";
+
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { DemoAction } from "@/components/demo-action";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { avatarTone } from "@/components/account-card";
+import { TraeMark } from "@/components/product-marks";
+import { cn } from "@/lib/utils";
+import type { TraeAccount, TraeJwtStatus } from "@/lib/trae-types";
+
+const chipClass = "rounded-md px-1.5 py-0 text-[11px] font-medium";
+
+/** 剩余小时数 → 可读文案。 */
+export function hoursText(hours: number | null): string {
+  if (hours === null || !Number.isFinite(hours)) return "未知";
+  if (hours <= 0) return "已过期";
+  if (hours < 1) return `${Math.round(hours * 60)} 分钟`;
+  if (hours < 48) return `${hours.toFixed(1)} 小时`;
+  return `${Math.floor(hours / 24)} 天`;
+}
+
+/** Unix 秒 → `MM-DD HH:mm`。 */
+export function shortTime(seconds: number | null): string {
+  if (!seconds) return "—";
+  const date = new Date(seconds * 1000);
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+/** JWT 状态 → Badge 变体与文案。 */
+export function jwtBadge(status: TraeJwtStatus, hours: number | null) {
+  switch (status) {
+    case "ok":
+      return { variant: "secondary" as const, className: "", text: `有效 ${hoursText(hours)}` };
+    case "warn":
+      return {
+        variant: "secondary" as const,
+        className: "bg-amber-500/15 text-amber-700 dark:text-amber-400",
+        text: `临期 ${hoursText(hours)}`,
+      };
+    case "expired":
+      return { variant: "destructive" as const, className: "", text: "已过期" };
+    default:
+      return { variant: "outline" as const, className: "", text: "无法解析" };
+  }
+}
+
+function formatCredits(value: number | null): string {
+  if (value === null || !Number.isFinite(value)) return "—";
+  return new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 }).format(value);
+}
+
+/** Unix 秒 → `MM/DD 到期`（与 WorkBuddy 卡片的 `formatCreditExpiry` 同形）。 */
+function formatExpiryShort(seconds: number | null): string {
+  if (!seconds) return "长期有效";
+  const date = new Date(seconds * 1000);
+  if (Number.isNaN(date.getTime())) return "长期有效";
+  return `${String(date.getMonth() + 1).padStart(2, "0")}/${String(date.getDate()).padStart(2, "0")} 到期`;
+}
+
+/** Unix 秒 → `YYYY/MM/DD`。 */
+function formatFullDate(seconds: number | null): string {
+  if (!seconds) return "—";
+  const date = new Date(seconds * 1000);
+  if (Number.isNaN(date.getTime())) return "—";
+  return date.toLocaleDateString("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit" });
+}
+
+interface Props {
+  account: TraeAccount;
+  /** 分组名（用于展示归属；未分组时传 null）。 */
+  groupName?: string | null;
+  /** 是否为当前登录账号（由「登录态快照」的 `currentAccount` 判定）。 */
+  current?: boolean;
+  /** 紧凑模式：头部缩成一条、按钮图标化、无 footer */
+  compact?: boolean;
+  /** 当前正在执行的动作 key（`switch-<uid>` / `save-<uid>` / …），用于把忙状态落到具体按钮上。 */
+  busy?: string | null;
+  /** 任一账号正在切换中，用于阻止并发切换。 */
+  switchBusy?: boolean;
+  /** 演示模式等场景下禁用所有写操作。 */
+  featuresDisabled?: boolean;
+  onSwitch: (account: TraeAccount) => void;
+  onSaveLogin: (account: TraeAccount) => void;
+  onRefreshJwt: (account: TraeAccount) => void;
+  onClearCooldown: (account: TraeAccount) => void;
+  onDelete: (account: TraeAccount) => void;
+}
+
+/**
+ * Trae 账号卡片。
+ *
+ * 结构与 WorkBuddy 的 `AccountCard` 一一对应（同样的 header/body/footer 三段、
+ * 同样的紧凑模式断点、同样的「当前账号」角标与操作菜单），差异只在数据源：
+ * Trae 的额度单位是积分、登录凭据是 JWT、切换动作是重启 Trae 客户端。
+ * 两个分区的卡片保持同形，用户在产品 Tab 之间来回切换时不需要重新学习界面。
+ */
+export function TraeAccountCard({
+  account,
+  groupName,
+  current = false,
+  compact = false,
+  busy = null,
+  switchBusy = false,
+  featuresDisabled = false,
+  onSwitch,
+  onSaveLogin,
+  onRefreshJwt,
+  onClearCooldown,
+  onDelete,
+}: Props) {
+  const name = account.name || `UID · ${account.userId}`;
+  const badge = jwtBadge(account.jwtStatus, account.jwtExpHours);
+  const switching = busy === `switch-${account.userId}`;
+  const saving = busy === `save-${account.userId}`;
+  const refreshingJwt = busy === `jwt-${account.userId}`;
+  const thawing = busy === `thaw-${account.userId}`;
+  const deleting = busy === `delete-${account.userId}`;
+  const hasCredits = account.remainingCredits !== null;
+  const [detailOpen, setDetailOpen] = useState(false);
+
+  /**
+   * 正文行列表。
+   *
+   * 与 WorkBuddy 卡片正文的「标签 / 值」两列行同构（`grid-cols-[auto_minmax(0,1fr)]`），
+   * 但**不搬 WorkBuddy 的字段**：Trae 没有积分包（package）粒度数据，
+   * 因此这里放的是 Trae 真实持有的账号属性——设备、JWT 到期、加入时间、最近更新。
+   */
+  const detailRows: { label: string; value: string; title?: string }[] = [
+    { label: "设备", value: account.deviceIdMasked || "—" },
+    {
+      label: "JWT 到期",
+      value: account.jwtExpTimestamp ? shortTime(account.jwtExpTimestamp) : "无法解析",
+      title: badge.text,
+    },
+    {
+      label: "加入时间",
+      value: account.addedAt ? formatFullDate(Math.floor(new Date(account.addedAt).getTime() / 1000)) : "—",
+    },
+    {
+      label: "最近更新",
+      value: account.updatedAt ? shortTime(Math.floor(new Date(account.updatedAt).getTime() / 1000)) : "—",
+    },
+    ...(groupName ? [{ label: "分组", value: groupName }] : []),
+  ];
+
+  /**
+   * 状态标签。
+   *
+   * 紧凑模式的卡片只有约 300px 宽，标签是 `shrink-0` 的，塞不下四个（冷却标签还带时间戳）。
+   * 因此紧凑模式只保留「凭据状态 + 签到状态 + 冷却中」三枚短标签，冷却详情与分组
+   * 分别由卡片正文与宽松模式承载——宁可少展示，也不要让标签溢出到按钮上。
+   */
+  const statusChips = (
+    <>
+      <Badge variant={badge.variant} className={cn(chipClass, badge.className)}>
+        {badge.text}
+      </Badge>
+      <Badge variant={account.checkedToday ? "success" : "secondary"} className={cn(chipClass, !account.checkedToday && "text-muted-foreground")}>
+        {account.checkedToday ? "已签到" : "未签到"}
+      </Badge>
+      {account.cooldownType &&
+        (compact ? (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Badge variant="warning" className={chipClass}>
+                冷却中
+              </Badge>
+            </TooltipTrigger>
+            <TooltipContent side="top">
+              {account.cooldownType}
+              {account.cooldownUntil ? ` · 至 ${shortTime(account.cooldownUntil)}` : ""}
+              {account.cooldownReason ? ` · ${account.cooldownReason}` : ""}
+            </TooltipContent>
+          </Tooltip>
+        ) : (
+          <Badge variant="warning" className={chipClass}>
+            {account.cooldownType}
+            {account.cooldownUntil ? ` · ${shortTime(account.cooldownUntil)}` : ""}
+          </Badge>
+        ))}
+      {!compact && groupName && (
+        <Badge variant="secondary" className={cn(chipClass, "text-muted-foreground")}>
+          {groupName}
+        </Badge>
+      )}
+      {!compact && account.hasRefreshToken && (
+        <Badge variant="secondary" className={cn(chipClass, "text-muted-foreground")}>
+          {account.jwtAutoRefresh ? "自动刷新 JWT" : "支持刷新 JWT"}
+        </Badge>
+      )}
+    </>
+  );
+
+  /** 「当前账号」角标 / 「切换」按钮——与 WorkBuddy 卡片的当前账号位完全同构。 */
+  const switchControl = current ? (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span className="relative inline-flex size-7 items-center justify-center rounded-lg border border-primary/25 bg-primary/10 text-primary">
+          <TraeMark size={15} />
+          <span className="absolute -right-1 -top-1 flex size-3.5 items-center justify-center rounded-full bg-primary text-primary-foreground">
+            <Check className="size-2.5" strokeWidth={3} />
+          </span>
+        </span>
+      </TooltipTrigger>
+      <TooltipContent side="top">Trae 当前账号</TooltipContent>
+    </Tooltip>
+  ) : (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button
+          variant="outline"
+          size="icon"
+          className="size-7 rounded-lg"
+          disabled={featuresDisabled || switchBusy}
+          onClick={() => onSwitch(account)}
+          aria-label="切换为 Trae 当前账号"
+          aria-busy={switching}
+        >
+          {switching ? <Loader2 className="size-3.5 animate-spin" /> : <TraeMark size={15} />}
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent side="top">切换为 Trae 当前账号（会重启 Trae）</TooltipContent>
+    </Tooltip>
+  );
+
+  const menu = (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button variant="ghost" size="icon" className={cn("rounded-lg text-muted-foreground hover:text-foreground", compact ? "size-7" : "size-8")} aria-label={`管理账号 ${name}`} title="更多账号操作">
+          <Ellipsis />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-44">
+        <DropdownMenuItem disabled={featuresDisabled || saving} onSelect={() => onSaveLogin(account)}>
+          <Save />保存登录态
+        </DropdownMenuItem>
+        {account.hasRefreshToken && (
+          <DropdownMenuItem disabled={featuresDisabled || refreshingJwt} onSelect={() => onRefreshJwt(account)}>
+            <KeyRound />刷新 JWT
+          </DropdownMenuItem>
+        )}
+        {account.cooldownType && (
+          <DropdownMenuItem disabled={featuresDisabled || thawing} onSelect={() => onClearCooldown(account)}>
+            <CircleSlash />解除冷却
+          </DropdownMenuItem>
+        )}
+        <DropdownMenuSeparator />
+        <DropdownMenuItem
+          className="text-destructive focus:bg-destructive/5 focus:text-destructive"
+          disabled={deleting}
+          onSelect={() => onDelete(account)}
+        >
+          <Trash2 />删除账号
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+
+  return (
+    <TooltipProvider>
+      <article className="flex min-w-0 flex-col overflow-hidden rounded-2xl border border-border bg-card shadow-[0_1px_2px_rgba(15,23,42,.025),0_10px_28px_rgba(15,23,42,.035)] transition-shadow hover:shadow-[0_2px_4px_rgba(15,23,42,.04),0_14px_34px_rgba(15,23,42,.055)]">
+        <header
+          className={cn(
+            "relative flex items-center border-b border-border",
+            compact ? "min-h-[52px] px-3.5 py-1.5" : "min-h-[104px] px-5 py-3",
+            current ? "bg-primary/5" : "bg-muted/30",
+          )}
+        >
+          <div className="pointer-events-none absolute inset-0 overflow-hidden">
+            <div className={cn("absolute -right-10 -top-16 rounded-full blur-2xl", compact ? "size-20" : "size-24", current ? "bg-primary/15" : "bg-muted/30")} />
+            {current && (
+              <div className={cn("absolute right-5 top-[64%] -translate-y-1/2 rotate-[7deg] opacity-[0.075] saturate-50 grayscale-[10%]")}>
+                <TraeMark size={compact ? 40 : 56} />
+              </div>
+            )}
+          </div>
+
+          <div className={cn("absolute z-20", compact ? "right-2.5 top-1/2 -translate-y-1/2" : "right-3.5 top-3.5")}>
+            {featuresDisabled ? (
+              <DemoAction>
+                <Button variant="ghost" size="icon" className={cn("rounded-lg text-muted-foreground hover:text-foreground", compact ? "size-7" : "size-8")} aria-label={`管理账号 ${name}`} title="更多账号操作">
+                  <Ellipsis />
+                </Button>
+              </DemoAction>
+            ) : (
+              menu
+            )}
+          </div>
+
+          {compact ? (
+            <div className="relative z-10 flex w-full min-w-0 items-center gap-2 pr-10">
+              <h3 className="min-w-0 flex-1 truncate text-[13px] font-semibold leading-5" title={name}>{name}</h3>
+              <div className="hidden min-w-0 overflow-hidden shrink-0 items-center gap-1 min-[420px]:flex">{statusChips}</div>
+              <div className="ml-auto flex shrink-0 items-center gap-1">{switchControl}</div>
+            </div>
+          ) : (
+            <div className="relative z-10 flex w-full min-w-0 items-center gap-3 pr-[112px]">
+              <div className={cn("flex size-12 shrink-0 items-center justify-center rounded-full text-base font-semibold ring-4 ring-white/65", avatarTone(name))}>
+                {name.charAt(0).toUpperCase()}
+              </div>
+              <div className="min-w-0 flex-1">
+                <h3 className="truncate text-sm font-semibold leading-5" title={name}>{name}</h3>
+                <p className="mt-0.5 truncate text-xs leading-5 text-muted-foreground" title={account.userId}>
+                  UID · {account.userId}
+                </p>
+                <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-1.5">{statusChips}</div>
+              </div>
+            </div>
+          )}
+        </header>
+
+        <section className={cn("flex min-w-0 flex-1 flex-col", compact ? "px-3.5 pb-3 pt-3" : "px-5 pb-4 pt-4")}>
+          {/* 大数字行：与 WorkBuddy 卡片同一位置、同一字号层级与图标用法。 */}
+          <div className="flex items-baseline gap-x-3 gap-y-1">
+            <span className="flex items-center gap-1.5">
+              <Sparkles className="size-4 shrink-0 stroke-[1.75] text-muted-foreground" aria-hidden="true" />
+              <strong
+                className={cn("font-semibold leading-none tabular-nums tracking-[-0.025em]", compact ? "text-[20px]" : "text-[22px]")}
+                style={{ fontFamily: '"Bricolage Grotesque Variable", "SF Pro Display", ui-sans-serif, sans-serif' }}
+              >
+                {formatCredits(account.remainingCredits)}
+              </strong>
+            </span>
+            <span className={cn("text-muted-foreground", compact ? "text-[11px]" : "text-xs")}>
+              {hasCredits ? "剩余积分" : "积分未查询"}
+            </span>
+            <div
+              className={cn("ml-auto flex items-center gap-1.5 text-muted-foreground", compact ? "text-[11px]" : "text-xs")}
+              title={
+                account.cooldownUntil
+                  ? `冷却至 ${shortTime(account.cooldownUntil)}`
+                  : account.creditsExpireAt
+                    ? `最早到期 ${shortTime(account.creditsExpireAt)}`
+                    : "暂无到期时间"
+              }
+            >
+              <Clock3 className="size-3.5 shrink-0" />
+              <span className="whitespace-nowrap tabular-nums">
+                {account.creditsExpireAt ? formatExpiryShort(account.creditsExpireAt) : "暂无到期"}
+              </span>
+            </div>
+          </div>
+
+          {/* 冷却 / 未查询提示：与 WorkBuddy 的积分错误行同形（同一图标位、同一配色语义）。 */}
+          {account.cooldownType ? (
+            <div className={cn("flex min-w-0 items-center gap-2 text-destructive", compact ? "mt-3 text-[11px]" : "mt-4 text-xs")}>
+              <Coins className="size-4 shrink-0" />
+              <span className="min-w-0 truncate">{account.cooldownReason || `冷却中（${account.cooldownType}）`}</span>
+            </div>
+          ) : !hasCredits ? (
+            <div className={cn("flex min-w-0 items-center gap-2 text-muted-foreground", compact ? "mt-3 text-[11px]" : "mt-4 text-xs")}>
+              <Coins className="size-4 shrink-0" />
+              <span className="min-w-0 truncate">尚未查询到积分，点右上角菜单「刷新积分」重试</span>
+            </div>
+          ) : null}
+
+          {/* 账号信息：WorkBuddy 在「近期到期」位放积分包进度条；Trae 无包粒度数据，
+              故按用户决议「照抄结构，数据照实」放真实的账号属性行。 */}
+          <div className={cn("text-[11px] font-medium text-muted-foreground", compact ? "mt-3" : "mt-4")}>账号信息</div>
+          <div className={cn(compact ? "mt-1.5 space-y-1.5" : "mt-2 space-y-2")}>
+            {detailRows.map((row) => (
+              <div
+                key={row.label}
+                className={cn("grid min-w-0 grid-cols-[auto_minmax(0,1fr)] items-center gap-3", compact ? "text-[11px]" : "text-xs")}
+              >
+                <span className="shrink-0 text-muted-foreground">{row.label}</span>
+                <span className="min-w-0 truncate text-right font-mono tabular-nums text-foreground/80" title={row.title ?? row.value}>
+                  {row.value}
+                </span>
+              </div>
+            ))}
+          </div>
+
+          {/* 「查看全部」链接位：WorkBuddy 是积分包明细弹窗；Trae 放登录态与凭据明细。 */}
+          <button
+            type="button"
+            className={cn(
+              "inline-flex w-fit items-center gap-1.5 font-medium text-primary transition-colors hover:text-primary/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30",
+              compact ? "mt-2 text-[11px]" : "mt-3 text-xs",
+            )}
+            onClick={() => setDetailOpen(true)}
+          >
+            查看账号详情
+            <ArrowRight className="size-3.5" />
+          </button>
+        </section>
+
+        {!compact && (
+          <footer className="flex flex-wrap items-center gap-2.5 border-t px-5 py-2.5">
+            {current ? (
+              <span
+                role="status"
+                aria-label="Trae 当前账号"
+                title="Trae 当前账号"
+                className="inline-flex h-7 items-center gap-2 rounded-full border border-primary/25 bg-primary/10 px-2.5 text-xs text-primary shadow-[inset_0_1px_0_rgba(255,255,255,.8)]"
+              >
+                <TraeMark size={18} />
+                <Check className="size-3.5" strokeWidth={2.25} />
+              </span>
+            ) : featuresDisabled ? (
+              <DemoAction>
+                <Button variant="outline" size="sm" className="h-7 rounded-full px-2.5 pr-3.5 text-xs" aria-label="切换为 Trae 当前账号">
+                  <TraeMark size={18} /><span>切换</span>
+                </Button>
+              </DemoAction>
+            ) : (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-7 rounded-full px-2.5 pr-3.5 text-xs"
+                    disabled={switchBusy}
+                    onClick={() => onSwitch(account)}
+                    aria-busy={switching}
+                  >
+                    {switching ? <Loader2 className="size-4 animate-spin" /> : <TraeMark size={18} />}
+                    <span>{switching ? "切换中…" : "切换"}</span>
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="top">切换为 Trae 当前账号（会重启 Trae）</TooltipContent>
+              </Tooltip>
+            )}
+
+            {featuresDisabled ? (
+              <DemoAction>
+                <Button variant="outline" size="sm" className="h-7 rounded-full px-2.5 pr-3.5 text-xs" aria-label="保存登录态">
+                  <Save className="size-4" /><span>保存登录态</span>
+                </Button>
+              </DemoAction>
+            ) : (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-7 rounded-full px-2.5 pr-3.5 text-xs"
+                    disabled={saving}
+                    onClick={() => onSaveLogin(account)}
+                    aria-busy={saving}
+                  >
+                    {saving ? <Loader2 className="size-4 animate-spin" /> : <Save className="size-4" />}
+                    <span>{saving ? "保存中…" : "保存登录态"}</span>
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="top">把当前 Trae 登录态备份到该账号槽位</TooltipContent>
+              </Tooltip>
+            )}
+
+            {account.hasRefreshToken && !featuresDisabled && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-7 rounded-full px-2.5 pr-3.5 text-xs"
+                    disabled={refreshingJwt}
+                    onClick={() => onRefreshJwt(account)}
+                    aria-busy={refreshingJwt}
+                  >
+                    {refreshingJwt ? <Loader2 className="size-4 animate-spin" /> : <KeyRound className="size-4" />}
+                    <span>{refreshingJwt ? "刷新中…" : "刷新 JWT"}</span>
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="top">用 refresh token 换一份新的 JWT</TooltipContent>
+              </Tooltip>
+            )}
+
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span className="ml-auto inline-flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                  <Plug className="size-3.5" />
+                  {account.updatedAt ? `${shortTime(Math.floor(new Date(account.updatedAt).getTime() / 1000))} 更新` : "未记录更新时间"}
+                </span>
+              </TooltipTrigger>
+              <TooltipContent side="top">该账号在本地账号库中的最近更新时间</TooltipContent>
+            </Tooltip>
+          </footer>
+        )}
+      </article>
+
+      {/* 账号详情弹窗：对应 WorkBuddy 卡片的「全部积分包」Dialog。
+          Trae 没有包粒度数据，因此换成本账号的全部凭据与状态字段，
+          把卡片上被截断的信息完整列出来。 */}
+      <Dialog open={detailOpen} onOpenChange={setDetailOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>账号详情</DialogTitle>
+            <DialogDescription>
+              {name} · UID {account.userId}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="max-h-[60vh] min-w-0 space-y-3 overflow-y-auto">
+            {(
+              [
+                { label: "账号 ID", value: account.userId },
+                { label: "分组", value: groupName ?? "未分组" },
+                { label: "剩余积分", value: account.remainingCredits === null ? "未查询" : formatCredits(account.remainingCredits) },
+                { label: "积分到期", value: account.creditsExpireAt ? formatFullDate(account.creditsExpireAt) : "长期有效" },
+                { label: "JWT 状态", value: badge.text },
+                { label: "JWT 到期", value: account.jwtExpTimestamp ? `${formatFullDate(account.jwtExpTimestamp)} ${shortTime(account.jwtExpTimestamp).slice(-5)}` : "无法解析" },
+                { label: "自动刷新 JWT", value: account.hasRefreshToken ? (account.jwtAutoRefresh ? "已开启" : "可手动刷新") : "无 refresh token" },
+                { label: "设备标识", value: account.deviceIdMasked || "—" },
+                { label: "加入时间", value: account.addedAt ? formatFullDate(Math.floor(new Date(account.addedAt).getTime() / 1000)) : "—" },
+                { label: "最近更新", value: account.updatedAt ? shortTime(Math.floor(new Date(account.updatedAt).getTime() / 1000)) : "—" },
+                { label: "冷却", value: account.cooldownType ? `${account.cooldownType}${account.cooldownUntil ? ` · 至 ${shortTime(account.cooldownUntil)}` : ""}` : "无" },
+              ] as { label: string; value: string }[]
+            ).map((row) => (
+              <div key={row.label} className="min-w-0">
+                <div className="text-[11px] text-muted-foreground">{row.label}</div>
+                <div className="mt-0.5 break-all font-mono text-xs text-foreground/90">{row.value}</div>
+              </div>
+            ))}
+          </div>
+        </DialogContent>
+      </Dialog>
+    </TooltipProvider>
+  );
+}

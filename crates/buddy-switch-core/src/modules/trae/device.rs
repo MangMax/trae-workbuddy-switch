@@ -266,11 +266,6 @@ pub struct OAuthLoginMachine {
     pub machine_id: String,
 }
 
-/// 取（必要时生成并落盘）某变体的 OAuth 登录 `machine_id`（默认变体，兼容壳）。
-pub fn oauth_login_machine() -> OAuthLoginMachine {
-    oauth_login_machine_for(TraeVariant::default())
-}
-
 /// 取（必要时生成并落盘）某变体的 OAuth 登录 `machine_id`（按变体分家）。
 ///
 /// **纯本机值，不读 `storage.json`**：授权 URL 在用户点授权之前就要打开，
@@ -517,6 +512,52 @@ mod tests {
 
             let healed = oauth_login_machine_for(TraeVariant::TraeWork);
             assert_eq!(healed.machine_id.len(), 32);
+            let reloaded: OAuthLoginMachine = store::read_json(&path);
+            assert_eq!(reloaded, healed, "自愈结果必须落盘");
+        });
+    }
+
+    /// ★ 旧 schema 的文件必须被**安全**读入 —— 真实用户升级后人人都是这个形态。
+    ///
+    /// 返工前本文件存的是 `{seed, device_id, machine_id}` 三键（当时的类型叫
+    /// `OAuthLoginDevice`，`device_id` 还是自造的 15 位数字）。新结构体只认
+    /// `machine_id`，所以必须钉住两件事：
+    ///
+    /// 1. **读得进**：未知键（`seed` / `device_id`）不能让反序列化失败
+    ///    —— 失败会退化成「重新随机」，登录身份随之漂移；
+    /// 2. **不产出半残值**：连 `machine_id` 都没有的更早期文件必须**自愈**成
+    ///    合法的 32 位 hex，而不是留下空串（空串会让授权 URL 少参数）。
+    #[test]
+    fn oauth_login_machine_reads_legacy_schema_safely() {
+        with_temp_home(|_| {
+            let path = crate::modules::trae::paths::oauth_device_file_for(TraeVariant::TraeWork);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+            // ① 逐字复刻返工前的落盘形态。
+            std::fs::write(
+                &path,
+                r#"{
+  "seed": "ef73197b3b8e42ca8c387a677fb2e02f",
+  "device_id": "087133290180569",
+  "machine_id": "66d9edd2b8a323aa58e624eacce943d3"
+}"#,
+            )
+            .unwrap();
+            let machine = oauth_login_machine_for(TraeVariant::TraeWork);
+            assert_eq!(
+                machine.machine_id, "66d9edd2b8a323aa58e624eacce943d3",
+                "旧文件里的 machine_id 必须原样保留（重新生成会让登录身份漂移）"
+            );
+
+            // ② 更早期的形态：只有 `seed` / `device_id`，没有 `machine_id`。
+            std::fs::write(&path, r#"{"seed":"abc","device_id":"123456789012345"}"#).unwrap();
+            let healed = oauth_login_machine_for(TraeVariant::TraeWork);
+            assert_eq!(healed.machine_id.len(), 32, "缺 machine_id 时必须自愈，不能留空");
+            assert!(
+                healed.machine_id.chars().all(|c| c.is_ascii_hexdigit()),
+                "自愈值必须是 hex，实际为 {}",
+                healed.machine_id
+            );
             let reloaded: OAuthLoginMachine = store::read_json(&path);
             assert_eq!(reloaded, healed, "自愈结果必须落盘");
         });

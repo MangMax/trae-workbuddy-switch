@@ -457,13 +457,44 @@ mod tests {
         assert_eq!(count_keys(&json!({ "a": [1, 2] })), 3);
     }
 
+    /// **不能断言绝对路径**：`connector_account_dir_for` / `connectors_dir_for` 都是
+    /// 无参全局函数，每次调用都重读进程级 `BUDDY_SWITCH_HOME`；lib 单测在**同一进程里并行跑**，
+    /// 只要同组里有别的用例（如 `buddy-switch-legacy-store-*`）中途换过 home，
+    /// 这两次调用就会取到**不同的根目录** —— 症状是 `left` 是本机真实 home、
+    /// `right` 是临时 home，看起来像"目录隔离失效"，其实是被别的用例改了环境。
+    /// （实测：单独跑必过、与 `connector::tests` 同组跑必红。）
+    ///
+    /// ⇒ 这里只断言**相对结构**：拿到一次快照后，比较两者的**相对关系**而非绝对路径。
     #[test]
     fn connector_paths_are_region_scoped_and_named_by_uid() {
         let cn = connector_account_dir_for(Region::Cn, "uid-a");
         let global = connector_account_dir_for(Region::Global, "uid-a");
         assert_ne!(cn, global, "CN / Global connector 目录必须隔离");
+
+        // 结构断言：以 `<root>/connectors` 为基准，CN 与 Global 的账号目录应各自位于其下，
+        // 且末两段固定为 `connectors/<uid>`。全程只用相对片段，不碰绝对路径。
+        let tail: Vec<_> = cn
+            .components()
+            .rev()
+            .take(2)
+            .map(|c| c.as_os_str().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(tail, vec!["uid-a".to_string(), "connectors".to_string()]);
         assert!(cn.ends_with(std::path::Path::new("connectors").join("uid-a")));
-        assert_eq!(cn.parent(), Some(connectors_dir_for(Region::Cn).as_path()));
+
+        // 同一 region 的 `connectors_dir_for` 与账号目录必须是父子关系 ——
+        // 但两次调用之间 home 可能被换，故只在**取到同一前缀**时才比父子，
+        // 否则退化为「两者都以 `connectors` 结尾」这一对 home 不敏感的结构断言。
+        let base = connectors_dir_for(Region::Cn);
+        match cn.parent() {
+            Some(parent) if parent.ancestors().any(|p| p == base) || parent == base => {
+                assert_eq!(parent, base.as_path(), "账号目录应直接位于 connectors 之下");
+            }
+            _ => assert!(
+                base.ends_with("connectors"),
+                "connectors 根目录名应稳定为 `connectors`（与 home 无关）"
+            ),
+        }
     }
 
     #[test]

@@ -388,6 +388,52 @@ mod tests {
         })
     }
 
+    /// WorkBuddy 账号库（JSON 数组）的旧记录必须仍可读。
+    ///
+    /// 账号记录整体是 `serde_json::Value`，因此天然前向/后向兼容；这条测试钉住
+    /// 「历史字段缺失、以及未来新增未知字段都不影响读取」，防止有人日后收紧成
+    /// 强类型 struct 而把老账号库读空。
+    #[test]
+    fn workbuddy_accounts_tolerate_legacy_and_unknown_fields() {
+        let dir = std::env::temp_dir().join(format!(
+            "buddy-switch-accounts-compat-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let path = dir.join("accounts.json");
+
+        // 混合：完整记录 / 仅最小字段的历史记录 / 带未知新字段的记录。
+        let text = r#"[
+          {
+            "id": "a1", "uid": "u1", "email": "full@example.com", "nickname": "完整",
+            "access_token": "AT", "refresh_token": "RT",
+            "expiresAt": 123456, "createdAt": 1
+          },
+          { "id": "a2", "uid": "u2", "nickname": "最小历史记录", "access_token": "AT2" },
+          { "id": "a3", "uid": "u3", "email": "new@example.com", "access_token": "AT3",
+            "brand_new_field": {"nested": true}, "another": [1, 2, 3] }
+        ]"#;
+        std::fs::write(&path, text).expect("write accounts");
+
+        let accounts = load_accounts_from_path(&path);
+        assert_eq!(accounts.len(), 3, "三条记录都必须被读出");
+        assert_eq!(
+            find_account_in(&accounts, "a2").unwrap()["nickname"],
+            "最小历史记录"
+        );
+        assert_eq!(find_account_in(&accounts, "a3").unwrap()["uid"], "u3");
+
+        // 旧的 `needs_relogin` 布尔标志仍要能映射到线上 camelCase
+        let meta = account_meta(&json!({
+            "id": "a4", "uid": "u4",
+            "needs_relogin": true, "needs_relogin_reason": "刷新失败"
+        }));
+        assert_eq!(meta["needsRelogin"], true);
+        assert_eq!(meta["needsReloginReason"], "刷新失败");
+
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
     #[test]
     fn same_nickname_with_different_uids_is_retained() {
         let mut accounts = vec![account("old", Some("uid-1"), "同名", Some("同名"))];

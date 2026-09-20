@@ -51,6 +51,18 @@ function read(file) {
 }
 
 /**
+ * 去掉行注释与块注释。
+ *
+ * 必要性（真实踩过）：注释里写 `call("<cmd>")` 这类示例会把扫描器骗过去，
+ * 报出「未登记的命令 <cmd>」，而真正的调用点全都没问题——护栏于是从
+ * 「保护构建」变成「制造噪声」，最后被开发者绕过。
+ * 用 `(^|[^:])` 排除 `://`，避免把 URL 里的 `//` 当成行注释起点。
+ */
+function stripComments(text) {
+  return text.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/[^\n]*/g, "$1");
+}
+
+/**
  * 从 openIndex（指向 "{"/"("/"["）开始，返回与之配对的括号**内部**文本。
  *
  * 只对同一种括号计数，足以覆盖本项目里的对象字面量与函数实参（不含嵌套异种括号）。
@@ -92,10 +104,12 @@ function extractRoutes(apiTs) {
 
 /** 提取 api.ts 中所有裸 call("<cmd>") 的 cmd（排除 httpCall 等与函数定义）。 */
 function extractCallCommands(apiTs) {
+  // 先剥注释：注释中的示例调用不构成契约（见 stripComments 的说明）。
+  const source = stripComments(apiTs);
   const re = /(?<![\w.$])call\s*\(\s*"([^"]+)"/g;
   const cmds = new Set();
   let m;
-  while ((m = re.exec(apiTs)) !== null) cmds.add(m[1]);
+  while ((m = re.exec(source)) !== null) cmds.add(m[1]);
   if (cmds.size === 0) throw new Error("未能从 api.ts 解析出任何 call(\"<cmd>\")");
   return cmds;
 }

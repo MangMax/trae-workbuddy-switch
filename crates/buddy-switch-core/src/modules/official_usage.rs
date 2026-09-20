@@ -12,15 +12,65 @@ use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
 use crate::modules::account::{account_display_name, get_str};
-use crate::modules::config::{atomic_write, official_usage_cache_file, store_dir};
-use crate::modules::credits::authenticated_post;
+use crate::modules::config::{atomic_write, store_dir};
+use crate::modules::credits::authenticated_post_for;
+use crate::modules::region::{official_usage_cache_file_for, region_spec, Region};
 
+/// 官方请求用量端点路径（两版共用同一路径，**只有主机按 region 变**）。
+const OFFICIAL_USAGE_PATH: &str = "/billing/meter/get-user-request-usage";
+
+/// CN 官方请求用量端点（既有值，**零变化**）。
+///
+/// 主机是 `www.workbuddy.cn`（= CN 的用户中心 web 端点，与
+/// `credits::new_resource_endpoint` 对 `workbuddy.cn` 域账号的选择一致），
+/// 不是 `billing_base`（`www.codebuddy.cn`）。
 pub const OFFICIAL_USAGE_URL: &str =
     "https://www.workbuddy.cn/billing/meter/get-user-request-usage";
+
+/// 按 region 取官方请求用量端点。
+///
+/// **为什么必须分主机**：该端点是「用户中心」域的接口，网关按 realm 鉴权。
+/// 实测证据（本机真实数据，2026-09-17）：
+/// - global 账号的资源查询走 `https://www.workbuddy.ai/billing/meter/*` **成功**
+///   （`credit_usage_snapshots.json` 里两个 global 账号各有 8 条真实余额记录）；
+/// - 但同一批 global 账号打 `www.workbuddy.cn` 的用量端点时，
+///   `official_usage_cache.json` 里留下的是 **APISIX 网关的 401**
+///   （`401 Authorization Required / openresty / APISIX`）。
+///
+/// 即：请求头形态在 `www.workbuddy.ai` 与 `www.workbuddy.cn` 上**都**能过网关
+/// （资源查询两边都成功），所以那个 401 不是缺头，而是**把 global 凭据打到了 CN 用户中心**。
+/// 因此 Global 用该 region 的基址，CN 保持既有值。
+///
+/// ⚠️ 仍未直接观测到 Global 端点的 200（本机没有可用的 global 会话），此判断由上面
+/// 两条观测 + 项目自身约定（`region_spec` / `new_resource_endpoint_for`）推出。
+/// 万一路径在 .ai 域不存在，会得到 404 → `status: unavailable`，与改动前
+/// （401 → unavailable）**用户可见行为相同**，故这是一个无下行风险的修正。
+pub fn official_usage_url(region: Region) -> String {
+    match region {
+        Region::Cn => OFFICIAL_USAGE_URL.to_string(),
+        Region::Global => format!(
+            "{}{OFFICIAL_USAGE_PATH}",
+            region_spec(Region::Global).billing_base
+        ),
+    }
+}
+
 pub const OFFICIAL_USAGE_PAGE_SIZE: usize = 3_000;
 pub const OFFICIAL_USAGE_DETAIL_LIMIT: usize = 100;
 const OFFICIAL_USAGE_MAX_PAGES: usize = 100;
-static OFFICIAL_USAGE_MEMORY: Mutex<Option<Value>> = Mutex::new(None);
+
+/// 官方用量采集结果的进程内记忆，**按 region 分家**。
+///
+/// 与 [`official_usage_cache_file_for`] 同理：混用一份记忆会让 CN 视图命中
+/// Global 的采集结果（payload 自带 `accounts[]`，前端拿它当账号列表）。
+fn official_usage_memory(region: Region) -> &'static Mutex<Option<Value>> {
+    static CN: Mutex<Option<Value>> = Mutex::new(None);
+    static GLOBAL: Mutex<Option<Value>> = Mutex::new(None);
+    match region {
+        Region::Cn => &CN,
+        Region::Global => &GLOBAL,
+    }
+}
 
 fn official_usage_fetch_lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
@@ -171,41 +221,60 @@ fn save_official_usage_cache_to(path: &Path, payload: &Value) {
     let _ = std::fs::create_dir_all(parent).and_then(|_| atomic_write(path, &content));
 }
 
-fn remembered_official_usage() -> Option<Value> {
-    if let Ok(guard) = OFFICIAL_USAGE_MEMORY.lock() {
+fn remembered_official_usage_for(region: Region) -> Option<Value> {
+    let memory = official_usage_memory(region);
+    if let Ok(guard) = memory.lock() {
         if let Some(cached) = guard.as_ref() {
             return Some(cached.clone());
         }
     }
-    let loaded = load_official_usage_cache_from(&official_usage_cache_file())?;
-    if let Ok(mut guard) = OFFICIAL_USAGE_MEMORY.lock() {
+    let loaded = load_official_usage_cache_from(&official_usage_cache_file_for(region))?;
+    if let Ok(mut guard) = memory.lock() {
         *guard = Some(loaded.clone());
     }
     Some(loaded)
 }
 
-fn remember_official_usage(payload: &Value) {
-    if let Ok(mut guard) = OFFICIAL_USAGE_MEMORY.lock() {
+fn remember_official_usage_for(region: Region, payload: &Value) {
+    if let Ok(mut guard) = official_usage_memory(region).lock() {
         *guard = Some(payload.clone());
     }
-    save_official_usage_cache_to(&official_usage_cache_file(), payload);
+    save_official_usage_cache_to(&official_usage_cache_file_for(region), payload);
 }
 
-/// 统计页默认读缓存；`refresh = true` 时才重新请求官方用量接口。
+/// 统计页默认读缓存；`refresh = true` 时才重新请求官方用量接口（CN 薄包装）。
 pub async fn official_usage_for_statistics(accounts: &[Value], at_ms: i64, refresh: bool) -> Value {
+    official_usage_for_statistics_for(Region::Cn, accounts, at_ms, refresh).await
+}
+
+/// 按 region 取官方用量投影（缓存 + 采集都按 region 隔离）。
+///
+/// **为什么必须带 region**：这条链路会（在 token 陈旧时）刷新账号并把结果写回
+/// **该 region 的账号库**。旧实现固定走 CN 的 [`authenticated_post`]，
+/// 于是 Global 视图会把 global 账号拿到 CN 的 billing 基址去换 token，
+/// 失败后连 `needs_relogin` 标记一起写进 `accounts.json`（CN 账号库）——
+/// global 账号因此出现在 CN 视图里，违反 PRD G1「两版互不污染」。
+///
+/// [`authenticated_post`]: crate::modules::credits::authenticated_post
+pub async fn official_usage_for_statistics_for(
+    region: Region,
+    accounts: &[Value],
+    at_ms: i64,
+    refresh: bool,
+) -> Value {
     if !refresh {
-        if let Some(cached) = remembered_official_usage() {
+        if let Some(cached) = remembered_official_usage_for(region) {
             return cached;
         }
     }
     let _guard = official_usage_fetch_lock().lock().await;
     if !refresh {
-        if let Some(cached) = remembered_official_usage() {
+        if let Some(cached) = remembered_official_usage_for(region) {
             return cached;
         }
     }
-    let usage = collect_official_usage(accounts, at_ms).await;
-    remember_official_usage(&usage);
+    let usage = collect_official_usage_for(region, accounts, at_ms).await;
+    remember_official_usage_for(region, &usage);
     usage
 }
 
@@ -408,7 +477,8 @@ fn local_date_at(ts: i64) -> NaiveDate {
         .unwrap_or_else(|| Local::now().date_naive())
 }
 
-async fn fetch_account_usage(
+async fn fetch_account_usage_for(
+    region: Region,
     account: &Value,
     range_start: NaiveDate,
     range_end: NaiveDate,
@@ -422,9 +492,10 @@ async fn fetch_account_usage(
     let mut seen_request_ids = HashSet::new();
 
     loop {
-        let response = authenticated_post(
+        let response = authenticated_post_for(
+            region,
             account,
-            OFFICIAL_USAGE_URL,
+            &official_usage_url(region),
             json!({
                 "startTime": start_time,
                 "endTime": end_time,
@@ -570,8 +641,17 @@ fn request_value(account_id: &str, account_name: &str, row: &RequestRow) -> Valu
     })
 }
 
-/// 查询全部当前账号并生成官方请求用量投影。
+/// 查询全部当前账号并生成官方请求用量投影（CN 薄包装）。
 pub async fn collect_official_usage(accounts: &[Value], at_ms: i64) -> Value {
+    collect_official_usage_for(Region::Cn, accounts, at_ms).await
+}
+
+/// 按 region 查询传入账号并生成官方请求用量投影。
+///
+/// 逐账号请求走 [`authenticated_post_for`]（带 region）——这一点是本模块
+/// 「两版互不污染」的关键：该函数内部会在 token 陈旧时按 region 刷新，
+/// 并把新账号写回**该 region 的账号库**。
+pub async fn collect_official_usage_for(region: Region, accounts: &[Value], at_ms: i64) -> Value {
     let today = local_date_at(at_ms);
     let range_start = today - Duration::days(30);
     let range_end = today;
@@ -597,7 +677,7 @@ pub async fn collect_official_usage(accounts: &[Value], at_ms: i64) -> Value {
     for (index, account) in accounts.iter().enumerate() {
         let account_id = get_str(account, "id").unwrap_or_else(|| format!("unknown-{index}"));
         let account_name = account_display_name(account);
-        match fetch_account_usage(account, range_start, range_end).await {
+        match fetch_account_usage_for(region, account, range_start, range_end).await {
             Ok(result) => {
                 successful_accounts += 1;
                 let (usage_today, usage_week, usage_month, daily) =
@@ -945,5 +1025,96 @@ mod tests {
         assert!(parse_official_usage_cache("not-json").is_none());
         assert!(parse_official_usage_cache("{}").is_none());
         assert!(parse_official_usage_cache(r#"{"payload":{"status":"nope"}}"#).is_none());
+    }
+
+    /// 官方用量端点必须按 region 分主机，且 CN 逐字节保持既有值。
+    ///
+    /// 若把 `official_usage_url` 改成「两版都返回 `OFFICIAL_USAGE_URL`」，
+    /// global 凭据会被打到 CN 用户中心并被网关按 realm 拒掉（实测 APISIX 401），
+    /// 本用例会红。
+    #[test]
+    fn official_usage_url_is_region_scoped() {
+        assert_eq!(
+            official_usage_url(Region::Cn),
+            "https://www.workbuddy.cn/billing/meter/get-user-request-usage",
+            "CN 端点不得改动（零回归）"
+        );
+        assert_eq!(
+            official_usage_url(Region::Global),
+            "https://www.workbuddy.ai/billing/meter/get-user-request-usage"
+        );
+        assert_ne!(official_usage_url(Region::Cn), official_usage_url(Region::Global));
+        // 两版只有主机不同，路径必须一致（否则是两份不同的契约，需另行取证）。
+        let path_of = |url: &str| {
+            url.split_once("://")
+                .and_then(|(_, rest)| rest.find('/').map(|index| rest[index..].to_string()))
+                .expect("url has path")
+        };
+        assert_eq!(
+            path_of(&official_usage_url(Region::Cn)),
+            path_of(&official_usage_url(Region::Global))
+        );
+    }
+
+    /// 进程内记忆与落盘缓存都必须按 region 分家。
+    ///
+    /// 采集结果的 payload 自带 `accounts[]`（本次采集用的账号集合），而前端把
+    /// `officialUsage.accounts` 直接当账号列表（`CreditStatsPage` 的
+    /// `filterAccounts = official ? official.accounts : stats.accounts`）。
+    /// 两版共用一份缓存时，先看 Global 再看 CN，CN 视图会**命中 Global 的采集结果**
+    /// 并因此列出 Global 账号——PRD G1「两版互不污染」被破坏。
+    ///
+    /// 若把 `official_usage_memory` 改成单个 static、或把
+    /// `official_usage_cache_file_for` 的 Global 分支改回 CN 路径，本用例必红。
+    #[test]
+    fn official_usage_cache_is_region_scoped() {
+        // ① 进程内记忆：写入 CN 不得被 Global 读到，反之亦然。
+        official_usage_memory(Region::Cn)
+            .lock()
+            .expect("cn memory")
+            .replace(json!({ "marker": "cn" }));
+        official_usage_memory(Region::Global)
+            .lock()
+            .expect("global memory")
+            .replace(json!({ "marker": "global" }));
+        assert_eq!(
+            official_usage_memory(Region::Cn)
+                .lock()
+                .expect("cn memory")
+                .as_ref()
+                .expect("cn cached")["marker"],
+            "cn"
+        );
+        assert_eq!(
+            official_usage_memory(Region::Global)
+                .lock()
+                .expect("global memory")
+                .as_ref()
+                .expect("global cached")["marker"],
+            "global"
+        );
+        // 同进程其他用例不应受本用例影响（这两个 static 只在本模块测试里被写入）。
+        official_usage_memory(Region::Cn)
+            .lock()
+            .expect("cn memory")
+            .take();
+        official_usage_memory(Region::Global)
+            .lock()
+            .expect("global memory")
+            .take();
+
+        // ② 落盘缓存：两版不同文件；CN 必须沿用既有文件名（老缓存零迁移）。
+        let cn = official_usage_cache_file_for(Region::Cn);
+        let global = official_usage_cache_file_for(Region::Global);
+        assert_ne!(cn, global, "两版官方用量缓存不得共用文件");
+        assert_eq!(
+            cn.file_name().and_then(|name| name.to_str()),
+            Some("official_usage_cache.json"),
+            "CN 缓存文件名不得改动，否则老用户缓存失效（白跑一次采集）"
+        );
+        assert_eq!(
+            global.file_name().and_then(|name| name.to_str()),
+            Some("official_usage_cache.global.json")
+        );
     }
 }
