@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
-use crate::modules::trae::account::{self, AccountsFile, RawAccount};
+use crate::modules::trae::account::{self, RawAccount};
 use crate::modules::trae::variant::TraeVariant;
 
 /// 导入结果计数（与 WorkBuddy 的 `ImportResult` 同名同义）。
@@ -195,13 +195,16 @@ pub fn import_accounts_for(
 ) -> Result<ImportResult, String> {
     let mut file = account::load_accounts_for(variant);
     let result = merge_import_records(&mut file.accounts, text, indexes)?;
-    account::save_accounts_for(
-        variant,
-        &AccountsFile {
-            accounts: file.accounts,
-        },
-    )
-    .map_err(|e| format!("保存账号库失败：{e}"))?;
+    // ★ 必须**整体**回存 `file`，不得字面重建 `AccountsFile { accounts: file.accounts }`。
+    //
+    // 两层理由：
+    // 1. 冗余 —— `merge_import_records` 已**就地**改了 `file.accounts`，重建不改变任何行为；
+    // 2. 危险 —— `save_accounts_for` 序列化的是**整个** `AccountsFile`，所以一旦该结构
+    //    新增第二个容器键，字面重建就会把那个键**静默清空**：用户只是导入一份 JSON，
+    //    另一份数据却没了，且没有任何报错。
+    //    这不是假想风险：同族的 `GroupsFile`（`account.rs`）已经是 `groups` + `membership`
+    //    双键结构，`AccountsFile` 目前单键只是**当前**状态，不是承诺。
+    account::save_accounts_for(variant, &file).map_err(|e| format!("保存账号库失败：{e}"))?;
     Ok(result)
 }
 

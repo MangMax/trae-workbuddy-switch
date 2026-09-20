@@ -585,10 +585,17 @@ mod tests {
 
     /// ★ OAuth 设备身份文件：默认变体沿用无后缀名，另一变体加中缀；两者必须不同。
     ///
-    /// 只比 basename，不碰绝对路径 —— 因此**不需要** env 锁（见
-    /// [`Self::变体后缀插在扩展名之前`] 的说明）。
+    /// 大多数断言只比 basename（不受「别的用例改了 HOME」影响），但**最后一条**
+    /// `oauth_device_file() == oauth_device_file_for(TraeWork)` 比较的是**绝对路径**：
+    /// 无参壳与显式变体两次读取之间若被别的用例改走 HOME，就会拿到真机 home 与
+    /// 临时 home 两条不同路径而**假失败**（实测 25 轮全量并行中 1 轮，
+    /// `left: …\.buddy-switch\trae\oauth_device.json` /
+    /// `right: …\Temp\buddy-switch-trae-test-…\home\.buddy-switch\…`）。
+    /// 故与 [`Self::应用级配置与网关配置刻意不分家`] 同款处置：整段持 `env_lock()`。
     #[test]
     fn oauth设备身份文件按变体分家且默认沿用旧名() {
+        let _lock = crate::modules::config::env_lock();
+
         let work = oauth_device_file_for(TraeVariant::TraeWork);
         let cn = oauth_device_file_for(TraeVariant::TraeCn);
         assert_eq!(

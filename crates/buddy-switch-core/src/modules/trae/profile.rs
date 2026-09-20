@@ -255,9 +255,42 @@ pub fn extract_local_jwt_for(variant: TraeVariant) -> Result<(String, String), S
             variant.display_name()
         )
     })?;
+    extract_local_jwt_from_dir(&data_dir, variant)
+}
 
+/// 从**指定数据目录**读凭据（显式入参）。
+///
+/// ## 为什么要有这个「显式目录」的形态
+///
+/// 本模块有**两个**目录选择器，语义不同，**在同一台机器上可能给出不同目录**：
+///
+/// | 选择器 | 语义 | 谁在用 |
+/// |:--|:--|:--|
+/// | [`platform::select_data_dir_for`] | **最近活跃**的候选 | 导入（`extract_local_jwt_for`） |
+/// | [`platform::detect_data_dir_for`] | **首位**候选（`names[0]`） | 备份 / 恢复 / 守卫要守护的那个操作 |
+///
+/// 实测（Trae Work，本机）：`select` 给 `TRAE SOLO`（客户端启动过、**从未登录**），
+/// `detect` 给 `TRAE SOLO CN`（**登录态在这里**）。于是「用 `select` 校验、
+/// 用 `detect` 操作」会出现两种坏法：
+///
+/// 1. **假阴性**：`select` 那个目录没有凭据 ⇒ 校验拿不到 uid ⇒ 守卫 fail-open
+///    **静默放行**，等于没有守卫；
+/// 2. **假阳性**（更坏）：两个目录各有登录态且**属于不同账号** ⇒ 校验读到 A 判定「就是 A」
+///    ⇒ 放行，而操作从 `detect` 目录拷的是 B 的状态存进 A 的槽位 ——
+///    守卫不但没拦住，还**为一次错误的保存盖了章**。
+///
+/// 所以：**校验的对象与操作的对象必须用同一个目录**。本函数把「读哪个目录」
+/// 变成调用方的显式入参，让两件事能锁定同一个目录。
+///
+/// ⚠️ 两个入口**各取所需，不要合并**：导入必须读**活跃**目录（用户在活跃客户端里
+/// 刚登录完就点导入，读首位候选会读到另一份旧登录态）；备份/恢复与守卫必须读
+/// **首位候选**（那是既有语义，改它会动到切换行为）。共用的是这个原语，不是目录选择器。
+fn extract_local_jwt_from_dir(
+    data_dir: &Path,
+    variant: TraeVariant,
+) -> Result<(String, String), String> {
     // ── 主来源：iCube 登录态副本（tc 信封；Trae Work 唯一可用的来源） ──────────
-    if let Some(found) = icube_login_candidate(variant)? {
+    if let Some(found) = icube_login_candidate_from_dir(data_dir, variant)? {
         return Ok(found);
     }
 
@@ -272,7 +305,7 @@ pub fn extract_local_jwt_for(variant: TraeVariant) -> Result<(String, String), S
             "令牌数据库",
         ),
     ];
-    for path in collect_log_candidates(&data_dir) {
+    for path in collect_log_candidates(data_dir) {
         candidates.push((path, "扩展日志"));
     }
 
@@ -322,6 +355,8 @@ pub fn extract_local_jwt_for(variant: TraeVariant) -> Result<(String, String), S
 /// 信封格式与设备凭证完全相同（见 [`crate::modules::trae::icube::tc_decrypt`]），
 /// 解出来是 `{token, refreshToken, host, userId, expiredAt, …}`。
 ///
+/// 目录是**显式入参**，由调用方决定（理由见 [`extract_local_jwt_from_dir`]）。
+///
 /// ## 三态返回值
 ///
 /// - `Ok(Some((uid, header_value)))` —— 拿到可用凭据，`header_value` **已含**
@@ -335,8 +370,11 @@ pub fn extract_local_jwt_for(variant: TraeVariant) -> Result<(String, String), S
 /// 优先用信封的 `expiredAt`（客户端自己算好的 epoch 秒，比解 JWT 直接）；
 /// 取不到时回落 JWT 的 `exp`；两者都没有时按「未知 = 可用」处理 ——
 /// 与明文兜底路径的既有口径一致（只拦 `exp > 0 && exp < now`）。
-fn icube_login_candidate(variant: TraeVariant) -> Result<Option<(String, String)>, String> {
-    let Ok(info) = icube::cloudide_auth_info_for(variant) else {
+fn icube_login_candidate_from_dir(
+    data_dir: &Path,
+    variant: TraeVariant,
+) -> Result<Option<(String, String)>, String> {
+    let Ok(info) = icube::cloudide_auth_info_from_dir(data_dir, variant) else {
         return Ok(None);
     };
     // 🔴 信封里是**裸** token（实测 1004 字符、三段、无前缀）。直接落库会让
@@ -852,6 +890,42 @@ fn copy_dir_recursive(source: &Path, target: &Path) -> Result<u64, String> {
     Ok(copied)
 }
 
+/// 快照类操作（备份 / 恢复 / 保存守卫 / 恢复后复核）读取的**唯一取值点**。
+///
+/// ## 为什么必须唯一取值点（I-4 同源不变式）
+///
+/// 不变式：**校验的输入必须取自被校验操作将要作用的那个对象。**
+/// 快照类操作的作用对象是「客户端 userData 目录」——`backup_to_slot_for` 从它复制、
+/// `restore_from_slot_for` 向它写入、`ensure_save_target_matches_client` 从它取证、
+/// `verify_restored_login_for` 也从它取证。四者必须指向**同一个目录**。
+///
+/// 本模块有**两个**语义不同的目录选择器，同一台机器上可能给出不同目录：
+///
+/// | 选择器 | 语义 |
+/// |:--|:--|
+/// | [`platform::select_data_dir_for`] | 该变体候选里**最近活跃**的那个（导入用） |
+/// | [`platform::detect_data_dir_for`] | 该变体**首位候选**（`names[0]`） |
+///
+/// 若四个调用点各自去调选择器，任一处被换成另一个（例如 `select_data_dir_for`）
+/// 都会产生「**校验读了 A、操作改了 B**」，且表现是**静默**的：守卫在真机上等于不存在
+/// （假阴性），或复核把正常切换误报成失败（读错目录）。改动是局部的，评审时看不出来。
+///
+/// 收敛到这一个函数后，调用点只表达「我要快照目录」，
+/// **选择器策略的变更只需改这一处**。调用点**不得**再各自调用 `detect_data_dir_for`。
+///
+/// ## 本函数只负责「取路径」，不判断存在性
+///
+/// 是否要求目录存在由**调用方显式声明**，因为两个操作的既有语义不同：
+///
+/// - [`backup_to_slot_for`] 要求源目录存在（不存在 ⇒ 报「未找到客户端数据目录」）；
+/// - [`restore_from_slot_for`] **不要求**目标目录存在（会 `create_dir_all` 新建）。
+///
+/// 把这一差异留在调用点（`.filter(|dir| dir.is_dir())`），是为了让「谁要求存在」
+/// 在代码里一眼可见，而不是被取值点悄悄统一掉（那会改变 restore 的既有行为）。
+fn snapshot_data_dir_for(variant: TraeVariant) -> Option<PathBuf> {
+    platform::detect_data_dir_for(variant)
+}
+
 /// 把客户端当前的登录态复制到指定槽位（默认变体，兼容壳）。
 pub fn backup_to_slot(slot: &str) -> Result<u64, String> {
     backup_to_slot_for(TraeVariant::default(), slot)
@@ -866,7 +940,8 @@ pub fn backup_to_slot_for(variant: TraeVariant, slot: &str) -> Result<u64, Strin
     if !paths::safe_slot_name(slot) {
         return Err(format!("非法的槽位名: {slot}"));
     }
-    let source_root = platform::detect_data_dir_for(variant)
+    // 快照源目录：唯一取值点。**要求存在**（不存在时下面的 `ok_or` 给出可操作提示）。
+    let source_root = snapshot_data_dir_for(variant)
         .filter(|dir| dir.is_dir())
         .ok_or("未找到 Trae 客户端数据目录，请先启动一次 Trae 并登录")?;
     let target_root = paths::profiles_dir_for(variant).join(slot);
@@ -912,7 +987,8 @@ pub fn restore_from_slot_for(variant: TraeVariant, slot: &str) -> Result<u64, St
     if !source_root.is_dir() {
         return Err(format!("槽位 {slot} 的登录态快照不存在"));
     }
-    let target_root = platform::detect_data_dir_for(variant)
+    // 快照目标目录：唯一取值点。**不要求存在** —— 下面会 `create_dir_all` 新建。
+    let target_root = snapshot_data_dir_for(variant)
         .ok_or("无法定位 Trae 客户端数据目录")?;
     std::fs::create_dir_all(&target_root)
         .map_err(|e| format!("创建客户端数据目录失败: {e}"))?;
@@ -1066,20 +1142,45 @@ where
     }
 
     // 3. 若已知当前账号，额外保存到它自己的槽位，使该账号可被再次切回。
+    //
+    // ★ 不变式：**凡把「客户端当前状态」写入「账号槽位」的路径，都必须过守卫；
+    //   `LAST_SLOT`（回滚槽）是唯一豁免。**
+    //
+    // 本步写的是**账号槽位**（`previous` 是 userId），且写入是**覆盖**式的：
+    // `LAST_SLOT` 里已经存了「切换前的现场」，`previous` 原本可能正确的旧快照一旦被
+    // 未登录态覆盖就**不可逆**了（回滚槽救不回来）。所以这一步必须先过
+    // `ensure_save_target_matches_client`，失败时**降级为 skip**、不影响后续切换。
+    //
+    // 注意 `LAST_SLOT` 的豁免理由：它的语义就是「切换前的现场」，必须允许在客户端
+    // 未登录时也照旧写入，否则回滚能力就没了（见第 2 步与守卫的文档）。
     if let Some(previous) = previous_account.as_deref().filter(|uid| *uid != target) {
-        match backup_to_slot_for(variant, previous) {
-            Ok(count) => emit(
+        match ensure_save_target_matches_client(variant, previous) {
+            Err(error) => emit(
                 &mut outcome,
                 SwitchStep::new(
                     "backup-current",
-                    "ok",
-                    format!("当前账号 {previous} 的登录态已更新（{count} 个文件）"),
+                    "skip",
+                    format!("跳过更新 {previous} 的快照：{error}"),
                 ),
             ),
-            Err(error) => emit(
-                &mut outcome,
-                SwitchStep::new("backup-current", "skip", format!("更新 {previous} 失败: {error}")),
-            ),
+            Ok(()) => match backup_to_slot_for(variant, previous) {
+                Ok(count) => emit(
+                    &mut outcome,
+                    SwitchStep::new(
+                        "backup-current",
+                        "ok",
+                        format!("当前账号 {previous} 的登录态已更新（{count} 个文件）"),
+                    ),
+                ),
+                Err(error) => emit(
+                    &mut outcome,
+                    SwitchStep::new(
+                        "backup-current",
+                        "skip",
+                        format!("更新 {previous} 失败: {error}"),
+                    ),
+                ),
+            },
         }
     }
 
@@ -1140,6 +1241,37 @@ where
         }
     }
 
+    // 6.5 恢复后**复核**：客户端实际登录的账号必须等于目标账号。
+    //
+    // 为什么必须有：`restore_from_slot_for` 只保证「文件被覆盖了」，不保证
+    // 「覆盖进去的就是 target 的登录态」—— `profiles/<target>/` 可能是被历史上
+    // 那条「把当前登录态存进别人槽位」的缺陷**污染过的快照**。没有这一步，
+    // 用户看到的是「切换成功」，然后发现还是同一个人（正是报障的那个症状）。
+    match verify_restored_login_for(variant, &target) {
+        RestoreCheck::Confirmed => emit(
+            &mut outcome,
+            SwitchStep::new("verify", "ok", format!("已确认客户端当前登录为 {target}")),
+        ),
+        RestoreCheck::Mismatch { actual } => {
+            let message = format!(
+                "切换未生效：恢复后客户端实际登录的是 {actual}，而不是目标账号 {target}。\
+                 该槽位的快照可能是在「保存守卫」上线前被写坏的（内容属于另一个账号）。\
+                 请在 Trae 客户端里登录 {target} 后重新保存该账号的登录态，再切换。"
+            );
+            emit(&mut outcome, SwitchStep::new("verify", "fail", message.clone()));
+            outcome.error = Some(message);
+            return outcome;
+        }
+        RestoreCheck::Unverifiable => emit(
+            &mut outcome,
+            SwitchStep::new(
+                "verify",
+                "skip",
+                "无法从客户端读取当前账号（快照内没有可解凭据），跳过复核",
+            ),
+        ),
+    }
+
     // 记录当前账号（仅在前几步都成功后写，避免把失败态记成「已切换」）。
     if let Err(error) = set_current_account_for(variant, &target) {
         emit(
@@ -1183,12 +1315,49 @@ where
     outcome
 }
 
+/// 恢复后复核的结论。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RestoreCheck {
+    /// 客户端**实际**登录的账号 == 目标账号。
+    Confirmed,
+    /// 实际登录的是另一个账号 —— 切换没有生效。
+    Mismatch { actual: String },
+    /// 读不到（客户端没装 / 快照内没有可解凭据）⇒ fail-open。
+    Unverifiable,
+}
+
+/// 复核「恢复之后客户端到底登录着谁」（读 [`platform::detect_data_dir_for`]）。
+///
+/// ⚠️ **必须读 `detect_data_dir_for`（首位候选）**，因为那是
+/// [`restore_from_slot_for`] 的**写入目标**；读活跃目录会在「活跃目录 ≠ 首位候选」
+/// 的机器上**误报失败**（读到的还是切换前那个人，见真机 Trae Work 的形态）。
+/// 目录必须与操作同源这条原则，与 [`ensure_save_target_matches_client`] 完全一致。
+///
+/// fail-open **仅在读不到时**：客户端没装、快照里没有信封、或该产品线本就没有
+/// 可解凭据，都可能读不到；把「读不到」当成失败会让正常切换被误挡。
+fn verify_restored_login_for(variant: TraeVariant, target: &str) -> RestoreCheck {
+    // 复核读的目录必须与 `restore_from_slot_for` 的写入目标同源（唯一取值点）。
+    let Some(root) = snapshot_data_dir_for(variant).filter(|dir| dir.is_dir()) else {
+        return RestoreCheck::Unverifiable;
+    };
+    verify_restored_login_in(&root, variant, target)
+}
+
+/// 复核逻辑本体（显式目录，便于在不起客户端的前提下测三种结论）。
+fn verify_restored_login_in(root: &Path, variant: TraeVariant, target: &str) -> RestoreCheck {
+    match extract_local_jwt_from_dir(root, variant) {
+        Ok((actual, _)) if actual == target => RestoreCheck::Confirmed,
+        Ok((actual, _)) => RestoreCheck::Mismatch { actual },
+        Err(_) => RestoreCheck::Unverifiable,
+    }
+}
+
 /// 保存前的守卫：客户端**此刻实际登录**的账号必须与目标槽位一致。
 ///
 /// ## 为什么必须有它
 ///
-/// [`backup_to_slot_for`] 的源是 `detect_data_dir_for(variant)`，也就是**客户端此刻
-/// 真实的登录态**。若调用方指定的槽位是另一个账号，快照就会被贴到错误的账号名下：
+/// [`backup_to_slot_for`] 的源是 [`snapshot_data_dir_for`]（首位候选），也就是
+/// **客户端此刻真实的登录态**。若调用方指定的槽位是另一个账号，快照就会被贴到错误的账号名下：
 /// `profiles/<B>/` 里装的是 A 的内容，`currentAccount` 却记成 B ⇒ 之后切到 B，
 /// 恢复出来的还是 A。用户看到的症状是「**切换怎么切都是同一个账号**」。
 ///
@@ -1199,33 +1368,93 @@ where
 ///
 /// `currentAccount` 这类由本程序自己维护的标签**正是被这条缺陷写坏的** ——
 /// 拿它做门禁，等于用被污染的值去判断污染。所以这里回到
-/// [`extract_local_jwt_for`] 读客户端真实凭据（与 `restore` 路径同源）。
+/// [`extract_local_jwt_from_dir`] 读客户端真实凭据。
 ///
-/// ## 为什么不能放进 `backup_to_slot_for`
+/// ## ★ 必须读**被守护操作所读的那个目录**（曾经在这里踩过一个 P0）
+///
+/// 本模块有两个目录选择器：`select_data_dir_for`（最近活跃）与
+/// `detect_data_dir_for`（首位候选），**同一台机器上可能给出不同目录**
+/// （实测 Trae Work：`select` → `TRAE SOLO`、`detect` → `TRAE SOLO CN`）。
+/// [`backup_to_slot_for`] 用的是 **`detect_data_dir_for`**。
+///
+/// 本函数曾用 `extract_local_jwt_for`（内部走 `select_data_dir_for`）取证，于是：
+///
+/// - **假阴性**：`select` 那个目录没有凭据 ⇒ 取证失败 ⇒ fail-open **静默放行**，
+///   守卫在真机上等于不存在；
+/// - **假阳性**（更坏）：两个目录各有登录态且**属于不同账号** ⇒ 取证读到 A 判定
+///   「就是 A」⇒ 放行，而 `backup_to_slot_for` 从 `detect` 目录拷的是 B 的状态
+///   存进 A 的槽位 —— 守卫**为一次错误的保存盖了章**。
+///
+/// 故此处走 [`snapshot_data_dir_for`]（唯一取值点，内部即 `detect_data_dir_for`），
+/// 与 [`backup_to_slot_for`] 严格同目录。
+/// 改这一行前请先读 [`extract_local_jwt_from_dir`] 与 [`snapshot_data_dir_for`] 的文档。
+///
+/// ## 为什么不能放进 `backup_to_slot_for`（`LAST_SLOT` 是唯一豁免）
+///
+/// **不变式：凡把「客户端当前状态」写入「账号槽位」的路径，都必须过本守卫；
+/// [`LAST_SLOT`]（回滚槽）是唯一豁免。**
 ///
 /// [`switch_account`] 自己会调 `backup_to_slot_for(variant, LAST_SLOT)`
 /// 把当前状态存进**回滚槽**。`last` 不是 userId，拿 uid 比必然不等 ⇒
-/// 守卫会**整体废掉切换的回滚兜底**。故守卫只加在「用户主动把登录态存进
-/// 某个账号槽位」的两个入口：[`save_current_login_for`] 与
-/// [`crate::modules::trae::handlers::backup_profile_for`]。
+/// 若把守卫下沉到 `backup_to_slot_for`，守卫会**整体废掉切换的回滚兜底**。
 ///
-/// ## fail-open（与参考实现语义一致）
+/// 两条语义决定了这个豁免：
 ///
-/// 客户端未安装 / 从未登录 / 凭据读不出来时**放行**。守卫的目的是拦住
-/// 「明明登录着别人、却往这个槽位存」，而不是把「读不到」也算成不一致 ——
-/// 后者会让「先启动客户端再保存」这个正常流程被误挡。读不到时由既有兜底
-/// （[`backup_to_slot_for`] 的「未找到客户端数据目录」/「未找到任何登录态文件」）
-/// 承担，用户仍会看到真实原因。
+/// - [`LAST_SLOT`] 的语义是「**切换前的现场**」——它**必须**允许在客户端未登录时
+///   也照旧写入，否则「切坏了再回滚」的能力就没了；
+/// - 「账号槽位」（以 userId 命名）的语义是「**该账号的可用登录态**」——
+///   绝不能被未登录态污染，且写入是**覆盖**式的，会毁掉原本正确的旧快照。
+///
+/// 因此守卫加在「把当前状态写进**账号槽位**」的**全部**路径上：
+/// [`save_current_login_for`]、[`crate::modules::trae::handlers::backup_profile_for`]，
+/// 以及 [`switch_account`] 的第 3 步（`backup-current`）。
+///
+/// ## 只放行一种情形：**源目录不存在**（R5 修正）
+///
+/// 本函数有**两个**出口，语义必须区分开：
+///
+/// - **出口①「源目录不存在」⇒ 放行**。此时「客户端到底登录着谁」这个问题本身
+///   不成立（没有客户端数据），把报错留给 [`backup_to_slot_for`] 的
+///   「未找到 Trae 客户端数据目录…」，用户看到的是**可操作**的原因；
+/// - **出口②「目录在、但读不出登录态」⇒ 拒绝**。曾经的实现也在这里放行，
+///   于是产生一条**静默**的坏路径：`backup_to_slot_for` 只要求目录存在，
+///   它会照旧复制 `Local Storage/`、`Network/`、`machineid` 等**与登录无关**的文件
+///   ⇒ `copied > 0` ⇒ 返回 `Ok`。于是一份「看起来正常、内容却是未登录态」的快照被
+///   存进账号槽位并被记成当前账号；之后切到该账号，恢复出来的是**未登录态**。
+///
+/// 「从未登录」与「凭据读不出来」都属于出口②，**都必须拒绝**：
+/// 本程序的职责是把「客户端此刻的登录态」存进「该账号的槽位」，
+/// 没有登录态就没有可存的东西，继续存只会污染槽位。
+///
+/// ## 为什么不做「四态枚举」
+///
+/// [`extract_local_jwt_from_dir`] 的 `Err` 至少有 5 种成因（没有 `storage.json` /
+/// 没有 cloudide 键 / 信封解不开 / **凭据已过期** / uid 解不出）。要把它们映射成
+/// 「未登录」与「读不出来」两张语义不同的脸，需要一张**没有依据**的对照表，
+/// 且「已过期」两类都不合适。故只用「读得到 / 读不到」二分。
 pub(crate) fn ensure_save_target_matches_client(
     variant: TraeVariant,
     user_id: &str,
 ) -> Result<(), String> {
-    let Ok((client_uid, _)) = extract_local_jwt_for(variant) else {
+    // 取证目录 = 被守护操作（`backup_to_slot_for`）所读的那个目录。
+    // 两者都必须走 `snapshot_data_dir_for` 这个**唯一取值点**，否则「校验读了 A、操作改了 B」。
+    let Some(dir) = snapshot_data_dir_for(variant).filter(|dir| dir.is_dir()) else {
+        // 出口①：源目录不存在 ⇒ 放行，报错交给 `backup_to_slot_for`。
         return Ok(());
+    };
+    let Ok((client_uid, _)) = extract_local_jwt_from_dir(&dir, variant) else {
+        // 出口②：目录在、但读不出登录态 ⇒ **拒绝**（文案必须与下面的出口③可区分，
+        // 这里没有 `client_uid` 这个值，绝不能复用「另一个账号」的措辞）。
+        return Err(format!(
+            "无法读取【{}】客户端当前的登录态，因此不能把一份**没有登录态**的快照存进【{user_id}】名下 —— \
+             那样之后切到该账号会变成未登录。请先在 Trae 客户端里登录后再保存，或改用「OAuth 网页登录」。",
+            variant.display_name()
+        ));
     };
     if client_uid == user_id {
         return Ok(());
     }
+    // 出口③：读到了登录态，但属于另一个账号。
     Err(format!(
         "客户端当前登录的是另一个账号（{client_uid}），不能把它的登录态保存到【{user_id}】名下 —— \
          否则之后切到该账号，恢复出来的还是现在这个人（症状：切换怎么切都是同一个账号）。\
@@ -2387,17 +2616,36 @@ mod tests {
     /// 此刻的真实登录态，槽位却是调用方指定的 userId ⇒ 存错槽位后
     /// `profiles/<B>/` 装的是 A 的内容，切到 B 恢复出来还是 A。
     /// 参考实现把它当**实测事故**修过（两个槽位被污染成完全相同）。
+    ///
+    /// ## 为什么必须断言「内容归属」，不能只断言 `currentAccount` / `count`
+    ///
+    /// 那两个值都是**本程序自己写的**，正是被这条缺陷污染的东西 —— 只断言它们，
+    /// 测试会在「守卫放行了一次错误保存」时照样变绿。所以这里把快照**读回来、
+    /// 解出信封里的 uid**，直接比对归属。
+    ///
+    /// （这不是假设：本用例最初只断言 `currentAccount` 与 `count > 0`，在守卫
+    /// **读错目录**的那个 P0 下**一直是绿的**，同时演示着它要防的那个 bug。）
     #[cfg(windows)]
     #[test]
     fn save_refuses_to_store_the_client_state_under_another_account() {
         let exp = chrono::Utc::now().timestamp() + 3600;
         let env = crate::modules::trae::test_support::TempEnv::empty();
         let fixtures = icube::test_support::write_cloudide_only_user_data(&env.appdata(), exp);
-        let work_uids = fixture_uids(&fixtures, TraeVariant::TraeWork);
+        let variant = TraeVariant::TraeWork;
+        let work_uids = fixture_uids(&fixtures, variant);
         assert!(work_uids.len() >= 2, "需要至少两个候选目录才能构造「存错槽位」");
 
+        // 前置：fixture 必须让两个选择器分叉 —— 否则本用例证明不了「同目录」这件事。
+        let op_dir = platform::detect_data_dir_for(variant).expect("临时 APPDATA 下应能定位目录");
+        let active_dir = platform::select_data_dir_for(variant).expect("应能定位活跃目录");
+        assert_ne!(
+            op_dir, active_dir,
+            "前置：fixture 必须让「首位候选」与「最近活跃」指向不同目录"
+        );
+
+        // 客户端「实际登录的账号」= **被守护操作所读目录**里的那个 uid。
         let (client_uid, _) =
-            extract_local_jwt_for(TraeVariant::TraeWork).expect("fixture 必须可读");
+            extract_local_jwt_from_dir(&op_dir, variant).expect("fixture 必须可读");
         let other_uid = work_uids
             .iter()
             .find(|uid| uid.as_str() != client_uid)
@@ -2406,7 +2654,7 @@ mod tests {
         let other_slot = paths::profiles_dir_for(TraeVariant::TraeWork).join(&other_uid);
 
         // ① 存到**别人**的槽位 ⇒ 必须拒绝，且不得留下半个槽位目录。
-        let error = save_current_login_for(TraeVariant::TraeWork, &other_uid)
+        let error = save_current_login_for(variant, &other_uid)
             .expect_err("登录着 A 却往 B 的槽位存，必须被拒绝");
         assert!(
             error.contains(&client_uid),
@@ -2424,9 +2672,8 @@ mod tests {
 
         // ② `backup_profile_for` 是同一操作的另一条入口，必须同样被拦 ——
         //    只在 `save_login` 上加守卫，等于留下一扇可绕过的大门。
-        let backup_error =
-            crate::modules::trae::handlers::backup_profile_for(TraeVariant::TraeWork, &other_uid)
-                .expect_err("另一条入口也必须被拦");
+        let backup_error = crate::modules::trae::handlers::backup_profile_for(variant, &other_uid)
+            .expect_err("另一条入口也必须被拦");
         assert!(
             backup_error.contains(&other_uid),
             "另一条入口的报错同样要说清目标槽位：{backup_error}"
@@ -2434,12 +2681,84 @@ mod tests {
         assert!(!other_slot.exists(), "另一条入口也不得留下槽位目录");
 
         // ③ 存到**自己**的槽位 ⇒ 必须成功（守卫不得把正常流程一起挡掉）。
-        let count = save_current_login_for(TraeVariant::TraeWork, &client_uid)
+        let count = save_current_login_for(variant, &client_uid)
             .expect("客户端登录着 A、存进 A 的槽位必须成功");
         assert!(count > 0, "必须真的复制到文件");
         assert_eq!(
-            current_account_for(TraeVariant::TraeWork).as_deref(),
+            current_account_for(variant).as_deref(),
             Some(client_uid.as_str())
+        );
+
+        // ④ ★ **核心断言**：把快照读回来、解出信封里的 uid，归属必须 == 槽位 uid。
+        //    这一条才是「切换不会切到同一个人」的证明；上面那两个自写标签证明不了。
+        let own_slot = paths::profiles_dir_for(variant).join(&client_uid);
+        let (saved_uid, _) = extract_local_jwt_from_dir(&own_slot, variant)
+            .expect("快照里必须能解出凭据（否则这条断言证明不了归属）");
+        assert_eq!(
+            saved_uid, client_uid,
+            "★ 快照内容的归属必须等于槽位 uid —— 否则切过去还是现在这个人"
+        );
+    }
+
+    /// ★ 守卫的证据来源必须与被守护的操作**同一个目录**（曾经读错，守卫在真机上静默失效）。
+    ///
+    /// fixture 构造成**首位候选有凭据、最近活跃的那个没有** —— 真机 Trae Work 就是这个形态
+    /// （`TRAE SOLO CN` 有登录态、`TRAE SOLO` 更活跃但没有）。
+    /// 旧实现用 `extract_local_jwt_for`（走 `select_data_dir_for`）取证 ⇒ 读不到 ⇒
+    /// fail-open ⇒ **静默放行**，守卫等于不存在。
+    #[cfg(windows)]
+    #[test]
+    fn save_guard_reads_the_same_dir_as_the_guarded_operation() {
+        let exp = chrono::Utc::now().timestamp() + 3600;
+        let env = crate::modules::trae::test_support::TempEnv::empty();
+        let fixtures = icube::test_support::write_cloudide_only_user_data(&env.appdata(), exp);
+        let variant = TraeVariant::TraeWork;
+
+        let first_name = platform::data_dir_names_for(variant)[0];
+        let first_dir = env.appdata().join(first_name);
+        let first_uid = fixtures
+            .iter()
+            .find(|(_, name)| name == first_name)
+            .map(|(uid, _)| uid.clone())
+            .expect("首位候选必须在 fixture 里");
+
+        // 把**非首位**候选清空（写成空对象）并弄成最新 ⇒ `select` 指向它，而它没有登录态。
+        for (_, name) in &fixtures {
+            if name == first_name {
+                continue;
+            }
+            let storage = env
+                .appdata()
+                .join(name)
+                .join("User")
+                .join("globalStorage")
+                .join("storage.json");
+            std::fs::write(&storage, b"{}").unwrap();
+        }
+
+        // 前置：两个选择器确实分叉，且「活跃目录读不到凭据」而「首位目录读得到」。
+        assert_ne!(
+            platform::detect_data_dir_for(variant).unwrap(),
+            platform::select_data_dir_for(variant).unwrap(),
+            "前置：fixture 必须让两个选择器分叉"
+        );
+        assert!(
+            extract_local_jwt_for(variant).is_err(),
+            "前置：活跃目录没有凭据 —— 旧实现正是靠这一点静默 fail-open"
+        );
+        assert_eq!(
+            extract_local_jwt_from_dir(&first_dir, variant)
+                .expect("前置：首位目录必须有凭据")
+                .0,
+            first_uid
+        );
+
+        // 核心：守卫的证据来自**首位目录**，所以它必须拦得住存错槽位。
+        let error = save_current_login_for(variant, "9999999999999999")
+            .expect_err("守卫必须读首位目录；读活跃目录会在这里静默放行");
+        assert!(
+            error.contains(&first_uid),
+            "报错必须说清客户端当前是谁：{error}"
         );
     }
 
@@ -2466,23 +2785,183 @@ mod tests {
         assert!(paths::profiles_dir_for(variant).join(LAST_SLOT).is_dir());
     }
 
-    /// 守卫必须 **fail-open**：客户端状态读不出来时不得挡住保存。
+    /// 守卫必须**拒绝**「客户端读不到登录态」时的保存（R5）。
     ///
-    /// 否则「先启动客户端再保存」这条正常流程会被误挡，而读不到的原因
-    /// （未安装 / 未登录 / 客户端在写）本来就有既有兜底去表达。
+    /// ## ⚠️ 本用例由旧用例**改名 + 语义反转**而来
+    ///
+    /// 旧名 `save_guard_fails_open_when_the_client_state_is_unreadable`，旧断言是
+    /// 「读不到客户端状态时**必须放行**」—— 它把一条有害行为**钉成了正确行为**。
+    /// 该行为允许把一份**未登录态**的快照静默存进账号槽位：
+    /// [`backup_to_slot_for`] 只要求目录存在，会照旧复制 `Local Storage/`、`Network/`、
+    /// `machineid` 等与登录无关的文件 ⇒ `copied > 0` ⇒ 返回 `Ok`。之后切到该账号，
+    /// 恢复出来的是未登录态。
+    ///
+    /// 现语义：**只有「源目录不存在」放行**；「从未登录」「凭据读不出来」都属于出口② ⇒ 拒绝。
     #[cfg(windows)]
     #[test]
-    fn save_guard_fails_open_when_the_client_state_is_unreadable() {
-        // 只有设备凭证、没有登录态副本、没有明文日志 ⇒ `extract_local_jwt_for` 必然失败。
+    fn save_refuses_when_the_client_has_no_login_state() {
+        // 只有设备凭证、没有登录态副本、没有明文日志 ⇒ 取证必然失败。
         let _env = crate::modules::trae::test_support::TempEnv::with_device_fixture();
         let variant = TraeVariant::TraeWork;
+        // 前置断言打在**守卫真正读的那个目录**上（`detect_data_dir_for`）——
+        // 打在活跃目录上会掩盖「两个选择器分叉」这类问题。
+        let op_dir = platform::detect_data_dir_for(variant).expect("临时 APPDATA 下应能定位目录");
         assert!(
-            extract_local_jwt_for(variant).is_err(),
+            extract_local_jwt_from_dir(&op_dir, variant).is_err(),
             "前置条件：本 fixture 必须读不到客户端登录态"
         );
 
-        let count = save_current_login_for(variant, "1234567890123456")
-            .expect("读不到客户端状态时必须放行，而不是挡住正常保存");
-        assert!(count > 0);
+        let error = save_current_login_for(variant, "1234567890123456")
+            .expect_err("客户端没有登录态时必须拒绝，而不是把未登录态存进账号槽位");
+        assert!(
+            error.contains("无法读取"),
+            "报错必须说清「读不到登录态」：{error}"
+        );
+        assert!(
+            !error.contains("另一个账号"),
+            "出口② 不得复用出口③（uid 不匹配）的措辞：{error}"
+        );
+        let slot = paths::profile_dir_for(variant, "1234567890123456")
+            .expect("合法 userId 应能定位槽位目录");
+        assert!(
+            !slot.exists(),
+            "被拒绝的保存不得留下槽位目录：{}",
+            slot.display()
+        );
+    }
+
+    /// 守卫的 fail-open **唯一出口**：源目录不存在时放行，把报错留给 `backup_to_slot_for`。
+    ///
+    /// 与 [`save_refuses_when_the_client_has_no_login_state`] 成对：那条证明「目录在、读不到
+    /// ⇒ 拒绝」，本条证明「目录不存在 ⇒ 放行」。若实现把「目录不存在」也改成拒绝，
+    /// 本用例会红（报错会变成守卫的「无法读取…」而不是 `backup_to_slot_for` 的
+    /// 「未找到 Trae 客户端数据目录…」）。
+    #[cfg(windows)]
+    #[test]
+    fn save_guard_fails_open_only_when_the_source_dir_is_absent() {
+        let _env = crate::modules::trae::test_support::TempEnv::empty();
+        let variant = TraeVariant::TraeWork;
+        let op_dir = platform::detect_data_dir_for(variant).expect("临时 APPDATA 下应能定位目录");
+        assert!(
+            !op_dir.is_dir(),
+            "前置条件：本 fixture 必须没有客户端数据目录（{}）",
+            op_dir.display()
+        );
+
+        let error = save_current_login_for(variant, "1234567890123456")
+            .expect_err("源目录不存在时，报错应由 backup_to_slot_for 给出");
+        assert!(
+            error.contains("未找到 Trae 客户端数据目录"),
+            "报错必须来自 backup_to_slot_for（而不是守卫）：{error}"
+        );
+        assert!(
+            !error.contains("无法读取"),
+            "守卫不得在「源目录不存在」时拦截：{error}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 切换后复核：恢复完了要确认客户端**真的**换了人
+    // -----------------------------------------------------------------------
+
+    /// ★ 复核必须读**恢复的写入目标**（`detect_data_dir_for`），不是活跃目录。
+    ///
+    /// fixture 让两个选择器分叉、且各自装着**不同**账号：首位目录 = `first_uid`、
+    /// 活跃目录 = 另一个 uid。复核 `first_uid` 必须 `Confirmed`。
+    /// 若实现误用活跃目录，这里会读到另一个 uid ⇒ 返回 `Mismatch` ⇒ **误报失败**
+    /// （真机 Trae Work 正是这个形态，会把正常切换判成失败）。
+    #[cfg(windows)]
+    #[test]
+    fn restore_verification_reads_the_write_target_not_the_active_dir() {
+        let exp = chrono::Utc::now().timestamp() + 3600;
+        let env = crate::modules::trae::test_support::TempEnv::empty();
+        let fixtures = icube::test_support::write_cloudide_only_user_data(&env.appdata(), exp);
+        let variant = TraeVariant::TraeWork;
+
+        let first_name = platform::data_dir_names_for(variant)[0];
+        let first_uid = fixtures
+            .iter()
+            .find(|(_, name)| name == first_name)
+            .map(|(uid, _)| uid.clone())
+            .expect("首位候选必须在 fixture 里");
+        let active_uid = fixtures
+            .iter()
+            .find(|(_, name)| name != first_name)
+            .map(|(uid, _)| uid.clone())
+            .expect("非首位候选必须在 fixture 里");
+        assert_ne!(first_uid, active_uid, "fixture 必须给两个目录不同 uid");
+        assert_ne!(
+            platform::detect_data_dir_for(variant).unwrap(),
+            platform::select_data_dir_for(variant).unwrap(),
+            "前置：fixture 必须让两个选择器分叉"
+        );
+
+        assert_eq!(
+            verify_restored_login_for(variant, &first_uid),
+            RestoreCheck::Confirmed,
+            "复核必须读写入目标（首位候选）；读活跃目录会误报失败"
+        );
+        // 反向：拿活跃目录那个 uid 当目标 ⇒ 必须是 Mismatch，证明复核确实在比较。
+        assert_eq!(
+            verify_restored_login_for(variant, &active_uid),
+            RestoreCheck::Mismatch {
+                actual: first_uid.clone()
+            },
+            "目标不是写入目标里的账号时必须报 Mismatch"
+        );
+    }
+
+    /// ★ 恢复后**复核**：快照里装的是别人 ⇒ 必须响亮失败，而不是记成「已切换」。
+    ///
+    /// 这条覆盖「历史污染快照」：`profiles/<B>/` 里其实是 A 的登录态
+    /// （守卫上线前被写坏的）。切换流程若不复核，用户会看到「切换成功」然后发现还是同一个人。
+    ///
+    /// 只测**复核逻辑本体**（显式目录），不跑完整切换流程 —— 仓库既有约定：
+    /// `switch_account` 会 `kill_client_for`，在开发机上会真的杀掉用户正在用的 Trae。
+    #[cfg(windows)]
+    #[test]
+    fn restore_verification_reports_mismatch_for_a_polluted_snapshot() {
+        let exp = chrono::Utc::now().timestamp() + 3600;
+        let env = crate::modules::trae::test_support::TempEnv::empty();
+        let fixtures = icube::test_support::write_cloudide_only_user_data(&env.appdata(), exp);
+        let variant = TraeVariant::TraeWork;
+        let uids = fixture_uids(&fixtures, variant);
+        let (owner, target) = (uids[0].clone(), uids[1].clone());
+        assert_ne!(owner, target);
+
+        // 模拟一个被污染的槽位目录：槽位名是 `target`，内容却是 `owner` 的。
+        let polluted = paths::profiles_dir_for(variant).join(&target);
+        let src = env
+            .appdata()
+            .join(platform::data_dir_names_for(variant)[0])
+            .join("User")
+            .join("globalStorage");
+        std::fs::create_dir_all(polluted.join("User").join("globalStorage")).unwrap();
+        std::fs::copy(
+            src.join("storage.json"),
+            polluted.join("User").join("globalStorage").join("storage.json"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            verify_restored_login_in(&polluted, variant, &target),
+            RestoreCheck::Mismatch { actual: owner },
+            "内容属于 owner 却切到 target ⇒ 必须响亮失败"
+        );
+
+        // 同一份内容，目标改成它真正的归属 ⇒ 必须 Confirmed（证明上一条不是恒真）。
+        assert_eq!(
+            verify_restored_login_in(&polluted, variant, &uids[0]),
+            RestoreCheck::Confirmed
+        );
+
+        // 读不到（目录里没有 storage.json）⇒ Unverifiable（fail-open，不得误判为失败）。
+        let empty = paths::profiles_dir_for(variant).join("empty-slot");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_eq!(
+            verify_restored_login_in(&empty, variant, &target),
+            RestoreCheck::Unverifiable,
+            "读不到时必须 fail-open，不能把正常切换判成失败"
+        );
     }
 }

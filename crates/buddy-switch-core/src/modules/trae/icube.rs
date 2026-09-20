@@ -534,6 +534,20 @@ struct StorageSnapshot {
 /// 参考实现跨变体扫全部候选目录并取第一个命中 —— 本项目**不照抄**（见模块头差异 1）。
 fn load_storage(variant: TraeVariant) -> Result<StorageSnapshot, IcubeError> {
     let dir = platform::select_data_dir_for(variant).ok_or(IcubeError::DataDirMissing)?;
+    load_storage_from_dir(&dir, variant)
+}
+
+/// 读取**指定目录**下的 storage.json（显式入参）。
+///
+/// 与 [`load_storage`] 的唯一区别是「目录从哪来」：后者按 [`platform::select_data_dir_for`]
+/// 挑最近活跃的那个。当调用方需要让**校验的对象**与**操作的对象**落在同一个目录时，
+/// 必须先自己定目录、再走这个函数 —— 两个选择器给出的目录**可能不同**
+/// （实测 Trae Work：`select` 给 `TRAE SOLO`、`detect` 给 `TRAE SOLO CN`，
+/// 而登录态只在其一），否则会出现「校验读了 A、操作改了 B」。
+fn load_storage_from_dir(
+    dir: &std::path::Path,
+    variant: TraeVariant,
+) -> Result<StorageSnapshot, IcubeError> {
     let source_app = dir
         .file_name()
         .and_then(|name| name.to_str())
@@ -608,8 +622,25 @@ pub fn device_credential_for(variant: TraeVariant) -> Result<DeviceCredential, I
 }
 
 /// 按**变体**取 cloudide 凭据（诊断 / 导入兜底，**不承担登录职责**）。
+///
+/// 目录由 [`platform::select_data_dir_for`]（最近活跃）决定。需要「与某个具体操作
+/// 指向同一个目录」时，用 [`cloudide_auth_info_from_dir`]。
 pub fn cloudide_auth_info_for(variant: TraeVariant) -> Result<CloudideAuthInfo, IcubeError> {
-    let snapshot = load_storage(variant)?;
+    let dir = platform::select_data_dir_for(variant).ok_or(IcubeError::DataDirMissing)?;
+    cloudide_auth_info_from_dir(&dir, variant)
+}
+
+/// 从**指定目录**取 cloudide 凭据（显式入参）。
+///
+/// 存在的理由：同一变体的多个候选目录**可能装着不同账号的登录态**
+/// （实测 Trae Work：`TRAE SOLO CN` 有登录态、`TRAE SOLO` 没有，且后者更活跃）。
+/// 调用方若用「最近活跃」去**校验**、却用「首位候选」去**操作**，就会
+/// 校验通过而操作作用在另一个目录上。此函数让两件事能锁定同一个目录。
+pub(crate) fn cloudide_auth_info_from_dir(
+    dir: &std::path::Path,
+    variant: TraeVariant,
+) -> Result<CloudideAuthInfo, IcubeError> {
+    let snapshot = load_storage_from_dir(dir, variant)?;
     let plain = decrypt_storage_key(&snapshot.object, CLOUDIDE_KEY, TcMode::Aes)?;
     cloudide_from_plain(&plain, variant)
 }
@@ -842,25 +873,46 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEc5xtFi4XpzYjFuYwN0sBaUzcnrds\n\
     ) -> Vec<(String, String)> {
         let mut out = Vec::new();
         for (variant_index, variant) in TraeVariant::all().into_iter().enumerate() {
-            for (index, name) in crate::modules::trae::platform::data_dir_names_for(variant)
-                .iter()
-                .enumerate()
-            {
+            let names = crate::modules::trae::platform::data_dir_names_for(variant);
+            for (index, name) in names.iter().enumerate() {
                 let user_id = format!("900000000000{:04}", variant_index * 10 + index);
                 let dir = base.join(name).join("User").join("globalStorage");
                 std::fs::create_dir_all(&dir).expect("fixture 目录应能创建");
                 let storage = serde_json::json!({
                     CLOUDIDE_KEY: synthetic_cloudide_envelope(&user_id, exp),
                 });
-                std::fs::write(
-                    dir.join("storage.json"),
-                    serde_json::to_vec_pretty(&storage).unwrap(),
-                )
-                .expect("fixture storage.json 应能写入");
+                let file = dir.join("storage.json");
+                std::fs::write(&file, serde_json::to_vec_pretty(&storage).unwrap())
+                    .expect("fixture storage.json 应能写入");
+                pin_activity(&file, names.len() - 1 - index);
                 out.push((user_id, (*name).to_string()));
             }
         }
         out
+    }
+
+    /// 把 fixture 文件的 mtime **钉死**在 `age_hours` 小时之前。
+    ///
+    /// ★ 为什么必须钉死、不能依赖「写入顺序」：`platform::data_dir_activity` 取的是
+    /// `storage.json` 的 mtime，而 Windows 的文件时间粒度约 **15.6ms** —— 相邻两次
+    /// fixture 写入经常落在**同一个刻度**上，于是两个候选目录的活跃时间**相等**，
+    /// `select_data_dir_for` 的稳定排序退回候选表原顺序、返回 `names[0]`，
+    /// 与 `detect_data_dir_for` **相同**。凡是把「两个选择器必须分叉」当**前置条件**
+    /// 的用例（守卫类三条）就会随机红在那一行前置断言上：实测全量并行下约 20%
+    /// （15 轮中 3 轮），单独跑 40 次一次不复现 —— 典型的「最难定位」形态。
+    ///
+    /// 这里给第 `i` 个候选钉 `now - (n-1-i)` 小时：**首位最旧、末位最新**，
+    /// 与真机 Trae Work 同形（首位 `TRAE SOLO CN` 有登录态、末位 `TRAE SOLO` 更活跃）。
+    fn pin_activity(file: &std::path::Path, age_hours: usize) {
+        let pinned = std::time::SystemTime::now()
+            - std::time::Duration::from_secs(age_hours as u64 * 3_600);
+        // 必须带 `write(true)`：Windows 上 `SetFileTime` 需要 `FILE_WRITE_ATTRIBUTES`，
+        // 只读句柄会 `ERROR_ACCESS_DENIED`。
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(file)
+            .and_then(|handle| handle.set_modified(pinned))
+            .expect("fixture 应能把 storage.json 的 mtime 钉死");
     }
 
     /// 在 `base` 下铺一份**合成**的 Trae userData 目录树，覆盖全部变体的候选目录名。

@@ -975,7 +975,14 @@ mod tests {
     /// 「在 Trae Work 库里找不到」而被全部静默丢弃 → 签到队列莫名其妙为空。
     #[test]
     fn plan_uses_the_options_variant_for_selected_scope() {
+        // ★ 先**清空**再建：本用例的临时 home 按 `process::id()` 命名，而 PID 会被系统复用
+        //   （实测本机 `%TEMP%` 里已堆积 174 个 `trae-checkin-plan-*`，**全部**残留着
+        //   上一轮的 `groups.trae_cn.json`）。一旦撞上复用，`create_dir_all` 是空操作，
+        //   残留的「CN 组」会让下面的 `group_create_for` 返回 `Err("同名分组已存在")`
+        //   并被 `unwrap()` 打崩 —— 实测 40 轮全量并行中 2 轮（5%），单跑几乎不复现。
+        //   同仓库 `platform::tests` 里的 `trae-select-*` 已是「先删后建」的写法。
         let dir = std::env::temp_dir().join(format!("trae-checkin-plan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
         let _guard = crate::modules::config::HomeOverrideGuard::set(&dir);
 
