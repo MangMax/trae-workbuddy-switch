@@ -282,9 +282,21 @@ pub fn extract_local_jwt_for(variant: TraeVariant) -> Result<(String, String), S
 /// 所以：**校验的对象与操作的对象必须用同一个目录**。本函数把「读哪个目录」
 /// 变成调用方的显式入参，让两件事能锁定同一个目录。
 ///
-/// ⚠️ 两个入口**各取所需，不要合并**：导入必须读**活跃**目录（用户在活跃客户端里
-/// 刚登录完就点导入，读首位候选会读到另一份旧登录态）；备份/恢复与守卫必须读
-/// **首位候选**（那是既有语义，改它会动到切换行为）。共用的是这个原语，不是目录选择器。
+/// ⚠️ 两个入口**各取所需，不要合并**。它们的差别是**目录选择器的语义**，不是「要不要传目录」：
+///
+/// | 入口 | 读哪个目录 | 选择器 |
+/// |:--|:--|:--|
+/// | 导入（[`extract_local_jwt_for`]） | 该变体**最近活跃**的候选 | [`platform::select_data_dir_for`] |
+/// | 备份 / 恢复 / 守卫 | 该变体**首个存在**的候选（写侧来源） | [`snapshot_data_dir_for`]，即 [`platform::detect_data_dir_for`] |
+///
+/// 导入必须读**活跃**目录：用户在活跃客户端里刚登录完就点导入，若读写侧目录会读到
+/// 另一份旧登录态。反之，备份 / 恢复 / 守卫必须读**写侧**目录 —— 那是「快照要读写
+/// 哪个目录」的唯一来源，改它会动到切换行为。
+///
+/// ⚠️ **不要按「候选表首位」理解写侧**：R3 之后 [`platform::detect_data_dir_for`]
+/// 取的是**首个存在的候选**，不再恒等于 `names[0]`。在只装了 `TRAE SOLO`
+/// （没有 `TRAE SOLO CN`）的机器上，这两者**不是同一个目录** —— 正是 R3 修掉的缺陷。
+/// 共用的是这个原语，不是目录选择器。
 fn extract_local_jwt_from_dir(
     data_dir: &Path,
     variant: TraeVariant,
@@ -1434,7 +1446,8 @@ fn verify_restored_login_in(root: &Path, variant: TraeVariant, target: &str) -> 
 ///
 /// ## 为什么必须有它
 ///
-/// [`backup_to_slot_for`] 的源是 [`snapshot_data_dir_for`]（首位候选），也就是
+/// [`backup_to_slot_for`] 的源是 [`snapshot_data_dir_for`]（该变体**首个存在**的候选，
+/// R3 之后不再恒等于候选表首位），也就是
 /// **客户端此刻真实的登录态**。若调用方指定的槽位是另一个账号，快照就会被贴到错误的账号名下：
 /// `profiles/<B>/` 里装的是 A 的内容，`currentAccount` 却记成 B ⇒ 之后切到 B，
 /// 恢复出来的还是 A。用户看到的症状是「**切换怎么切都是同一个账号**」。
@@ -1573,11 +1586,16 @@ pub fn overview() -> Value {
 /// 而不是「最近活跃」的那个：本字段的用途是让用户核对「切换器**正在操作哪个目录**」，
 /// 与快照的读写目标同源才有意义。「用户最近在用哪个」是另一个问题，
 /// 由 [`platform::select_data_dir_for`] 回答（见 `platform::variants_status` 的 `dataDir`）。
+///
+/// ⚠️ 取值**必须**经 [`snapshot_data_dir_for`] 这个唯一取值点，不得直调
+/// `platform::detect_data_dir_for`：后者今天是前者的薄封装、两者同值，
+/// 但一旦写侧的选择器策略调整（R1 之后只允许改这一个地方），直调会让本字段
+/// **悄悄停留在旧语义**，而注释还在声称「同源」。
 pub fn overview_for(variant: TraeVariant) -> Value {
     json!({
         "profiles": list_profiles_for(variant).iter().map(ProfileInfo::to_json).collect::<Vec<_>>(),
         "currentAccount": current_account_for(variant),
-        "dataDir": platform::detect_data_dir_for(variant).map(|dir| dir.to_string_lossy().to_string()),
+        "dataDir": snapshot_data_dir_for(variant).map(|dir| dir.to_string_lossy().to_string()),
         "clientRunning": platform::is_running_for(variant),
         "coreEntryCount": CORE_ENTRIES.len(),
     })
