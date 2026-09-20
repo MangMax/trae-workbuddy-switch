@@ -896,8 +896,8 @@ fn copy_dir_recursive(source: &Path, target: &Path) -> Result<u64, String> {
 ///
 /// 不变式：**校验的输入必须取自被校验操作将要作用的那个对象。**
 /// 快照类操作的作用对象是「客户端 userData 目录」——`backup_to_slot_for` 从它复制、
-/// `restore_from_slot_for` 向它写入、`ensure_save_target_matches_client` 从它取证、
-/// `verify_restored_login_for` 也从它取证。四者必须指向**同一个目录**。
+/// `restore_from_slot_for` 向它写入、`ensure_save_target_matches_client` 从它取证。
+/// 它们必须指向**同一个目录**。
 ///
 /// 本模块有**两个**语义不同的目录选择器，同一台机器上可能给出不同目录：
 ///
@@ -906,7 +906,7 @@ fn copy_dir_recursive(source: &Path, target: &Path) -> Result<u64, String> {
 /// | [`platform::select_data_dir_for`] | 该变体候选里**最近活跃**的那个（导入用） |
 /// | [`platform::detect_data_dir_for`] | 该变体**首位候选**（`names[0]`） |
 ///
-/// 若四个调用点各自去调选择器，任一处被换成另一个（例如 `select_data_dir_for`）
+/// 若调用点各自去调选择器，任一处被换成另一个（例如 `select_data_dir_for`）
 /// 都会产生「**校验读了 A、操作改了 B**」，且表现是**静默**的：守卫在真机上等于不存在
 /// （假阴性），或复核把正常切换误报成失败（读错目录）。改动是局部的，评审时看不出来。
 ///
@@ -922,6 +922,15 @@ fn copy_dir_recursive(source: &Path, target: &Path) -> Result<u64, String> {
 ///
 /// 把这一差异留在调用点（`.filter(|dir| dir.is_dir())`），是为了让「谁要求存在」
 /// 在代码里一眼可见，而不是被取值点悄悄统一掉（那会改变 restore 的既有行为）。
+///
+/// ## 取值点唯一 ≠ 构造同源：切换链还要**显式传值**
+///
+/// 把取值点收敛到一处，只消除了「同一份逻辑里两处各自取目录」；**同一份值**仍可能
+/// 被取两次而只是**今天恰好相等**（「**约定同源**」）。[`switch_account`] 的
+/// 「恢复 → 复核」链要求更强：目录算**一次**，由调用方把**同一个值**分别交给
+/// 写入（[`restore_from_slot_in_dir`]）与复核（[`verify_restored_login_in`]）
+/// —— 即「**构造同源**」，两者**在类型层面**是同一个值、无法分叉。
+/// 复核**不得**自行再调本函数。
 fn snapshot_data_dir_for(variant: TraeVariant) -> Option<PathBuf> {
     platform::detect_data_dir_for(variant)
 }
@@ -980,6 +989,38 @@ pub fn restore_from_slot(slot: &str) -> Result<u64, String> {
 /// 二是将来若有条目同时出现在两份清单里，**快照内容应当胜出**。
 /// 不变式的完整说明见 [`CORE_ENTRIES`]。
 pub fn restore_from_slot_for(variant: TraeVariant, slot: &str) -> Result<u64, String> {
+    // 目标目录取「快照类操作的唯一取值点」；**不要求存在** —— 委托方会 `create_dir_all` 新建。
+    let target_root = snapshot_data_dir_for(variant).ok_or("无法定位 Trae 客户端数据目录")?;
+    restore_from_slot_in_dir(&target_root, variant, slot)
+}
+
+/// 把指定槽位的快照恢复到**指定目标目录**（显式目录；构造同源）。
+///
+/// ## 与 [`restore_from_slot_for`] 的关系
+///
+/// 后者是「取目录 + 委托本函数」的薄封装（公开签名与行为均不变）。本函数把目标目录
+/// 变成**显式入参**，使调用方能把它**同一个值**同时交给「写入」与「复核」，
+/// 而不是让两边各自再推导一次。
+///
+/// ## 为什么必须是显式入参（I-4 同源不变式）
+///
+/// 不变式：**校验的输入必须取自被校验操作将要作用的那个对象。**
+/// 恢复后的复核要读「刚被写入的那个目录」；若复核自己去调一次取值点，
+/// 就只是「**约定同源**」——两次调用**今天恰好同值**，一旦取值点被改成依赖
+/// 运行时状态（活跃度、环境变量等），写入与复核就会**静默分叉**：
+/// 复核读到另一个目录，把正常切换误报成失败（或反过来盖章）。
+/// 显式传参是「**构造同源**」：两者**在类型层面**就是同一个值，无法分叉。
+///
+/// ## 行为
+///
+/// 与原先的 [`restore_from_slot_for`] 函数体逐条一致，只把目标目录的来源换成入参：
+/// 先校验槽位名 → 确认快照存在 → `create_dir_all(target_root)` → 清「清单外的凭据来源」
+/// → 覆盖清单内条目 → 清单实例锁 → 失败项写日志。
+fn restore_from_slot_in_dir(
+    target_root: &Path,
+    variant: TraeVariant,
+    slot: &str,
+) -> Result<u64, String> {
     if !paths::safe_slot_name(slot) {
         return Err(format!("非法的槽位名: {slot}"));
     }
@@ -987,19 +1028,16 @@ pub fn restore_from_slot_for(variant: TraeVariant, slot: &str) -> Result<u64, St
     if !source_root.is_dir() {
         return Err(format!("槽位 {slot} 的登录态快照不存在"));
     }
-    // 快照目标目录：唯一取值点。**不要求存在** —— 下面会 `create_dir_all` 新建。
-    let target_root = snapshot_data_dir_for(variant)
-        .ok_or("无法定位 Trae 客户端数据目录")?;
-    std::fs::create_dir_all(&target_root)
+    std::fs::create_dir_all(target_root)
         .map_err(|e| format!("创建客户端数据目录失败: {e}"))?;
 
-    let unpurged = purge_restore_relatives(&target_root);
+    let unpurged = purge_restore_relatives(target_root);
 
     let mut restored = 0u64;
     for entry in CORE_ENTRIES {
         restored += copy_entry(
             &entry.resolve(&source_root),
-            &entry.resolve(&target_root),
+            &entry.resolve(target_root),
             entry.kind,
         )?;
     }
@@ -1226,7 +1264,27 @@ where
     }
 
     // 6. 恢复目标快照。
-    match restore_from_slot_for(variant, &target) {
+    //
+    // ★ 目标目录在这里**只算一次**，并把它**显式传给**第 6 步（写入）与第 6.5 步（复核）。
+    //   这是 I-4 同源不变式要求的**构造同源**：写入与复核共用同一个值，
+    //   而不是各自再去取一次目录（「约定同源」——两次取值今天恰好同值，明天可能分叉）。
+    //
+    //   位置刻意留在第 5 步（关客户端）**之后**：accessor 取不到目录时，用户看到的
+    //   失败步骤与文案必须与「由 `restore_from_slot_for` 内部报错」时**逐字一致**
+    //   （stage=fatal / status=fail / 「恢复失败: 无法定位 Trae 客户端数据目录」）。
+    let restore_dir = match snapshot_data_dir_for(variant) {
+        Some(dir) => dir,
+        None => {
+            let message = "无法定位 Trae 客户端数据目录".to_string();
+            emit(
+                &mut outcome,
+                SwitchStep::new("fatal", "fail", format!("恢复失败: {message}")),
+            );
+            outcome.error = Some(message);
+            return outcome;
+        }
+    };
+    match restore_from_slot_in_dir(&restore_dir, variant, &target) {
         Ok(count) => emit(
             &mut outcome,
             SwitchStep::new("restore", "ok", format!("已恢复 {target} 的登录态（{count} 个文件）")),
@@ -1243,11 +1301,13 @@ where
 
     // 6.5 恢复后**复核**：客户端实际登录的账号必须等于目标账号。
     //
-    // 为什么必须有：`restore_from_slot_for` 只保证「文件被覆盖了」，不保证
+    // 为什么必须有：`restore_from_slot_in_dir` 只保证「文件被覆盖了」，不保证
     // 「覆盖进去的就是 target 的登录态」—— `profiles/<target>/` 可能是被历史上
     // 那条「把当前登录态存进别人槽位」的缺陷**污染过的快照**。没有这一步，
     // 用户看到的是「切换成功」，然后发现还是同一个人（正是报障的那个症状）。
-    match verify_restored_login_for(variant, &target) {
+    //
+    // ★ 复核**复用 `restore_dir` 这个值**（构造同源），不再自取目录。
+    match verify_restored_login_in(&restore_dir, variant, &target) {
         RestoreCheck::Confirmed => emit(
             &mut outcome,
             SwitchStep::new("verify", "ok", format!("已确认客户端当前登录为 {target}")),
@@ -1326,24 +1386,26 @@ enum RestoreCheck {
     Unverifiable,
 }
 
-/// 复核「恢复之后客户端到底登录着谁」（读 [`platform::detect_data_dir_for`]）。
+/// 复核逻辑本体：读**显式传入的目录**，判断客户端此刻登录着谁。
 ///
-/// ⚠️ **必须读 `detect_data_dir_for`（首位候选）**，因为那是
-/// [`restore_from_slot_for`] 的**写入目标**；读活跃目录会在「活跃目录 ≠ 首位候选」
-/// 的机器上**误报失败**（读到的还是切换前那个人，见真机 Trae Work 的形态）。
-/// 目录必须与操作同源这条原则，与 [`ensure_save_target_matches_client`] 完全一致。
+/// ## ★ 目录必须与「写入」是**同一个值**（构造同源，I-4 同源不变式）
 ///
-/// fail-open **仅在读不到时**：客户端没装、快照里没有信封、或该产品线本就没有
-/// 可解凭据，都可能读不到；把「读不到」当成失败会让正常切换被误挡。
-fn verify_restored_login_for(variant: TraeVariant, target: &str) -> RestoreCheck {
-    // 复核读的目录必须与 `restore_from_slot_for` 的写入目标同源（唯一取值点）。
-    let Some(root) = snapshot_data_dir_for(variant).filter(|dir| dir.is_dir()) else {
-        return RestoreCheck::Unverifiable;
-    };
-    verify_restored_login_in(&root, variant, target)
-}
-
-/// 复核逻辑本体（显式目录，便于在不起客户端的前提下测三种结论）。
+/// 本函数是复核的**唯一实现**，目录是**显式入参**——由调用方
+/// （[`switch_account`]）把 [`restore_from_slot_in_dir`] 刚写入的那个目录
+/// **原样传进来**。这与 [`restore_from_slot_for`] 的写入目标必然一致：
+/// 二者**在类型层面**是同一个值，不存在「各自再推导一次」的可能。
+///
+/// 历史上这里曾有一个无参薄封装 `verify_restored_login_for`，它自己再调一次目录取值点
+/// —— 那只是「**约定同源**」（两次取值今天恰好同值）。取值点一旦依赖运行时状态
+/// （活跃度、环境变量等），写入与复核就会**静默分叉**：复核读到另一个目录，
+/// 把正常切换误报成失败。该封装已删除，改由调用方显式传值。
+///
+/// 因此**不要**在此函数内部再引入任何目录选择器 —— 那会把构造同源退回约定同源。
+///
+/// ## fail-open 仅在读不到时
+///
+/// 客户端没装、快照里没有信封、或该产品线本就没有可解凭据，都可能读不到
+/// （目录不存在时同样读不到）；把「读不到」当成失败会让正常切换被误挡。
 fn verify_restored_login_in(root: &Path, variant: TraeVariant, target: &str) -> RestoreCheck {
     match extract_local_jwt_from_dir(root, variant) {
         Ok((actual, _)) if actual == target => RestoreCheck::Confirmed,
@@ -2864,12 +2926,19 @@ mod tests {
     // 切换后复核：恢复完了要确认客户端**真的**换了人
     // -----------------------------------------------------------------------
 
-    /// ★ 复核必须读**恢复的写入目标**（`detect_data_dir_for`），不是活跃目录。
+    /// ★ 复核逻辑本体读的是**它收到的那个目录**，而不是活跃目录。
     ///
     /// fixture 让两个选择器分叉、且各自装着**不同**账号：首位目录 = `first_uid`、
-    /// 活跃目录 = 另一个 uid。复核 `first_uid` 必须 `Confirmed`。
-    /// 若实现误用活跃目录，这里会读到另一个 uid ⇒ 返回 `Mismatch` ⇒ **误报失败**
-    /// （真机 Trae Work 正是这个形态，会把正常切换判成失败）。
+    /// 活跃目录 = 另一个 uid。
+    ///
+    /// 改造成**构造同源**后，复核不再自取目录（见
+    /// [`switch_passes_the_same_dir_to_restore_and_verification`] 的结构断言），
+    /// 故本用例改为把目录**显式喂进去**：
+    ///
+    /// - 喂**写入目标**（首位候选）⇒ `Confirmed`；
+    /// - 喂**活跃目录** ⇒ `Mismatch`（读到的是另一个人）。
+    ///
+    /// 第二条证明「复核确实在读它收到的目录并做比较」，不是恒真。
     #[cfg(windows)]
     #[test]
     fn restore_verification_reads_the_write_target_not_the_active_dir() {
@@ -2890,24 +2959,87 @@ mod tests {
             .map(|(uid, _)| uid.clone())
             .expect("非首位候选必须在 fixture 里");
         assert_ne!(first_uid, active_uid, "fixture 必须给两个目录不同 uid");
+
+        // `snapshot_data_dir_for` 就是 `restore_from_slot_in_dir` 的写入目标来源。
+        let write_target = snapshot_data_dir_for(variant).expect("临时 APPDATA 下应能定位目录");
+        let active_dir = platform::select_data_dir_for(variant).expect("活跃候选应存在");
         assert_ne!(
-            platform::detect_data_dir_for(variant).unwrap(),
-            platform::select_data_dir_for(variant).unwrap(),
+            write_target, active_dir,
             "前置：fixture 必须让两个选择器分叉"
         );
 
         assert_eq!(
-            verify_restored_login_for(variant, &first_uid),
+            verify_restored_login_in(&write_target, variant, &first_uid),
             RestoreCheck::Confirmed,
-            "复核必须读写入目标（首位候选）；读活跃目录会误报失败"
+            "写入目标里的账号 == 目标 ⇒ 必须 Confirmed"
         );
-        // 反向：拿活跃目录那个 uid 当目标 ⇒ 必须是 Mismatch，证明复核确实在比较。
+        // 反向：喂活跃目录 ⇒ 读到的是另一个人 ⇒ Mismatch（证明复核真的在用收到的目录）。
         assert_eq!(
-            verify_restored_login_for(variant, &active_uid),
+            verify_restored_login_in(&active_dir, variant, &first_uid),
             RestoreCheck::Mismatch {
-                actual: first_uid.clone()
+                actual: active_uid.clone()
             },
-            "目标不是写入目标里的账号时必须报 Mismatch"
+            "喂活跃目录时必须读到活跃账号并报 Mismatch（否则本用例证明不了什么）"
+        );
+    }
+
+    /// 从源码里取某个函数的函数体（花括号配平），供结构断言用。
+    fn fn_body_in_source(source: &str, name: &str) -> String {
+        let needle = format!("fn {name}");
+        let start = source
+            .find(&needle)
+            .unwrap_or_else(|| panic!("源码里必须存在 {needle}"));
+        let open = start
+            + source[start..]
+                .find('{')
+                .unwrap_or_else(|| panic!("{needle} 必须有函数体"));
+        let mut depth = 0i32;
+        for (offset, ch) in source[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return source[open + 1..open + offset].to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("{needle} 的花括号不配平");
+    }
+
+    /// ★ **构造同源**的结构断言：`switch_account` 必须把**同一个**目录值
+    /// 同时交给「写入」与「复核」。
+    ///
+    /// ## 为什么是结构断言而不是运行时断言
+    ///
+    /// 「复核是否复用写入目录」**只体现在调用形态上**；而运行 `switch_account` 会走到
+    /// 第 5 步 `kill_client_for`，在开发机上会真的杀掉用户正在用的 Trae
+    /// （本模块既有约定：切换流程只测各步骤的本体，见
+    /// [`restore_verification_reports_mismatch_for_a_polluted_snapshot`]）。
+    ///
+    /// 因此直接读模块自身源码（`include_str!`）断言：两处都必须收到**同一个标识符**
+    /// `restore_dir`，且不得再出现「自取目录」的旧封装 `verify_restored_login_for`。
+    ///
+    /// ## 反向验证
+    ///
+    /// 把 `verify_restored_login_in(&restore_dir, …)` 换回
+    /// `verify_restored_login_for(variant, …)`，本用例必须报红。
+    #[test]
+    fn switch_passes_the_same_dir_to_restore_and_verification() {
+        let body = fn_body_in_source(include_str!("profile.rs"), "switch_account");
+        assert!(
+            body.contains("restore_from_slot_in_dir(&restore_dir,"),
+            "写入（step 6）必须收到显式目录 `restore_dir`（构造同源）"
+        );
+        assert!(
+            body.contains("verify_restored_login_in(&restore_dir,"),
+            "复核（step 6.5）必须复用同一个 `restore_dir`，而不是自取目录（否则退回约定同源）"
+        );
+        assert!(
+            !body.contains("verify_restored_login_for("),
+            "复核不得再走「自取目录」的旧封装（该封装已删除）"
         );
     }
 
