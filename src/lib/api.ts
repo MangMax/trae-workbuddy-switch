@@ -78,7 +78,7 @@ import type {
 /**
  * 双通道适配层：
  * - 桌面 App（Tauri）：`invoke` 调用 Rust commands
- * - webui（浏览器）：HTTP fetch 调用本地 workbuddy-switch 服务（127.0.0.1）
+ * - webui（浏览器）：HTTP fetch 调用本地 buddy-switch 服务（127.0.0.1）
  */
 const API_BASE = "http://127.0.0.1:57890";
 
@@ -274,7 +274,7 @@ async function httpCall<T>(cmd: string, args?: Record<string, unknown>): Promise
       body: route.method === "POST" ? JSON.stringify(args ?? {}) : undefined,
     });
   } catch {
-    throw new Error(`无法连接 workbuddy-switch 服务（${API_BASE}），请先运行 \`workbuddy-switch\``);
+    throw new Error(`无法连接 Buddy Switch 服务（${API_BASE}），请先运行 \`buddy-switch\``);
   }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
@@ -1085,6 +1085,13 @@ export function traeMergeLegacyRegions(): Promise<TraeLegacyMergeReport> {
  *
  * `variant` 决定读/写哪条产品线的快照与客户端目录。它是**数据维度**，
  * 故与其他可选参数同层放在 `options` 里，由后端 `parse_switch_options` 一并解析。
+ *
+ * ⚠️ **整包必须嵌在 `options` 键下**：桌面端命令签名是
+ * `trae_switch_account(app, options: Value)`（单个 `Value` 参数），Tauri 按参数名
+ * 取值，平铺传参会直接报 `missing required key options` —— 只有 webui 通道
+ * （`api_trae_switch` 里 `body.get("options").unwrap_or(body)`）能容忍平铺。
+ * 与 `traeCheckin` 同形；`scripts/check-api-contract.cjs` 的「单 Value 参数」规则
+ * 会守住这条不变式。
  */
 export function traeSwitchAccount(options: {
   userId: string;
@@ -1094,11 +1101,13 @@ export function traeSwitchAccount(options: {
   variant?: TraeVariantId | null;
 }): Promise<TraeSwitchOutcome> {
   return call("trae_switch_account", {
-    userId: options.userId,
-    launch: options.launch ?? true,
-    proxyPort: options.proxyPort ?? null,
-    resetDevice: options.resetDevice ?? false,
-    variant: options.variant ?? null,
+    options: {
+      userId: options.userId,
+      launch: options.launch ?? true,
+      proxyPort: options.proxyPort ?? null,
+      resetDevice: options.resetDevice ?? false,
+      variant: options.variant ?? null,
+    },
   });
 }
 

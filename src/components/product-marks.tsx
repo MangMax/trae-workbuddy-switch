@@ -145,8 +145,12 @@ type TraeVariantKey = "trae_work" | "trae_cn" | "trae_code" | "cn" | "global";
  * 归一化：内容占画布 80.4%、四周 9.8% 透明边距、严格居中）：
  *
  * - `trae_work`：`traework.png`（官方浅色底图标）
- * - `trae_cn`  ：`trae.png`（官方深色底图标）+ 承托块右下角一枚小字角标，
- *   让两者并排时一眼可辨
+ * - `trae_cn`  ：`trae.png`（官方深色底图标）
+ *
+ * 两者靠**图标本身的底色**区分（浅底 / 深底），**不再叠 `CN` 角标**：
+ * 角标在 15px 的按钮里只有 4~5px 高，糊成一团反而像噪点；而调用方
+ * （账号卡片按钮、产品线切换器、范围条）都在图标旁写着产品线名称，
+ * 角标属于重复信息。
  *
  * 渲染手法与 `WorkBuddyMark` / `TraeMark` 完全一致（118% 放大裁透明圈）。
  */
@@ -164,23 +168,12 @@ export function TraeVariantMark({
       )}
       style={{ width: size, height: size }}
     >
-      {/* `global`（国际版 TraeWork）与 `trae_work`（国内版）同属 TraeWork 家族 ⇒ 同一个图标；
-          CN 角标只给 `trae_cn`（国内 TraeCode），国际版不加角标。 */}
+      {/* `global`（国际版 TraeWork）与 `trae_work`（国内版）同属 TraeWork 家族 ⇒ 同一个图标。 */}
       <img
         src={variant === "trae_work" || variant === "global" ? traeworkIcon : traeIcon}
         alt=""
         className="absolute left-1/2 top-1/2 size-[118%] max-w-none -translate-x-1/2 -translate-y-1/2 object-cover"
       />
-      {variant === "trae_cn" && (
-        // 角标是**装饰性的**（`aria-hidden` 由外层承担），
-        // 真正可读的信息在调用方的 tooltip 文案里。
-        <span
-          className="absolute -bottom-px -right-px rounded-[3px] bg-primary px-[2px] font-semibold leading-[1.4] text-primary-foreground"
-          style={{ fontSize: Math.max(7, Math.round(size * 0.3)) }}
-        >
-          CN
-        </span>
-      )}
     </span>
   );
 }

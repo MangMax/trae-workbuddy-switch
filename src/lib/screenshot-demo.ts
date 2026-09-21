@@ -623,6 +623,7 @@ function demoTraeVariants(): TraeVariantsStatus {
       {
         variant: "cn",
         variantLabel: "国内版",
+        consoleBase: "https://www.trae.cn",
         installed: true,
         running: true,
         version: "1.107.1",
@@ -655,6 +656,7 @@ function demoTraeVariants(): TraeVariantsStatus {
       {
         variant: "global",
         variantLabel: "国际版",
+        consoleBase: "https://www.trae.ai",
         installed: true,
         running: false,
         version: "1.107.1",

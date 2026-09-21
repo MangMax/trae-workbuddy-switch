@@ -31,11 +31,17 @@ function programStub(
  * 程序位的 `variant` 是**切换时要回传给后端的标识**：
  * 国内两个程序位有各自的历史标识（`trae_work` / `trae_cn`，后端据此选客户端），
  * 国际版 TraeCode 尚未建模 ⇒ `null`（按钮必须禁用，不能拿同区域另一个客户端顶替）。
+ *
+ * `consoleBase` 是本表里**唯一**「只在后端不可用时才用到」的域值 —— 正常路径一律由后端
+ * `region_endpoints(region).console_base` 提供（`platform.rs` 有单测钉住按区域分家）。
+ * 它出现在这里是因为本表本就是「后端不可用时的展示快照」，与 `variantLabel` 同类；
+ * ⚠️ **后端改域时必须回来同步这一处**，否则演示模式/后端挂掉时「关于」外链会指向旧站。
  */
 export const TRAE_VARIANT_FALLBACK: TraeVariantStatus[] = [
   {
     variant: "cn",
     variantLabel: "国内版",
+    consoleBase: "https://www.trae.cn",
     installed: false,
     running: false,
     version: null,
@@ -50,6 +56,7 @@ export const TRAE_VARIANT_FALLBACK: TraeVariantStatus[] = [
   {
     variant: "global",
     variantLabel: "国际版",
+    consoleBase: "https://www.trae.ai",
     installed: false,
     running: false,
     version: null,

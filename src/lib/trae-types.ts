@@ -154,6 +154,16 @@ export interface TraeVariantStatus {
   variant: TraeRegionId;
   /** 展示名（`"国内版"` / `"国际版"`），与 Rust `TraeRegion::display_name()` 同源。 */
   variantLabel: string;
+  /**
+   * 该区域**用户看得见的那一页**所在的域，是**可直接拼 URL 的基址**。
+   *
+   * 授权页 = `${consoleBase}/authorization`，「关于」外链 = `consoleBase` 本身。
+   * 与 Rust `region_endpoints(region).console_base` 同源（客户端 `bootConfig.consoleHost`），
+   * **域按区域分家**：国内 `https://www.trae.cn`、国际 `https://www.trae.ai`。
+   *
+   * 前端**不得**另立一份域常量 —— 漏改的症状不是报错，而是国际版用户被静默导到国内站。
+   */
+  consoleBase: string;
   installed: boolean;
   running: boolean;
   version: string | null;
@@ -439,7 +449,12 @@ export interface TraeDeviceResetReport {
 /** 发起登录的结果：前端拿 `verificationUri` 去开浏览器。 */
 export interface TraeOAuthStartResult {
   loginId: string;
-  /** 授权页 URL（`https://www.trae.cn/authorization?…`）。 */
+  /**
+   * 授权页 URL。**域按区域分家**（不是同一个页面换参数）：
+   * 国内版 `https://www.trae.cn/authorization?…`，
+   * 国际版 `https://www.trae.ai/authorization?…`。
+   * 后端按变体从端点表派生（`EndpointSet.console_base`），前端**不要**自己拼。
+   */
   verificationUri: string;
   /** 会话有效期（秒）。 */
   expiresIn: number;

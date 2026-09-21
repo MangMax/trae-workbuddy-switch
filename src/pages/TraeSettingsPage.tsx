@@ -43,6 +43,12 @@ import { copyText } from "@/lib/clipboard";
 import { normalizeTraeGatewayLogs } from "@/lib/trae-gateway";
 import { isAutoDetected, traeProductLabel } from "@/lib/trae-client";
 import { useTraeVariant } from "@/lib/use-trae-variant";
+import {
+  findRegionStatus,
+  loadTraeVariantStatuses,
+  TRAE_VARIANT_FALLBACK,
+  TRAE_VARIANTS_KEY,
+} from "@/lib/trae-variant-status";
 import type {
   TraeCapabilities,
   TraeDeviceResetReport,
@@ -54,6 +60,7 @@ import type {
   TraeProfilesOverview,
   TraeSettings,
   TraeVariantId,
+  TraeVariantStatus,
 } from "@/lib/trae-types";
 import { cn } from "@/lib/utils";
 import { useCachedResource } from "@/lib/use-cached-resource";
@@ -766,7 +773,7 @@ function ProfilesSection({
       )}
 
       <div className="border-t border-border/60 px-4 py-3 text-xs leading-5 text-muted-foreground sm:px-5">
-        快照保存在 BuddySwitch 自己的数据目录下，与 Trae 客户端目录分离，因此删除快照不会影响正在使用的登录态。
+        快照保存在 Buddy Switch 自己的数据目录下，与 Trae 客户端目录分离，因此删除快照不会影响正在使用的登录态。
       </div>
 
       {/* 恢复确认：明确告知会覆盖当前登录态 */}
@@ -895,6 +902,21 @@ export default function TraeSettingsPage() {
   const env = pageSnapshot?.env ?? null;
   const capabilities = pageSnapshot?.capabilities ?? null;
   const profiles = pageSnapshot?.profiles ?? null;
+
+  /**
+   * 「关于」外链要指向**当前区域的官方站点**，域由后端给（`consoleBase`），
+   * 前端不另立常量 —— 漏改的症状不是报错，而是国际版用户被静默导到国内站。
+   *
+   * 键与侧栏那颗运行状态圆点共用（`TRAE_VARIANTS_KEY`）⇒ 这里是**缓存命中**，
+   * 不会为本页多发一次探测；首帧（尚未取到）先用兜底快照，
+   * 免得外链先消失再出现。
+   */
+  const { data: variantStatuses } = useCachedResource<TraeVariantStatus[]>(
+    TRAE_VARIANTS_KEY,
+    loadTraeVariantStatuses,
+  );
+  const consoleBase =
+    findRegionStatus(variantStatuses ?? TRAE_VARIANT_FALLBACK, variant)?.consoleBase ?? null;
 
   async function patch(next: Partial<TraeSettings>) {
     if (!settings) return;
@@ -1254,12 +1276,17 @@ export default function TraeSettingsPage() {
                 账号切换、签到与设备标识能力参考开源实现，并按本工具的架构重写为原生 Rust。
               </p>
             </div>
-            <Button variant="ghost" size="sm" asChild>
-              <a href="https://www.trae.cn" target="_blank" rel="noreferrer">
-                <ExternalLink />
-                trae.cn
-              </a>
-            </Button>
+            {consoleBase ? (
+              <Button variant="ghost" size="sm" asChild>
+                <a href={consoleBase} target="_blank" rel="noreferrer">
+                  <ExternalLink />
+                  {consoleBase.replace(/^https?:\/\//, "")}
+                </a>
+              </Button>
+            ) : (
+              // 域未知时**不给死链**：宁可少一枚按钮，也不把用户导到可能错的站。
+              <span className="text-xs text-muted-foreground/75">站点地址未知</span>
+            )}
           </SettingsRow>
           </CardContent>
         </SettingsGroup>

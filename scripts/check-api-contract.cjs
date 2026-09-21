@@ -19,6 +19,15 @@
 // （`body.get("config").unwrap_or(&body)`），且 body 形状在源码里没有机器可读的声明，
 // 无法用稳健的静态规则校验——强行用脆弱正则只会降低整条护栏的可信度，故不做。
 //
+//   ⑥ src-tauri/src/commands.rs  —— 桌面端命令的**参数名**（见第 7 条校验）
+//
+// 第 7 条只覆盖一个**可机检**的子集：签名里除 Tauri 注入参数外**只剩一个 `Value` 参数**
+// 的命令。Tauri 按参数名从 invoke 载荷里取值，前端平铺传参就会报
+// `missing required key <参数名>`（真踩过：`trae_switch_account` 平铺传 `userId/launch/…`，
+// 报 `missing required key options`，而 webui 通道因为 `body.get("options").unwrap_or(body)`
+// 能容忍平铺 —— 于是「浏览器里好用、桌面端点不动」）。这类命令的参数名与形状是**单一、
+// 机器可读**的，因此可以硬校验；其余多参数命令仍不做（那才需要脆弱的正则）。
+//
 // 用法：node scripts/check-api-contract.cjs   （npm run check:api）
 
 const fs = require("fs");
@@ -29,6 +38,11 @@ const API_TS = path.join(ROOT, "src", "lib", "api.ts");
 const SCREENSHOT_DEMO_TS = path.join(ROOT, "src", "lib", "screenshot-demo.ts");
 const SERVER_RS = path.join(ROOT, "crates", "buddy-switch-server", "src", "api.rs");
 const TAURI_LIB_RS = path.join(ROOT, "src-tauri", "src", "lib.rs");
+const TAURI_COMMANDS_RS = path.join(ROOT, "src-tauri", "src", "commands.rs");
+
+// 第 7 条校验的豁免表。留空是**有意**的：目前所有「单 Value 参数」命令都能用对象
+// 字面量调用，豁免项一旦出现，说明出现了需要人工判断的形态，应在评审时说明理由。
+const SINGLE_VALUE_SHAPE_EXEMPT = new Set([]);
 
 // webui 未提供、仅桌面端可用的命令。它们「有意」没有 ROUTES 路由条目——豁免的依据是
 // 「无 ROUTES 路由」，而不是「没守卫」：这些命令的 wrapper **内部**都自带
@@ -177,18 +191,149 @@ function extractInvokeCommands(libRs) {
   return cmds;
 }
 
+/**
+ * 按**顶层**逗号切分（跳过字符串、跳过 `{}`/`[]`/`()` 内部）。
+ *
+ * 用于解析 Rust 形参表与 TS 对象字面量的顶层条目——嵌套里的逗号不能当分隔符。
+ */
+function splitTopLevel(text) {
+  const parts = [];
+  let depth = 0;
+  let current = "";
+  let i = 0;
+  while (i < text.length) {
+    const ch = text[i];
+    if (ch === '"' || ch === "'" || ch === "`") {
+      const quote = ch;
+      current += ch;
+      i += 1;
+      while (i < text.length) {
+        current += text[i];
+        if (text[i] === "\\") {
+          current += text[i + 1] ?? "";
+          i += 2;
+          continue;
+        }
+        if (text[i] === quote) {
+          i += 1;
+          break;
+        }
+        i += 1;
+      }
+      continue;
+    }
+    if (ch === "{" || ch === "[" || ch === "(") depth += 1;
+    if (ch === "}" || ch === "]" || ch === ")") depth -= 1;
+    if (ch === "," && depth === 0) {
+      parts.push(current);
+      current = "";
+      i += 1;
+      continue;
+    }
+    current += ch;
+    i += 1;
+  }
+  if (current.trim() !== "") parts.push(current);
+  return parts;
+}
+
+/** 提取对象字面量内部的**顶层键名**（支持 `{ a: 1 }` 与 `{ a }` 简写）。 */
+function topLevelKeys(objectBody) {
+  return splitTopLevel(objectBody)
+    .map((segment) => {
+      const withValue = segment.match(/^\s*([A-Za-z_$][\w$]*)\s*:/);
+      if (withValue) return withValue[1];
+      const shorthand = segment.match(/^\s*([A-Za-z_$][\w$]*)\s*$/);
+      return shorthand ? shorthand[1] : null;
+    })
+    .filter((key) => key !== null);
+}
+
+/** 把 snake_case 参数名转成 camelCase（`#[tauri::command(rename_all = "camelCase")]` 用）。 */
+function toCamelCase(name) {
+  return name.replace(/_([a-z0-9])/g, (_, ch) => ch.toUpperCase());
+}
+
+/**
+ * 从 commands.rs 提取「除注入参数外只剩一个 `Value` 参数」的命令 → 期望的载荷键名。
+ *
+ * 返回 `Map<命令名, 期望键名>`。Tauri 注入的参数（`AppHandle` / `State` / `Window` …）
+ * 由框架填充，不来自前端，必须先排除，否则每个带 `app` 的命令都会被算成多参数。
+ */
+function extractSingleValueParamCommands(commandsRs) {
+  const source = stripComments(commandsRs);
+  const map = new Map();
+  const fnRe = /pub\s+(?:async\s+)?fn\s+([A-Za-z0-9_]+)\s*\(/g;
+  let m;
+  while ((m = fnRe.exec(source)) !== null) {
+    const name = m[1];
+    const openIndex = m.index + m[0].length - 1;
+    const params = sliceBalanced(source, openIndex);
+    const userParams = splitTopLevel(params)
+      .map((param) => param.trim())
+      .filter((param) => param !== "")
+      .map((param) => {
+        const colon = param.indexOf(":");
+        if (colon < 0) return null;
+        return { name: param.slice(0, colon).trim(), type: param.slice(colon + 1).trim() };
+      })
+      .filter(Boolean)
+      .filter((param) => !/AppHandle|State<|Window|WebviewWindow/.test(param.type));
+    if (userParams.length !== 1) continue;
+    if (!/^(?:serde_json::)?Value$/.test(userParams[0].type)) continue;
+    // 取该命令的 `#[tauri::command(...)]` 属性，判断是否需要驼峰化参数名。
+    const attribute = source.slice(Math.max(0, m.index - 400), m.index);
+    const renameAll = attribute.match(/rename_all\s*=\s*"([^"]+)"\s*\)/);
+    const camel = renameAll && renameAll[1] === "camelCase";
+    map.set(name, camel ? toCamelCase(userParams[0].name) : userParams[0].name);
+  }
+  return map;
+}
+
+/**
+ * 提取 api.ts 中每个 `call("<cmd>", { … })` 的顶层键名。
+ *
+ * 只登记**对象字面量**调用；实参是变量（`call("x", args)`）时记 `null`，
+ * 由调用方决定是报错还是豁免——静默跳过会让护栏悄悄失效。
+ */
+function extractCallArgKeys(apiTs) {
+  const source = stripComments(apiTs);
+  const map = new Map();
+  const re = /(?<![\w.$])call\s*\(\s*"([^"]+)"\s*(,)?/g;
+  let m;
+  while ((m = re.exec(source)) !== null) {
+    const cmd = m[1];
+    const afterComma = m.index + m[0].length;
+    if (!m[2]) {
+      map.set(cmd, []);
+      continue;
+    }
+    let i = afterComma;
+    while (i < source.length && /\s/.test(source[i])) i += 1;
+    if (source[i] !== "{") {
+      map.set(cmd, null);
+      continue;
+    }
+    map.set(cmd, topLevelKeys(sliceBalanced(source, i)));
+  }
+  return map;
+}
+
 function main() {
   const apiTs = read(API_TS);
   const screenshotTs = read(SCREENSHOT_DEMO_TS);
   const serverRs = read(SERVER_RS);
   const libRs = read(TAURI_LIB_RS);
+  const commandsRs = read(TAURI_COMMANDS_RS);
 
   const routes = extractRoutes(apiTs);
   const callCmds = extractCallCommands(apiTs);
+  const callArgKeys = extractCallArgKeys(apiTs);
   const demoReadCmds = extractDemoReadCommands(apiTs);
   const demoCaseCmds = extractDemoCaseCommands(screenshotTs);
   const serverRoutes = extractServerRoutes(serverRs);
   const invokeCmds = extractInvokeCommands(libRs);
+  const singleValueCommands = extractSingleValueParamCommands(commandsRs);
 
   const routeCmds = new Set(routes.map((r) => r.cmd));
   const errors = [];
@@ -263,6 +408,36 @@ function main() {
     }
   }
 
+  // 7) 「单 Value 参数」命令：前端必须把该参数名作为**唯一**的顶层键传过去。
+  //
+  // 这类命令的载荷形状在两侧源码里都是单一、机器可读的，所以能硬校验；
+  // 校验失败的典型症状是「webui 正常、桌面端报 missing required key」。
+  if (singleValueCommands.size === 0) {
+    throw new Error(
+      "未能从 src-tauri/src/commands.rs 解析出任何「单 Value 参数」命令 —— 第 7 条校验会静默失效",
+    );
+  }
+  for (const [cmd, expectedKey] of [...singleValueCommands].sort()) {
+    // 前端没调用的命令不涉及载荷形状（可能是内部 helper，或由其他通道调用）。
+    if (!callCmds.has(cmd) || SINGLE_VALUE_SHAPE_EXEMPT.has(cmd)) continue;
+    const keys = callArgKeys.get(cmd);
+    if (keys === undefined || keys === null) {
+      errors.push(
+        `[desktop] call("${cmd}") 的实参不是可解析的对象字面量，无法校验参数名` +
+          `（命令签名只接受一个 \`${expectedKey}: Value\`）→ 请改用对象字面量 \`{ ${expectedKey}: … }\`，` +
+          `或说明理由后加入 SINGLE_VALUE_SHAPE_EXEMPT`,
+      );
+      continue;
+    }
+    if (keys.length !== 1 || keys[0] !== expectedKey) {
+      errors.push(
+        `[desktop] call("${cmd}") 的顶层键为 [${keys.join(", ") || "（无）"}]，` +
+          `但命令签名只接受一个 \`${expectedKey}: Value\` 参数 → 桌面端会报 ` +
+          `\`missing required key ${expectedKey}\`（webui 通道因后端兼容平铺，可能看不出问题）`,
+      );
+    }
+  }
+
   if (hints.length > 0) {
     for (const hint of hints) process.stdout.write(`${hint}\n`);
   }
@@ -277,6 +452,7 @@ function main() {
     `API 契约校验通过：routes=${routes.length}，call=${callCmds.size}，` +
       `server=${serverRoutes.size}，invoke=${invokeCmds.size}，` +
       `demoRead=${demoReadCmds.size}，demoCase=${demoCaseCmds.size}，` +
+      `单Value参数=${singleValueCommands.size}，` +
       `桌面专属豁免=${ROUTE_EXEMPT_COMMANDS.size}\n`,
   );
 }
