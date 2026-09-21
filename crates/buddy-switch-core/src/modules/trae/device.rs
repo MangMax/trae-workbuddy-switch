@@ -441,12 +441,12 @@ mod tests {
             assert_eq!(work_first, work_second, "同变体两次调用必须稳定");
 
             // 另一条产品线：文件不同 ⇒ 必须生成**另一个**值（证明没有读到 Work 的文件）。
-            let cn = oauth_login_machine_for(TraeVariant::TraeCn);
+            let cn = oauth_login_machine_for(TraeVariant::Global);
             assert_ne!(cn.machine_id, work_first.machine_id);
 
             // 两个文件都要真的落盘，且路径不同。
             let work_path = crate::modules::trae::paths::oauth_device_file_for(TraeVariant::TraeWork);
-            let cn_path = crate::modules::trae::paths::oauth_device_file_for(TraeVariant::TraeCn);
+            let cn_path = crate::modules::trae::paths::oauth_device_file_for(TraeVariant::Global);
             assert_ne!(work_path, cn_path);
             assert!(work_path.is_file(), "Trae Work 的 machine_id 未落盘: {work_path:?}");
             assert!(cn_path.is_file(), "Trae CN 的 machine_id 未落盘: {cn_path:?}");

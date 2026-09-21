@@ -87,6 +87,38 @@ export function TraeOAuthLoginDialog({ open, onOpenChange, onSuccess }: Props) {
    */
   const timedOutRef = useRef(false);
 
+  /**
+   * 是否已经落定（成功 / 失败 / 超时）。
+   *
+   * ## 为什么必须有它：终态是**一次性上报**的
+   *
+   * 后端 [`login_poll`] 在返回终态的**同一次调用**里就把会话从内存摘掉
+   * （Rust 侧「轮询到终态后把会话摘掉」）。因此**再轮询一次**只会拿到
+   * `{done:true, error:"登录请求不存在或已过期"}`。
+   *
+   * 前端只要多轮询一次，界面就会**同时**出现「已添加账号：X」与那句红字。
+   * 实测触发路径：父级的 `onSuccess` 是内联箭头函数（每次渲染都是新引用），
+   * 而它原先在轮询 effect 的依赖数组里 —— 登录成功后 `onSuccess` 里的
+   * `loadAll()` 触发父级重渲染 → effect 重跑 → 立刻又轮询一次 → 撞上已被摘除的会话。
+   *
+   * 修法是两条一起上：① 回调进 ref、依赖里不放函数（见 `onSuccessRef`）；
+   * ② 用本 ref 记「已落定」，**跨 effect 重跑也绝不再轮询**。
+   * 只用其中一条也能挡住当前这条路径，但两条都留着，未来任何重跑都不会复现。
+   */
+  const settledRef = useRef(false);
+
+  /**
+   * `onSuccess` 的 ref 镜像：轮询 effect 的依赖里**不允许出现函数 prop**。
+   *
+   * 父级传的是内联箭头函数，引用每次渲染都变；放进依赖会让 effect 无谓重跑
+   * （重跑的副作用见 `settledRef` 的说明）。用 ref 承接后，依赖只剩
+   * `[open, loginId]` 这两个**真正决定会话身份**的值。
+   */
+  const onSuccessRef = useRef(onSuccess);
+  useEffect(() => {
+    onSuccessRef.current = onSuccess;
+  }, [onSuccess]);
+
   // 打开时重置。**同时取消上一次遗留的会话**：用户在轮询中途关掉再打开时，
   // 上一个监听端口还开着；不取消就会泄漏端口，且旧会话超时后可能把
   // 用户后续的授权请求接走（用户会看到「授权成功但应用没反应」）。
@@ -110,16 +142,23 @@ export function TraeOAuthLoginDialog({ open, onOpenChange, onSuccess }: Props) {
     // 轮询会继续每 1.5s 打后端（后端此时返回 `done:true, error:"已取消"`，
     // 于是关闭状态下还在 `setError`）。因此关闭即停。
     if (!open || !loginId) return;
+    // 已落定过就不再轮询。**这条判断正是缺陷入口的封堵**：effect 因依赖变化重跑时
+    // 会立刻再发一次请求，而终态会话早已被后端摘掉，于是「成功」被一句
+    // 「登录请求不存在或已过期」染红。见 `settledRef` 的注释。
+    if (settledRef.current) return;
     let timer: number | undefined;
     let cancelled = false;
 
     const poll = async () => {
       // 已到前端超时就停止轮询：后端那条会话由它自己的超时兜底，
       // 这里继续轮询只会让界面在「已超时」的文案下偷偷转圈。
-      if (timedOutRef.current || cancelled) return;
+      if (timedOutRef.current || settledRef.current || cancelled) return;
       try {
         const res = await api.traeOAuthStatus(loginId);
         if (res.done) {
+          // **先落定、再改界面**：此后任何 effect 重跑都会在入口处直接返回，
+          // 不会再发第二次轮询（终端态只能被读一次）。
+          settledRef.current = true;
           if (res.account) {
             // 同时校 `!timedOutRef.current`：若后端耗时超过前端 310s 才成功
             // （慢换 token / 时钟偏移），此时界面**已经**因超时置了 error。
@@ -129,7 +168,7 @@ export function TraeOAuthLoginDialog({ open, onOpenChange, onSuccess }: Props) {
             // 静默接受会让状态与提示自相矛盾。
             if (!cancelled && !timedOutRef.current) {
               setResult(res.account);
-              onSuccess?.(res.account);
+              onSuccessRef.current?.(res.account);
             }
           } else if (!cancelled && !timedOutRef.current) {
             setError(res.error || "登录失败");
@@ -139,7 +178,10 @@ export function TraeOAuthLoginDialog({ open, onOpenChange, onSuccess }: Props) {
         timer = window.setTimeout(poll, 1500);
       } catch (e) {
         // 轮询本身不抛错（后端永不返 Err），能走到这里说明是传输层问题。
-        if (!cancelled && !timedOutRef.current) setError(api.asError(e));
+        if (!cancelled && !timedOutRef.current) {
+          settledRef.current = true;
+          setError(api.asError(e));
+        }
       }
     };
     void poll();
@@ -148,7 +190,9 @@ export function TraeOAuthLoginDialog({ open, onOpenChange, onSuccess }: Props) {
       cancelled = true;
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [open, loginId, onSuccess]);
+    // 依赖里**只有**决定会话身份的两个值。`onSuccess` 走 ref（见 `onSuccessRef`），
+    // 放进依赖会让父级每次重渲染都重跑本 effect —— 那正是本次修掉的缺陷。
+  }, [open, loginId]);
 
   // 前端独立倒计时与超时：会话开始时起算，超时后给明确文案并停轮询。
   useEffect(() => {
@@ -166,6 +210,8 @@ export function TraeOAuthLoginDialog({ open, onOpenChange, onSuccess }: Props) {
         setRemaining(0);
         if (!timedOutRef.current) {
           timedOutRef.current = true;
+          // 超时同样是终态：一并落下"已落定"，让轮询的语义只有一个判据。
+          settledRef.current = true;
           setError(
             `等待授权超时（${TRAE_OAUTH_FRONTEND_TIMEOUT_SECONDS - 10} 秒）。` +
               "请确认浏览器里已完成授权；若已授权但仍超时，" +
@@ -205,7 +251,10 @@ export function TraeOAuthLoginDialog({ open, onOpenChange, onSuccess }: Props) {
     setBusy(true);
     setError("");
     // 重置超时标志与剩余时间：这是「重新发起」与「首次发起」共用的入口。
+    // `settledRef` 必须一起重置 —— 否则「失败后重新发起」会因残留的"已落定"
+    // 直接跳过轮询，新会话永远等不到结果。
     timedOutRef.current = false;
+    settledRef.current = false;
     setRemaining(null);
     try {
       const res = await api.traeOAuthStart(variant);
@@ -321,14 +370,20 @@ export function TraeOAuthLoginDialog({ open, onOpenChange, onSuccess }: Props) {
           </Alert>
         )}
 
-        {error && (
+        {/*
+          错误块**必须**与结果块互斥：`{error && …}` 单独渲染时，一次多余的轮询
+          就能让界面同时出现「已添加账号：X」与红色报错（本次修掉的缺陷形态）。
+          轮询侧已落定封堵，这里再互斥一次 —— 两块提示自相矛盾是最坏的用户体验，
+          值得两道保险。重试按钮本来就用的 `error && !result`，这里与之对齐。
+        */}
+        {error && !result && (
           <Alert variant="destructive">
             <AlertDescription>{error}</AlertDescription>
           </Alert>
         )}
 
         {/* 出错/超时后仍把回调地址摆出来：这是排查「回调没打回本机」的唯一抓手。 */}
-        {error && port !== null && (
+        {error && !result && port !== null && (
           <p className="text-xs text-muted-foreground break-all">
             本机回调监听：<code>http://127.0.0.1:{port}/authorize</code>
           </p>

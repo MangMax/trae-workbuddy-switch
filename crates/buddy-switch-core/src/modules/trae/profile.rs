@@ -2120,13 +2120,13 @@ mod tests {
             "应显示传入变体的展示名 Trae Work：{work}"
         );
         assert!(
-            !work.contains(&format!("【{}】", TraeVariant::TraeCn.display_name())),
+            !work.contains(&format!("【{}】", TraeVariant::Trae.display_name())),
             "不得出现另一条产品线的标签：{work}"
         );
 
-        let cn = diagnose_missing_credential(&root, TraeVariant::TraeCn);
+        let cn = diagnose_missing_credential(&root, TraeVariant::Trae);
         assert!(
-            cn.contains(&format!("【{}】", TraeVariant::TraeCn.display_name())),
+            cn.contains(&format!("【{}】", TraeVariant::Trae.display_name())),
             "应显示传入变体的展示名 Trae CN：{cn}"
         );
         assert!(
@@ -2209,7 +2209,7 @@ mod tests {
         std::fs::write(&cn_storage, r#"{"telemetry":{}}"#).unwrap();
 
         let work_result = extract_local_jwt_for(TraeVariant::TraeWork);
-        let cn_result = extract_local_jwt_for(TraeVariant::TraeCn);
+        let cn_result = extract_local_jwt_for(TraeVariant::Trae);
 
         match original {
             Some(value) => std::env::set_var("APPDATA", value),
@@ -2223,7 +2223,7 @@ mod tests {
         assert_eq!(work_uid, "1111111111111111", "不得回落到 Trae CN 的凭据");
         assert_eq!(work_found, format!("Cloud-IDE-JWT {work_token}"));
 
-        // 反向也成立：TraeCn 请求只取自己目录里的凭据。
+        // 反向也成立：Trae 请求只取自己目录里的凭据。
         let (cn_uid, cn_found) = cn_result.expect("应取到 Trae CN 目录里的凭据");
         assert_eq!(cn_uid, "2222222222222222");
         assert_eq!(cn_found, format!("Cloud-IDE-JWT {cn_token}"));
@@ -2244,7 +2244,7 @@ mod tests {
 
         let error = extract_local_jwt_for(TraeVariant::TraeWork)
             .expect_err("两条候选目录都不存在时必须报错");
-        let cn_error = extract_local_jwt_for(TraeVariant::TraeCn)
+        let cn_error = extract_local_jwt_for(TraeVariant::Trae)
             .expect_err("两条候选目录都不存在时必须报错");
 
         match original {
@@ -2258,7 +2258,7 @@ mod tests {
             "报错必须点名 Trae Work：{error}"
         );
         assert!(
-            cn_error.contains(TraeVariant::TraeCn.display_name()),
+            cn_error.contains(TraeVariant::Trae.display_name()),
             "报错必须点名 Trae CN：{cn_error}"
         );
     }
@@ -2274,7 +2274,7 @@ mod tests {
         // `BUDDY_SWITCH_HOME`。断言绝对路径会被并行跑的其它用例改 home 而"假红"
         // （症状是左右目录名差一个 PID 后缀），只比 basename 天然免疫。
         let work = paths::profiles_dir_for(TraeVariant::TraeWork);
-        let cn = paths::profiles_dir_for(TraeVariant::TraeCn);
+        let cn = paths::profiles_dir_for(TraeVariant::Trae);
 
         assert_eq!(
             work.file_name().and_then(|n| n.to_str()),
@@ -2291,7 +2291,7 @@ mod tests {
         // 单个账号的快照目录同样分家。
         assert_ne!(
             paths::profile_dir_for(TraeVariant::TraeWork, "u1"),
-            paths::profile_dir_for(TraeVariant::TraeCn, "u1"),
+            paths::profile_dir_for(TraeVariant::Trae, "u1"),
             "同一个 uid 在两条产品线下必须是两个槽位"
         );
     }
@@ -2308,13 +2308,13 @@ mod tests {
         let _guard = crate::modules::config::HomeOverrideGuard::set(&dir);
 
         set_current_account_for(TraeVariant::TraeWork, "u-work").unwrap();
-        set_current_account_for(TraeVariant::TraeCn, "u-cn").unwrap();
+        set_current_account_for(TraeVariant::Trae, "u-cn").unwrap();
 
         assert_eq!(current_account_for(TraeVariant::TraeWork).as_deref(), Some("u-work"));
-        assert_eq!(current_account_for(TraeVariant::TraeCn).as_deref(), Some("u-cn"));
+        assert_eq!(current_account_for(TraeVariant::Trae).as_deref(), Some("u-cn"));
 
         // 覆盖其中一条不得影响另一条。
-        set_current_account_for(TraeVariant::TraeCn, "u-cn-2").unwrap();
+        set_current_account_for(TraeVariant::Trae, "u-cn-2").unwrap();
         assert_eq!(
             current_account_for(TraeVariant::TraeWork).as_deref(),
             Some("u-work"),
@@ -2331,11 +2331,11 @@ mod tests {
         let _guard = crate::modules::config::HomeOverrideGuard::set(&dir);
 
         // 只往 Trae CN 的目录里放一个槽位。
-        let cn_slot = paths::profiles_dir_for(TraeVariant::TraeCn).join("cn-only");
+        let cn_slot = paths::profiles_dir_for(TraeVariant::Trae).join("cn-only");
         std::fs::create_dir_all(&cn_slot).unwrap();
         std::fs::write(cn_slot.join("marker.txt"), b"x").unwrap();
 
-        let cn_slots: Vec<String> = list_profiles_for(TraeVariant::TraeCn)
+        let cn_slots: Vec<String> = list_profiles_for(TraeVariant::Trae)
             .into_iter()
             .map(|info| info.slot)
             .collect();
@@ -2359,11 +2359,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let _guard = crate::modules::config::HomeOverrideGuard::set(&dir);
 
-        set_current_account_for(TraeVariant::TraeCn, "u-cn").unwrap();
-        let cn_slot = paths::profiles_dir_for(TraeVariant::TraeCn).join("u-cn");
+        set_current_account_for(TraeVariant::Trae, "u-cn").unwrap();
+        let cn_slot = paths::profiles_dir_for(TraeVariant::Trae).join("u-cn");
         std::fs::create_dir_all(&cn_slot).unwrap();
 
-        let cn = overview_for(TraeVariant::TraeCn);
+        let cn = overview_for(TraeVariant::Trae);
         let work = overview_for(TraeVariant::TraeWork);
 
         assert_eq!(cn.get("currentAccount").and_then(Value::as_str), Some("u-cn"));
@@ -2668,14 +2668,14 @@ mod tests {
         let fixtures = icube::test_support::write_cloudide_only_user_data(&env.appdata(), exp);
 
         let work_uids = fixture_uids(&fixtures, TraeVariant::TraeWork);
-        let cn_uids = fixture_uids(&fixtures, TraeVariant::TraeCn);
+        let cn_uids = fixture_uids(&fixtures, TraeVariant::Trae);
         assert_eq!(work_uids.len(), 2, "Trae Work 应有两个候选目录");
         assert_eq!(cn_uids.len(), 2, "Trae CN 应有两个候选目录");
 
         let (work_uid, work_header) =
             extract_local_jwt_for(TraeVariant::TraeWork).expect("Trae Work 必须能从 tc 信封导入");
         let (cn_uid, cn_header) =
-            extract_local_jwt_for(TraeVariant::TraeCn).expect("Trae CN 必须能从 tc 信封导入");
+            extract_local_jwt_for(TraeVariant::Trae).expect("Trae CN 必须能从 tc 信封导入");
 
         assert!(work_uids.contains(&work_uid), "读到了别的目录的账号：{work_uid}");
         assert!(cn_uids.contains(&cn_uid), "读到了别的目录的账号：{cn_uid}");

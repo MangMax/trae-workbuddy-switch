@@ -26,6 +26,7 @@ use crate::modules::trae::platform;
 use crate::modules::trae::profile::{self, SwitchOptions};
 use crate::modules::trae::settings;
 use crate::modules::trae::store;
+use crate::modules::trae::token_stats::TraeTokenScope;
 use crate::modules::trae::variant::TraeVariant;
 
 /// 账号页需要的全部数据：账号视图 + 分组视图 + 概览计数（默认变体，兼容壳）。
@@ -154,6 +155,9 @@ pub fn credits_overview_for(variant: TraeVariant) -> Value {
     json!({
         "remaining": remaining.credits,
         "expireTimes": remaining.expire_times,
+        // 逐包明细（账号卡进度条的数据源）：`{ "<uid>": [CreditPackage…] }`。
+        // 缺失 / 旧缓存 → `{}`（`RemainingCreditsFile.packages` 的 `#[serde(default)]`）。
+        "packages": remaining.packages,
         "updatedAt": remaining.updated_at,
         "balances": balances,
         "records": history.records.iter().map(|record| json!({
@@ -170,6 +174,14 @@ pub fn credits_overview_for(variant: TraeVariant) -> Value {
         })).collect::<Vec<_>>(),
         "todayEarned": today_earned,
         "historyDays": crate::modules::trae::TRAE_HISTORY_KEEP_DAYS,
+        // 「官方积分消耗按模型」在 Trae 侧**无数据源**：积分只来自签到快照，
+        // 不存在「产生这些积分的请求用量」这一口径。形状与文案由 `unsupported_note`
+        // 单点构造（与 Token 统计页同源），页面只渲染置灰卡，不造假图表。
+        "unsupported": [unsupported_note(
+            "official_credit_by_model",
+            "官方积分消耗按模型",
+            "Trae 积分只来自签到快照，不存在「产生这些积分的请求用量」这一口径的数据源。",
+        )],
     })
 }
 
@@ -369,13 +381,13 @@ pub fn group_op_for(
 /// 而真正的问题只是「客户端还没跟上」。因此规则是**宽容的**：
 ///
 /// - `trae_work` → [`TraeVariant::TraeWork`]（同时也是缺省）
-/// - `trae_cn` → [`TraeVariant::TraeCn`]
+/// - `trae_cn` → [`TraeVariant::Trae`]
 /// - 其它任何值（含缺失、空串、拼错、旧前端的 `null`）→ 默认变体
 ///
 /// **默认变体沿用旧文件名**（存续层已如此设计），所以「回落默认」对老用户而言
 /// 语义就是「行为和升级前一模一样」——这是安全的失败方向。
 ///
-/// 反过来若回落成 `TraeCn`，老用户的账号库会瞬间看起来空了。
+/// 反过来若回落成 `Trae`，老用户的账号库会瞬间看起来空了。
 pub fn parse_variant_param(params: &Value) -> TraeVariant {
     params
         .get("variant")
@@ -612,6 +624,24 @@ pub fn reset_device_for(variant: TraeVariant) -> Result<Value, String> {
 }
 
 // ---------------------------------------------------------------------------
+// 旧「产品线」账号库 → 区域账号库的一次性合并
+// ---------------------------------------------------------------------------
+
+/// 把旧产品线的账号库（`.trae_cn` 后缀）并入**国内版**区域账号库。
+///
+/// **幂等**：没有旧库、或已经并完时返回 `changed: false`，且不产生任何写入
+/// （见 [`super::region_migrate::merge_legacy_cn_into_region`]）。
+/// 因此前端在页面加载时无脑调一次是安全的。
+///
+/// 为什么由**前端触发**而不是启动阶段自动跑：合并会改写用户的账号库。让用户在
+/// 能看到结果的地方触发、并在合并后收到一条明确提示，比在启动阶段静默改数据
+/// 更符合本工具「改写用户数据前先备份、并让用户知道」的既有约定
+/// —— 备份路径会随报告一起回传。
+pub fn merge_legacy_regions() -> Result<Value, String> {
+    super::region_migrate::merge_legacy_cn_into_region().map(|report| report.to_json())
+}
+
+// ---------------------------------------------------------------------------
 // OAuth 登录（浏览器授权 + 本地回调监听）
 // ---------------------------------------------------------------------------
 
@@ -678,9 +708,79 @@ pub fn save_settings(patch: Value) -> Result<Value, String> {
 /// Token 统计（聚合本机 Trae 网关请求日志）。
 ///
 /// `days` 为统计窗口天数；`None` / `<= 0` 表示全部历史。
+/// `scope` 为**变体范围**筛选维度（见 [`TraeTokenScope`]），缺省 `All`。
 /// 解析细节与三条边界见 [`crate::modules::trae::token_stats`]。
-pub fn token_statistics(days: Option<i64>) -> Value {
-    crate::modules::trae::token_stats::get_statistics(days)
+pub fn token_statistics(days: Option<i64>, scope: TraeTokenScope) -> Value {
+    crate::modules::trae::token_stats::get_statistics(days, scope)
+}
+
+/// 「平台做不到」的统一说明形状（`{capability,label,supportedOn,reason}`）——**唯一来源**。
+///
+/// ## 为什么必须单点构造
+///
+/// 与 [`crate::modules::trae::platform::Unsupported`] 同构，但那个结构的字段是
+/// `&'static str`、且表达的是「平台能力矩阵」；Token 统计这类**载荷内**的置灰卡需要
+/// 运行期拼装的文案。两条来源若各拼一遍 JSON，字段名迟早漂移（`supportedOn` vs
+/// `supported_on`），前端 `CapabilityBadge` 就会静默拿不到值。
+///
+/// `supportedOn` 恒为 `—`：这些维度**在任何平台都不存在**（不是「换个系统就行」），
+/// 用破折号而非留空，前端据此渲染「平台不支持」而不是「加载中」。
+///
+/// `MEMORY.md §八`：**绝不用「成功」冒充**——做不到的维度不带 `ok:true`，只带本形状。
+pub fn unsupported_note(capability: &str, label: &str, reason: &str) -> Value {
+    json!({
+        "capability": capability,
+        "label": label,
+        "supportedOn": "—",
+        "reason": reason,
+    })
+}
+
+/// 打开 Trae 客户端的数据目录（宿主命令 `open_trae_data_dir` 的唯一实现）。
+///
+/// ## 平台归属
+///
+/// **非 Windows → 结构化 `Unsupported`**（而非「假成功」或裸 `Err`）：Trae 的
+/// userData 定位与「在文件管理器中打开」这套实现按 Windows 语义固化
+/// （`%APPDATA%\<产品名>` + `explorer`），其他平台未对齐，故如实声明做不到。
+/// 这与 [`crate::modules::trae::platform::capabilities`] 的 `machine_guid_reset` 同策。
+///
+/// ## 取哪个目录
+///
+/// 走 [`crate::modules::trae::platform::select_data_dir_for`]（**读 / 展示侧**语义）：
+/// 「该产品线最近被用过的那个 userData 目录」。找不到（该变体一个候选目录都不存在）时
+/// 返回**指向该变体**的错误，提示用户先启动一次对应客户端，而不是含糊的「未检测到」。
+pub fn open_data_dir(variant: TraeVariant) -> Result<Value, String> {
+    if !cfg!(windows) {
+        return Ok(crate::modules::trae::platform::Unsupported::new(
+            "open_data_dir",
+            "打开 Trae 数据目录",
+            "Windows",
+            "Trae userData 目录定位与文件管理器打开按 Windows 语义实现，当前平台未提供等价方式。",
+        )
+        .to_json());
+    }
+
+    let dir = crate::modules::trae::platform::select_data_dir_for(variant).ok_or_else(|| {
+        format!(
+            "未找到「{}」的 Trae 数据目录：请先启动一次该客户端，再打开目录。",
+            variant.display_name()
+        )
+    })?;
+
+    #[cfg(windows)]
+    {
+        std::process::Command::new("explorer")
+            .arg(&dir)
+            .spawn()
+            .map_err(|error| format!("打开目录失败: {error}"))?;
+    }
+
+    Ok(json!({
+        "ok": true,
+        "path": dir.to_string_lossy(),
+        "variant": variant.as_str(),
+    }))
 }
 
 /// 运行日志（系统日志页的「运行日志」标签页）。
@@ -927,5 +1027,64 @@ mod tests {
         // 空字符串等同未提供
         let all2 = clear_cooldown(Some("")).unwrap();
         assert_eq!(all2.get("scope").unwrap().as_str(), Some("all"));
+    }
+
+    /// `unsupported_note` 是「平台做不到」的唯一形状来源：字段名必须逐字钉死，
+    /// 否则前端 `CapabilityBadge` 会静默拿不到 `supportedOn`/`reason`。
+    #[test]
+    fn unsupported_note_has_the_pinned_four_field_shape() {
+        let value = unsupported_note("cache_metrics", "缓存命中率", "上游不回传 cache 字段");
+        let object = value.as_object().expect("必须是对象");
+        let keys: std::collections::BTreeSet<&str> =
+            object.keys().map(String::as_str).collect();
+        let expected: std::collections::BTreeSet<&str> =
+            ["capability", "label", "supportedOn", "reason"].into_iter().collect();
+        assert_eq!(keys, expected, "字段名 / 数量漂移");
+        assert_eq!(value["capability"], "cache_metrics");
+        assert_eq!(value["label"], "缓存命中率");
+        // 这些维度在任何平台都不存在 → supportedOn 恒为破折号（前端据此渲染「平台不支持」）。
+        assert_eq!(value["supportedOn"], "—");
+        assert_eq!(value["reason"], "上游不回传 cache 字段");
+        // 绝不用「成功」冒充（MEMORY.md §八）。
+        assert!(value.get("ok").is_none());
+    }
+
+    /// Token 统计必须透出新聚合键；scope 缺省应为「全部」。
+    #[test]
+    fn token_statistics_exposes_new_aggregation_keys() {
+        let dir = std::env::temp_dir().join(format!("trae-token-handlers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let _guard = crate::modules::config::HomeOverrideGuard::set(&dir);
+
+        let value = token_statistics(None, TraeTokenScope::default());
+        assert_eq!(TraeTokenScope::default(), TraeTokenScope::All);
+        for key in ["variantCounts", "modelDaily", "unsupported"] {
+            assert!(value.get(key).is_some(), "缺少字段 {key}");
+        }
+        assert!(value.get("variantCounts").unwrap().is_object());
+        assert!(value.get("variantCounts").unwrap().get("unlabeled").is_some());
+        assert!(value.get("modelDaily").unwrap().is_array());
+        assert!(value.get("unsupported").unwrap().is_array());
+    }
+
+    /// `open_data_dir` 在非 Windows 上必须返回**结构化 Unsupported**（四个字段），
+    /// 而不是裸错误或假成功；Windows 上返回 `{ok,path,variant}`（路径可不存在但不得 panic）。
+    #[test]
+    fn open_data_dir_is_structured_unsupported_off_windows() {
+        let dir = std::env::temp_dir().join(format!("trae-opendir-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let _guard = crate::modules::config::HomeOverrideGuard::set(&dir);
+
+        let value = open_data_dir(TraeVariant::TraeWork).expect("open_data_dir 不应 Err");
+        if cfg!(windows) {
+            // 隔离 home 下不一定真装了 Trae；能拿到 ok+path 就够（实际打开是宿主副作用）。
+            assert!(value.get("ok").is_some() || value.get("capability").is_some());
+        } else {
+            assert_eq!(value["capability"], "open_data_dir");
+            assert_eq!(value["supportedOn"], "Windows");
+            assert!(value.get("reason").is_some());
+            assert!(value.get("ok").is_none(), "非 Windows 不得返回假成功");
+        }
     }
 }

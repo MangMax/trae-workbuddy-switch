@@ -750,7 +750,14 @@ async fn try_exchange_variant(
         .json(payload)
         .send()
         .await
-        .map_err(|e| format!("请求失败: {e}"))?;
+        .map_err(|e| {
+            // 与签到/续期同一出口：展开 source 链（见 modules/net.rs）。
+            // 授权流程的失败提示往往是用户唯一的线索，不能只剩一行顶层文案。
+            format!(
+                "请求失败: {}",
+                crate::modules::net::describe_transport_error(&e)
+            )
+        })?;
 
     let status = response.status().as_u16();
     let body: Value = response
@@ -1828,8 +1835,8 @@ mod tests {
         assert!(!used);
         // 缺失 / 空串：回落该变体的 icube_base。
         for missing in [None, Some(""), Some("   ")] {
-            let (host, used) = resolve_exchange_host(missing, TraeVariant::TraeCn);
-            assert_eq!(host, "https://api.trae.com.cn");
+            let (host, used) = resolve_exchange_host(missing, TraeVariant::Global);
+            assert_eq!(host, "https://icube-normal.trae.ai");
             assert!(used, "回落必须被标记，以便留痕");
         }
     }
@@ -1992,7 +1999,7 @@ mod tests {
         )
         .expect("Trae Work 账号应能落库");
         account::login_with_exchanged_tokens_for(
-            TraeVariant::TraeCn,
+            TraeVariant::Global,
             make_jwt("cn-user"),
             None,
             Some("CN".to_string()),
@@ -2001,12 +2008,12 @@ mod tests {
         .expect("Trae CN 账号应能落库");
 
         let login_id = "test-status-variant";
-        insert_finished_session(login_id, TraeVariant::TraeCn, json!({"userId": "cn-user"}));
+        insert_finished_session(login_id, TraeVariant::Global, json!({"userId": "cn-user"}));
 
         let value = crate::modules::trae::handlers::oauth_login_status(login_id);
         assert_eq!(
             value.get("variant").and_then(Value::as_str),
-            Some("trae_cn")
+            Some("global")
         );
         let accounts = value
             .get("accounts")
@@ -2029,16 +2036,16 @@ mod tests {
         let _gate = lock_the_callback_port();
         let _env = temp_env();
 
-        let started = crate::modules::trae::handlers::oauth_login_start_for(TraeVariant::TraeCn)
+        let started = crate::modules::trae::handlers::oauth_login_start_for(TraeVariant::Global)
             .await
             .expect("发起登录不应失败");
-        assert_eq!(started["variant"].as_str(), Some("trae_cn"));
-        assert_eq!(started["variantLabel"].as_str(), Some("Trae CN"));
+        assert_eq!(started["variant"].as_str(), Some("global"));
+        assert_eq!(started["variantLabel"].as_str(), Some("国际版"));
         // 授权 URL 的 `device_id` 必须与**该变体**的 icube 设备身份同源
         // （fixture 里两条产品线的候选目录给了不同 deviceId ⇒ 读错变体会露馅）。
         let uri = started["verificationUri"].as_str().unwrap();
         let params = parse_query(uri.split_once('?').unwrap().1);
-        let cn_identity = icube::device_identity_for(TraeVariant::TraeCn).expect("fixture 身份应可读");
+        let cn_identity = icube::device_identity_for(TraeVariant::Global).expect("fixture 身份应可读");
         assert_eq!(
             params.get("device_id").map(String::as_str),
             Some(cn_identity.device_id.as_str())
@@ -2248,7 +2255,7 @@ mod tests {
     async fn login_start_response_carries_variant_and_device_credential_diagnostics() {
         let _gate = lock_the_callback_port();
         let _env = temp_env();
-        let started = login_start_for(TraeVariant::TraeCn)
+        let started = login_start_for(TraeVariant::Global)
             .await
             .expect("发起登录不应失败");
         let login_id = started
@@ -2259,11 +2266,11 @@ mod tests {
 
         assert_eq!(
             started.get("variant").and_then(|v| v.as_str()),
-            Some("trae_cn")
+            Some("global")
         );
         assert_eq!(
             started.get("variantLabel").and_then(|v| v.as_str()),
-            Some("Trae CN")
+            Some("国际版")
         );
         let credential = started
             .get("deviceCredential")
@@ -2604,7 +2611,7 @@ mod tests {
 
         // 账号必须落进 **Trae Work** 的库。
         assert_eq!(account::entries_for(TraeVariant::TraeWork).len(), 1);
-        assert!(account::entries_for(TraeVariant::TraeCn).is_empty());
+        assert!(account::entries_for(TraeVariant::Global).is_empty());
     }
 
     /// ★ `error=` 回调必须**立刻**收尾（且优先于探测判定）。

@@ -95,15 +95,23 @@ const PRODUCT_NAV: Record<Product, readonly NavItem[]> = {
 };
 
 /**
- * 产品显示名。
+ * 产品显示名（侧栏顶部产品切换器与导航无障碍标签的唯一来源）。
  *
- * Trae 分区**固定显示 `Trae`**，不带产品线后缀 —— 具体是哪条线由分区内部的
- * 切换器表达。把线名写进侧栏会让「Trae Work / Trae CN」看起来像两个产品，
- * 而它们共用同一组页面与账号管理方式。
+ * Trae 分区显示 **`TraeWork`**：它管的就是 TraeWork 这条产品线
+ * （国内版 `TRAE SOLO CN` 与国际版 `TRAE SOLO`），名字与客户端
+ * `product.json` 的 `nameAlias`（`TraeWork CN` / `TraeWork`）及系统注册表显示名一致。
+ *
+ * 但**区域（国内版 / 国际版）仍然不写进侧栏**：它由分区内部顶部的区域切换器表达。
+ * 把区域名塞进侧栏会让「国内版 / 国际版」看起来像两个独立产品，
+ * 而它们共用同一组页面、同一套账号管理方式。同理，程序线（TraeWork / TraeCode）
+ * 是**账号卡片上的一枚按钮**，也不进侧栏。
+ *
+ * 注意 `Product` 的**标识**仍是 `trae`（路由前缀 `/trae/...` 与 `PRODUCT_NAV` 的键都不动）：
+ * 本次只改展示名，改标识会牵动路由表与全部 `/trae` 链接。
  */
 const PRODUCT_LABEL: Record<Product, string> = {
   workbuddy: "WorkBuddy",
-  trae: "Trae",
+  trae: "TraeWork",
 };
 
 /** 产品首页：切到某产品时，若当前路由不属于它，就落到这里。 */
@@ -193,12 +201,11 @@ function ProductSwitch({
    * tablist 外框 195px、扣 `p-1` 后内容区 187px、`gap-0.5` 占 2px ⇒ 每格 92px；
    * 再减 `px-2`（16px）+ 图标 15px + `gap-1.5`（6px），**留给文字的只有 55px**，
    * 而 12px/500 的 `WorkBuddy` 实测 `scrollWidth = 64px` —— 短 9px，被截成 `WorkBu…`。
-   * （此前的注释把「每格 95px」当成了文字可用宽度，漏减了图标 15px + 间距 6px +
-   * 内边距 16px，正是这次截断的来源。）
    *
-   * 因此改成**按内容自适应并居中**（`grid-cols-[auto_auto]` + `justify-center`）：
-   * `WorkBuddy` 格 = 8+15+6+64+8 = 101px、`Trae` 格 = 8+15+6+23+8 = 60px，
-   * 加 2px 间隙共 163px ≤ 187px，放得下且有余量。
+   * 因此改成**按内容自适应并居中**（`grid-cols-[auto_auto]` + `justify-center`）。
+   * **实测（2026-09-21，1333×900，`px-1.5`）**：`WorkBuddy` 格 97px、`TraeWork` 格 85px，
+   * 加 2px 间隙共 184px ≤ 内容区 193px，**余量 9px**；两个标签的
+   * `scrollWidth == clientWidth`（64/64、52/52）⇒ **均未被截断**。
    *
    * 刻意**不**用「缩字号 / 压 padding 硬塞进等分格」：要等分放下 `WorkBuddy`，
    * `padX + gap` 只能有 13px（12px 字号）或 16px（11px 字号），余量仅 1~3px；
@@ -207,6 +214,9 @@ function ProductSwitch({
    * label 上的 `truncate` 保留，作为将来产品名变长时的兜底（当前不触发）。
    *
    * 两个图标仍然如实反映「这是两个独立体系」——这正是 WorkBuddy 侧的做法。
+   * 注意第二格的标签是 **`TraeWork`**（本分区管的产品线），而它内部的**区域**
+   * （国内版 / 国际版）与**程序位**（TraeWork / TraeCode）都在页面里选，见
+   * `useTraeVariant` 与账号页的状态条 —— 侧栏只表达「进哪个产品分区」。
    */
   return (
     <Tabs
@@ -220,19 +230,19 @@ function ProductSwitch({
       >
         <TabsTrigger
           value="workbuddy"
-          className="h-7 w-full min-w-0 gap-1.5 rounded-lg px-2 text-xs font-medium data-[state=active]:bg-primary/15 data-[state=active]:shadow-none"
+          className="h-7 w-full min-w-0 gap-1.5 rounded-lg px-1.5 text-xs font-medium data-[state=active]:bg-primary/15 data-[state=active]:shadow-none"
         >
           <WorkBuddyMark size={15} />
-          <span className="truncate">WorkBuddy</span>
+          <span className="truncate">{PRODUCT_LABEL.workbuddy}</span>
         </TabsTrigger>
         <TabsTrigger
           value="trae"
-          className="h-7 w-full min-w-0 gap-1.5 rounded-lg px-2 text-xs font-medium data-[state=active]:bg-primary/15 data-[state=active]:shadow-none"
+          className="h-7 w-full min-w-0 gap-1.5 rounded-lg px-1.5 text-xs font-medium data-[state=active]:bg-primary/15 data-[state=active]:shadow-none"
         >
-          {/* 两个产品的图标各自如实呈现；Trae 用**不带角标**的基础款，
-              因为这里不再区分产品线（线在页面内部选）。 */}
+          {/* 两个产品的图标各自如实呈现；TraeWork 用**不带角标**的基础款，
+              因为这里不再区分区域与程序位（都在页面内部选）。 */}
           <TraeVariantMark variant="trae_work" size={15} />
-          <span className="truncate">Trae</span>
+          <span className="truncate">{PRODUCT_LABEL.trae}</span>
         </TabsTrigger>
       </TabsList>
     </Tabs>

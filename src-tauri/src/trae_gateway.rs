@@ -3,8 +3,8 @@
 //! ## 为什么不复用 [`crate::gateway`]
 //!
 //! 两者持有的类型完全不同：WorkBuddy 侧是 `GatewayState`（Key 库 / region / 目录缓存），
-//! Trae 侧是 `TraeGatewayState`（Trae 账号池 / 单一 API Key / 独立日志文件）。共用一个
-//! `OnceLock` 只会得到「两个 Option 字段里总有一个是 None」的结构。
+//! Trae 侧是 `TraeGatewayState`（**按产品线分家的账号池** / **多 Key 库（含归属变体）** /
+//! 独立日志文件）。共用一个 `OnceLock` 只会得到「两个 Option 字段里总有一个是 None」的结构。
 //!
 //! 代价是重复约 40 行生命周期代码，换来的是**改 Trae 网关不会碰到 WorkBuddy 网关**。
 //! 这正是 `buddy_switch_gateway::trae` 模块的整体设计取向。

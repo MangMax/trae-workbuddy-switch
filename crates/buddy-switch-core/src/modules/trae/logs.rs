@@ -545,7 +545,7 @@ mod tests {
     #[test]
     fn sources_split_by_variant_but_app_log_is_shared() {
         let work = sources_for(TraeVariant::TraeWork);
-        let cn = sources_for(TraeVariant::TraeCn);
+        let cn = sources_for(TraeVariant::Global);
 
         let pick = |list: &[(&'static str, std::path::PathBuf, &'static str)], kind: &str| {
             list.iter()
@@ -578,6 +578,6 @@ mod tests {
         );
         // 顺带钉住两个分家文件的具体名字（改名字是契约变更，会红是提醒）。
         assert_eq!(pick(&work, "checkin"), "checkin.log");
-        assert_eq!(pick(&cn, "checkin"), "checkin.trae_cn.log");
+        assert_eq!(pick(&cn, "checkin"), "checkin.global.log");
     }
 }

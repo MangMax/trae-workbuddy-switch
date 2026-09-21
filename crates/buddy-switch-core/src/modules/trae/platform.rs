@@ -159,7 +159,9 @@ pub fn exe_names_for(variant: super::variant::TraeVariant) -> &'static [&'static
         // 因此这里用一个与表一一对应的静态切片。新增变体时要同步。
         match variant {
             super::variant::TraeVariant::TraeWork => &["TRAE SOLO CN", "TRAE SOLO"],
-            super::variant::TraeVariant::TraeCn => &["Trae CN", "Trae"],
+            super::variant::TraeVariant::Trae => &["Trae CN", "Trae"],
+            // 国际版区域：exe 名是国际版客户端自己的（`TRAE SOLO.exe`）。
+            super::variant::TraeVariant::Global => &["TRAE SOLO"],
         }
     }
 }
@@ -274,31 +276,106 @@ pub fn is_running_for(variant: super::variant::TraeVariant) -> bool {
 /// `installed` 与 `dataDirExists` 分开返回：装了但从未登录过的客户端
 /// 有其安装目录、却没有 userData 目录，这两种状态在界面上要区别对待。
 pub fn variants_status() -> Value {
-    let items: Vec<Value> = super::variant::all_specs()
+    let items: Vec<Value> = super::region::TraeRegion::all()
         .iter()
-        .map(|spec| {
-            let variant = spec.variant;
-            let probe = detect_install_for(variant);
-            let data_dir = select_data_dir_for(variant);
-            json!({
-                "variant": variant.as_str(),
-                "variantLabel": variant.display_name(),
-                // 官方别名（product.json 的 nameAlias），用于诊断文案与核对。
-                "nameAlias": spec.name_alias,
-                "installed": probe.installed,
-                "running": is_running_for(variant),
-                "version": probe.version,
-                "path": probe.exe.as_ref().map(|p| p.to_string_lossy().to_string()),
-                "dataDir": data_dir.as_ref().map(|p| p.to_string_lossy().to_string()),
-                "dataDirExists": data_dir.map(|p| p.is_dir()).unwrap_or(false),
-            })
-        })
+        .map(|region| region_status(*region))
         .collect();
-
     json!({
         "platform": platform_tag(),
         "variants": items,
     })
+}
+
+/// 单个**区域**的状态，含它每个**程序位**的探测结果。
+///
+/// ## 为什么形状从「按产品线列条目」改成「按区域列条目 + 条目内列程序」
+///
+/// 区域才是**账号体系**的分界（国内 / 国际两套互不相通的账号），而程序只是
+/// 「登录态写进哪个客户端、启动谁」（见 [`super::region`] 模块头）。
+/// 界面因此是「顶部选区域 → 卡片按该区域列出程序」，数据形状必须同构，
+/// 否则前端就得自己把产品线轴在本地折算成区域，很容易与后端口径分叉。
+fn region_status(region: super::region::TraeRegion) -> Value {
+    let programs: Vec<Value> = super::region::programs_of(region)
+        .iter()
+        .map(|spec| {
+            let variant = variant_for_program(spec.region, spec.program);
+            let (installed, running, version, path, data_dir) = match variant {
+                Some(target) => {
+                    let probe = detect_install_for(target);
+                    let dir = select_data_dir_for(target);
+                    (
+                        probe.installed,
+                        is_running_for(target),
+                        probe.version,
+                        probe.exe.as_ref().map(|p| p.to_string_lossy().to_string()),
+                        dir.as_ref().map(|p| p.to_string_lossy().to_string()),
+                    )
+                }
+                // 该程序位**没有对应的客户端建模**（例如国际版 TraeCode：本机未安装、
+                // 也尚未建模）⇒ 如实报「未安装」，**不猜目录**。
+                // 猜错目录的后果是"切换"把登录态写进另一个客户端的 userData。
+                None => (false, false, None, None, None),
+            };
+            json!({
+                "program": spec.program.as_str(),
+                "label": spec.display_name,
+                "nameAlias": spec.name_alias,
+                // 前端「切换到此程序」时回传的标识；`null` = 该程序位当前不可操作。
+                "variant": variant.map(|target| target.as_str()),
+                "installed": installed,
+                "running": running,
+                "version": version,
+                "path": path,
+                "dataDir": data_dir,
+                "dataDirExists": data_dir.as_deref().map(|p| std::path::Path::new(p).is_dir()).unwrap_or(false),
+            })
+        })
+        .collect();
+
+    // 区域级汇总：**装了任一程序**即视为该区域可用（国际版目前只装了 TraeWork）。
+    let any = |key: &str| {
+        programs
+            .iter()
+            .any(|item| item.get(key).and_then(Value::as_bool).unwrap_or(false))
+    };
+    let primary = programs
+        .iter()
+        .find(|item| item.get("installed").and_then(Value::as_bool).unwrap_or(false));
+    let field = |key: &str| {
+        primary
+            .and_then(|item| item.get(key).cloned())
+            .unwrap_or(Value::Null)
+    };
+
+    json!({
+        // 区域标识（`cn` / `global`）—— 前端选区域、以及账号类接口的入参。
+        "variant": region.as_str(),
+        "variantLabel": region.display_name(),
+        "installed": any("installed"),
+        "running": any("running"),
+        "version": field("version"),
+        "path": field("path"),
+        "dataDir": field("dataDir"),
+        "dataDirExists": field("dataDirExists"),
+        // 该区域下的程序位（卡片上每个账号要渲染的切换按钮）。
+        "programs": programs,
+    })
+}
+
+/// 程序位 → 客户端建模标识。`None` = 尚未建模，调用方必须显式处理（不得猜）。
+fn variant_for_program(
+    region: super::region::TraeRegion,
+    program: super::region::TraeProgram,
+) -> Option<super::variant::TraeVariant> {
+    use super::region::{TraeProgram, TraeRegion};
+    use super::variant::TraeVariant;
+    match (region, program) {
+        (TraeRegion::Cn, TraeProgram::TraeWork) => Some(TraeVariant::TraeWork),
+        (TraeRegion::Cn, TraeProgram::TraeCode) => Some(TraeVariant::Trae),
+        (TraeRegion::Global, TraeProgram::TraeWork) => Some(TraeVariant::Global),
+        // 国际版 TraeCode 未安装也未被建模 —— 不拿 TraeWork 的目录顶替。
+        (TraeRegion::Global, TraeProgram::TraeCode) => None,
+    }
 }
 
 /// 变体表与 [`exe_names`] / [`data_dir_names`] 的摊平结果是否一致。
@@ -933,10 +1010,54 @@ pub fn launch_client_for(
     Ok(())
 }
 
-/// 当前平台的能力清单（用于前端的「平台支持」说明面板）。
+/// 当前平台的能力清单（用于前端的「平台能力」说明面板）。
+///
+/// 除平台级受限项（`machine_guid_reset` / `system_ca_install`）外，还会列出**产品级**
+/// 不支持项——即 WorkBuddy 有、而 Trae 产品本身不提供的能力（自动旅行、CodeBuddy
+/// CLI/IDE、会话/记忆迁移…）。它们与操作系统无关，故**无条件**下发，`supported_on`
+/// 标为「WorkBuddy」以说明「这条能力在哪有」，界面据此渲染为置灰说明而不造假控件。
 pub fn capabilities() -> Value {
     let mut unsupported: Vec<Value> = Vec::new();
 
+    // ---- 产品级：WorkBuddy 有、Trae 无（与平台无关，故无条件列出）----
+    unsupported.push(
+        Unsupported::new(
+            "auto_travel",
+            "自动旅行（派猫猫）",
+            "WorkBuddy",
+            "Trae 客户端没有该活动接口，本工具也无对应后端实现。",
+        )
+        .to_json(),
+    );
+    unsupported.push(
+        Unsupported::new(
+            "codebuddy_cli",
+            "CodeBuddy CLI / IDE 接入",
+            "WorkBuddy",
+            "CodeBuddy 属 WorkBuddy 生态，Trae 分区不提供该客户端的接入与切换。",
+        )
+        .to_json(),
+    );
+    unsupported.push(
+        Unsupported::new(
+            "account_data_migration",
+            "会话 / 记忆 / 连接器迁移",
+            "WorkBuddy",
+            "Trae 登录态是一组 Cloud-IDE-JWT 文件，没有会话树 / 记忆 / 连接器对象可迁移。",
+        )
+        .to_json(),
+    );
+    unsupported.push(
+        Unsupported::new(
+            "session_tree",
+            "会话列表 / 复制会话 / 切换进度流",
+            "WorkBuddy",
+            "Trae 的账号切换是文件级快照替换，不存在会话列表与切换进度事件流。",
+        )
+        .to_json(),
+    );
+
+    // ---- 平台级：仅在缺失该能力的平台上列出 ----
     if !cfg!(windows) {
         unsupported.push(
             Unsupported::new(
@@ -1493,12 +1614,12 @@ mod tests {
     #[test]
     fn 逐变体安装探测互不干扰() {
         let work = detect_install_for(super::super::variant::TraeVariant::TraeWork);
-        let cn = detect_install_for(super::super::variant::TraeVariant::TraeCn);
+        let cn = detect_install_for(super::super::variant::TraeVariant::Trae);
 
         // 探到的 exe 必须落在该变体自己的候选目录名下（不能串到另一条产品线）。
         for (variant, probe) in [
             (super::super::variant::TraeVariant::TraeWork, &work),
-            (super::super::variant::TraeVariant::TraeCn, &cn),
+            (super::super::variant::TraeVariant::Trae, &cn),
         ] {
             if let Some(exe) = probe.exe.as_ref() {
                 let parent = exe
@@ -1527,40 +1648,67 @@ mod tests {
             .and_then(|v| v.as_array())
             .expect("variants 应为数组");
 
-        // 数量必须等于变体总数 —— 少一条就意味着界面上会少一个图标。
+        // 数量必须等于**区域总数** —— 少一条就意味着界面上会少一个区域入口。
+        // 形状自 2026-09-21 起是「按区域列条目、条目内含程序位」，不再是「按产品线列条目」。
         assert_eq!(
             items.len(),
-            super::super::variant::all_specs().len(),
-            "variants_status 未返回全部变体"
+            super::super::region::TraeRegion::all().len(),
+            "variants_status 未返回全部区域"
         );
+
+        // 每个条目都必须带 `programs`，且该区域的程序位数量与规格表一致 ——
+        // 少一枚就意味着卡片上少一个切换按钮（用户看不到那个客户端）。
+        for item in items {
+            let region = item
+                .get("variant")
+                .and_then(|v| v.as_str())
+                .expect("区域标识必须存在");
+            let programs = item
+                .get("programs")
+                .and_then(|v| v.as_array())
+                .unwrap_or_else(|| panic!("区域 {region} 缺少 programs 数组"));
+            let parsed = super::super::region::TraeRegion::parse(region)
+                .unwrap_or_else(|| panic!("区域标识无法回解: {region}"));
+            assert_eq!(
+                programs.len(),
+                super::super::region::programs_of(parsed).len(),
+                "区域 {region} 的程序位数与规格表不一致"
+            );
+        }
 
         let mut seen: Vec<&str> = Vec::new();
         for item in items {
             for key in [
                 "variant",
                 "variantLabel",
-                "nameAlias",
                 "installed",
                 "running",
                 "version",
                 "path",
                 "dataDir",
                 "dataDirExists",
+                "programs",
             ] {
-                assert!(item.get(key).is_some(), "变体项缺少线上字段 {key}");
+                assert!(item.get(key).is_some(), "区域项缺少线上字段 {key}");
             }
             assert!(item.get("installed").unwrap().is_boolean());
             assert!(item.get("running").unwrap().is_boolean());
             // 不能泄漏 snake_case 形式。
             assert!(item.get("variant_label").is_none());
+            // 官方别名**下移到程序位**（区域不是客户端，没有 nameAlias）。
+            for program in item.get("programs").and_then(|v| v.as_array()).unwrap() {
+                for key in ["program", "label", "nameAlias", "variant", "installed", "running"] {
+                    assert!(program.get(key).is_some(), "程序位缺少线上字段 {key}");
+                }
+            }
             seen.push(item.get("variant").and_then(|v| v.as_str()).unwrap());
         }
 
-        // 两条产品线的标识必须都在，且不重复。
-        for expected in ["trae_work", "trae_cn"] {
-            assert!(seen.contains(&expected), "缺少变体 {expected}");
+        // 两个区域的标识必须都在，且不重复。
+        for expected in ["cn", "global"] {
+            assert!(seen.contains(&expected), "缺少区域 {expected}");
         }
-        assert_eq!(seen.len(), 2, "变体标识重复: {seen:?}");
+        assert_eq!(seen.len(), 2, "区域标识重复: {seen:?}");
     }
 
     /// 逐变体运行探测：结果只取决于该变体的进程名。
@@ -1570,7 +1718,7 @@ mod tests {
     #[test]
     fn 逐变体运行探测与全局一致() {
         let work = is_running_for(super::super::variant::TraeVariant::TraeWork);
-        let cn = is_running_for(super::super::variant::TraeVariant::TraeCn);
+        let cn = is_running_for(super::super::variant::TraeVariant::Trae);
 
         // 全局判定是逐变体判定的并集：任一为真则全局必须为真。
         if work || cn {
@@ -1793,7 +1941,7 @@ mod tests {
         std::env::set_var("APPDATA", &base);
 
         let work = select_data_dir_for(super::super::variant::TraeVariant::TraeWork);
-        let cn = select_data_dir_for(super::super::variant::TraeVariant::TraeCn);
+        let cn = select_data_dir_for(super::super::variant::TraeVariant::Trae);
 
         match original {
             Some(value) => std::env::set_var("APPDATA", value),
@@ -1831,7 +1979,7 @@ mod tests {
         std::env::set_var("APPDATA", &base);
 
         let work = select_data_dir_for(super::super::variant::TraeVariant::TraeWork);
-        let cn = select_data_dir_for(super::super::variant::TraeVariant::TraeCn);
+        let cn = select_data_dir_for(super::super::variant::TraeVariant::Trae);
 
         match original {
             Some(value) => std::env::set_var("APPDATA", value),

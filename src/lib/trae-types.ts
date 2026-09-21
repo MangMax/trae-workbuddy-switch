@@ -38,44 +38,130 @@ export interface TraeEnvStatus {
 }
 
 /** 产品线变体标识。 */
-export type TraeVariantId = "trae_work" | "trae_cn";
+/**
+ * **区域标识**（持久化轴）：国内版 / 国际版。
+ *
+ * 账号库、分组、设备绑定、签到、积分、冷却、日志都按它分家 ——
+ * 因为国内与国际是两套**互不相通**的账号体系。与 Rust 侧 `TraeRegion::as_str()` 同源。
+ */
+export type TraeRegionId = "cn" | "global";
 
 /**
- * `TraeVariantId` → 展示名（`"Trae Work"` / `"Trae CN"`）。
+ * **程序位标识**（执行轴）：登录态写进哪个客户端、启动谁。
  *
- * 与 Rust 侧 `variant::TraeVariant::display_name()` 同源。
+ * 与 Rust 侧 `TraeProgram::as_str()` 同源。区域决定「账号属于哪套体系」，
+ * 程序只决定「落到哪个客户端」。
+ */
+export type TraeProgramId = "trae_work" | "trae_code";
+
+/**
+ * 发给后端的「目标」标识 —— **区域与程序位共用一个字段**（后端宽容解析）。
  *
- * **什么场景用它**：手上只有变体标识、需要**立刻**显示产品线名时
- * （例如登录弹窗要说清「正在为哪条产品线登录」）。
- * 这类场景**不能**等后端探测结果 —— 变体标识本身就是我们真正要发给后端的东西，
- * 是权威值；后端的 `variantLabel` 只是同一事实的另一种表述。
+ * `trae_work` / `trae_cn` 是改造前的产品线标识，现在表示**国内区域下的两个程序位**
+ * （`trae_work`＝TraeWork 客户端、`trae_cn`＝TraeCode 客户端）。保留它们是为了：
+ * 账号类接口按区域取库（两者都落国内库），而切换/快照类接口能据此确定**客户端**。
+ */
+export type TraeVariantId = TraeRegionId | "trae_work" | "trae_cn" | TraeProgramId;
+
+/**
+ * `TraeVariantId` → 展示名。
  *
- * **什么场景不要用它**：能拿到探测结果时优先用后端返回的 `variantLabel`
- * （见 `trae-client.ts` 的 `traeProductLabel`），避免前端多维护一份文案。
+ * 区域 → `国内版` / `国际版`；程序位 → 客户端的官方别名写法。
+ * 与 Rust 侧 `TraeRegion::display_name()` / `program_spec().display_name` 同源。
+ *
+ * **什么场景用它**：手上只有标识、需要**立刻**显示名字时（例如登录弹窗要说清
+ * 「正在为哪条线登录」）。能拿到后端探测结果时优先用 `variantLabel`，避免前端多维护文案。
  */
 export function traeVariantLabel(variant: TraeVariantId): string {
-  return variant === "trae_cn" ? "Trae CN" : "Trae Work";
+  switch (variant) {
+    case "cn":
+      return "国内版";
+    case "global":
+      return "国际版";
+    case "trae_cn":
+    case "trae_code":
+      return "TraeCode";
+    default:
+      return "TraeWork";
+  }
 }
 
 /**
- * 单条产品线的独立环境状态（`get_trae_variants().variants[]`）。
+ * `TraeVariantId` → **区域**展示名（国内版 / 国际版）。
  *
- * 与 [`TraeEnvStatus`] 的区别：`TraeEnvStatus` 是**自动挑中的那一条**（单一视角），
- * 本类型是**每一条各自的状态**（并排视角）。界面右上角要同时显示两个产品图标时
- * 用这个，而不是拿 `TraeEnvStatus` 推断另一条——后者根本不知道另一条的存在。
+ * 与 {@link traeVariantLabel} 的分工：后者回答「这个标识自己是谁」（程序位就叫程序名），
+ * 本函数只回答「它落在哪个区域」。凡是**按区域分区**的展示都必须用本函数 ——
+ * 目前有两处：API Key 的「归属版本」列、Token 统计的版本分档。
+ *
+ * ⚠️ 为什么不能直接用 `traeVariantLabel`：历史上写进 Key 记录的是**改造前的产品线标识**
+ * （`trae_work` / `trae_cn`），而那两个产品线**都是国内构建**。照 `traeVariantLabel`
+ * 显示就会得到「TraeWork / TraeCode」两个名字，而网关对它们的行为**完全相同**
+ * （同一本国内账号库、同一个池、Token 统计里同属「国内版」一档）——
+ * 界面上于是出现一处**假差异**：看起来归属不同，实际毫无区别。
+ *
+ * 未建模的组合（例如国际版程序位，本机未安装）交回 {@link traeVariantLabel}，
+ * **不猜**：宁可显示它的本名，也不要替后端发明一个区域。
  */
-export interface TraeVariantStatus {
-  variant: TraeVariantId;
-  /** 展示名（`"Trae Work"` / `"Trae CN"`），与 Rust `display_name()` 同源。 */
-  variantLabel: string;
-  /** 客户端 `product.json` 的官方别名（`"TraeWork CN"` / `"TraeCode CN"`）。 */
-  nameAlias: string | null;
+export function traeRegionLabelOf(variant: TraeVariantId): string {
+  switch (variant) {
+    case "global":
+      return "国际版";
+    case "cn":
+    case "trae_work":
+    case "trae_cn":
+      return "国内版";
+    default:
+      return traeVariantLabel(variant);
+  }
+}
+
+/**
+ * 单个**程序位**的安装/运行状态（`get_trae_variants().variants[].programs[]`）。
+ *
+ * 「区域 → 程序位」是两层：区域决定账号体系，程序位决定客户端。
+ * 卡片上的切换按钮就是按它渲染的（每枚按钮对应一个程序位）。
+ */
+export interface TraeProgramStatus {
+  /** 程序位标识（`trae_work` / `trae_code`）。 */
+  program: TraeProgramId;
+  /** 展示名（`TraeWork` / `TraeCode` / `TraeWork AI` / `Trae AI`）。 */
+  label: string;
+  /** 客户端 `product.json` 的官方别名（诊断与核对用）。 */
+  nameAlias: string;
+  /**
+   * 切换时回传的标识；`null` = 该程序位**尚未建模**（例如国际版 TraeCode 本机未安装），
+   * 此时按钮必须禁用 —— 不能拿同区域另一个客户端的标识顶替。
+   */
+  variant: TraeVariantId | null;
   installed: boolean;
   running: boolean;
   version: string | null;
   path: string | null;
   dataDir: string | null;
   dataDirExists: boolean;
+}
+
+/**
+ * 单条**区域**的环境状态（`get_trae_variants().variants[]`）。
+ *
+ * 与 [`TraeEnvStatus`] 的区别：`TraeEnvStatus` 是**自动挑中的那一条**（单一视角），
+ * 本类型是**每个区域各自的状态**（并排视角）—— 界面顶部的区域切换器用它。
+ *
+ * 区域级字段（`installed` / `running` / `version` / …）是「该区域**任一**程序已装」
+ * 的汇总（国际版目前只装了 TraeWork），精确到程序请看 `programs`。
+ */
+export interface TraeVariantStatus {
+  variant: TraeRegionId;
+  /** 展示名（`"国内版"` / `"国际版"`），与 Rust `TraeRegion::display_name()` 同源。 */
+  variantLabel: string;
+  installed: boolean;
+  running: boolean;
+  version: string | null;
+  path: string | null;
+  dataDir: string | null;
+  dataDirExists: boolean;
+  /** 该区域下的程序位（卡片上每个账号要渲染的切换控件）。 */
+  programs: TraeProgramStatus[];
 }
 
 /** 全部产品线的环境状态（`get_trae_variants`）。 */
@@ -104,6 +190,19 @@ export interface TraeCapabilities {
   unsupported: TraeUnsupported[];
 }
 
+/** 单个积分资源包的逐包明细（账号卡进度条的数据源）。 */
+export interface TraeCreditPackage {
+  packageCode: string | null;
+  packageName: string | null;
+  total: number;
+  remaining: number;
+  used: number;
+  expireAt: number | null;
+  expired: boolean;
+  /** 是否 7 天内到期。 */
+  expiringSoon: boolean;
+}
+
 /** 账号视图。 */
 export interface TraeAccount {
   userId: string;
@@ -117,6 +216,8 @@ export interface TraeAccount {
   credits: number | null;
   remainingCredits: number | null;
   creditsExpireAt: number | null;
+  /** 逐包明细；未刷新过积分时为 `null`。 */
+  creditPackages: TraeCreditPackage[] | null;
   deviceIdMasked: string | null;
   cooldownType: string | null;
   cooldownUntil: number | null;
@@ -143,6 +244,33 @@ export interface TraeAccountsOverview {
   total: number;
   cooling: number;
   ungrouped: number;
+}
+
+/**
+ * 旧「产品线」账号库并入区域账号库的合并报告（`trae_merge_legacy_regions`）。
+ *
+ * 与 Rust 侧 `region_migrate::MergeReport::to_json()` 逐字对应。
+ * `changed: false` 表示**没有发生改写**（无旧库 / 已并完）—— 幂等判据。
+ */
+export interface TraeLegacyMergeReport {
+  /** 旧库里的账号总数。 */
+  legacyAccounts: number;
+  /** 本次并入国内版账号库的账号数。 */
+  accountsAdded: number;
+  /** 因国内版库已有同 uid 而**保留现有值**的账号数。 */
+  accountsKept: number;
+  /** 并入的设备绑定数。 */
+  bindingsAdded: number;
+  /** 并入的分组数（按名字去重）。 */
+  groupsAdded: number;
+  /** 并入的成员关系数。 */
+  membershipAdded: number;
+  /** 备份目录；`null` = 无需备份（未发生改写）或备份失败（见 `backupFailed`）。 */
+  backup: string | null;
+  /** 备份是否尝试过但失败 —— 与「无需备份」区分开。 */
+  backupFailed: boolean;
+  /** 本次是否真的改写了数据（`false` = 幂等空转）。 */
+  changed: boolean;
 }
 
 /** 单账号签到结果。 */
@@ -207,12 +335,16 @@ export interface TraeDailySnapshot {
 export interface TraeCreditsOverview {
   remaining: Record<string, number>;
   expireTimes: Record<string, number>;
+  /** 逐包明细：`{ "<userId>": [CreditPackage…] }`（账号卡进度条的数据源）。 */
+  packages: Record<string, TraeCreditPackage[]>;
   updatedAt: string | null;
   balances: { userId: string; credits: number; date: string }[];
   records: TraeCreditRecord[];
   daily: TraeDailySnapshot[];
   todayEarned: number;
   historyDays: number;
+  /** 平台做不到的维度（置灰说明），形状见 {@link TraeUnsupported}。 */
+  unsupported: TraeUnsupported[];
 }
 
 /** 登录态快照信息。 */
@@ -449,6 +581,41 @@ export interface TraeGatewayModel {
   owned_by: string;
 }
 
+/**
+ * 单条 Trae API Key（`list_trae_api_keys` 的 `keys[]`）。
+ *
+ * **不含 hash 与明文**：服务端只下发脱敏白名单（`prefix` / `name` / `variant`…），
+ * 明文仅在创建时一次性返回。
+ *
+ * `variant` 是该 Key 的**归属区域**（`"cn"` / `"global"`）—— 账号池按区域建，
+ * 因此它决定这把 Key 能取到哪个区域的账号。**新 Key 一律落到区域的线上标识**；
+ * 历史 Key 存的可能是 `"trae_work"` / `"trae_cn"`（改造前的产品线标识），
+ * 二者都属国内区域，故展示与分档一律按 `variant.region()` 的语义处理，
+ * 不要在前端自行比较字符串是否相等。
+ */
+export interface TraeApiKeyRecord {
+  id: string;
+  name: string;
+  /** 归属区域（`"cn"` / `"global"`；历史记录可能是 `"trae_work"` / `"trae_cn"`）。 */
+  variant: TraeVariantId;
+  prefix: string;
+  createdAt: number;
+  revokedAt: number | null;
+  revoked: boolean;
+  lastUsedAt: number | null;
+}
+
+/**
+ * 新建 Key 的返回（`create_trae_api_key`）。
+ *
+ * `key` 为**一次性明文**——只会出现在本次响应里，之后无从取回；界面必须提示用户立即复制。
+ */
+export interface TraeApiKeyCreated {
+  ok: boolean;
+  key?: string;
+  record?: TraeApiKeyRecord;
+}
+
 // ---------------------------------------------------------------------------
 // Token 统计（聚合本机网关请求日志）
 // ---------------------------------------------------------------------------
@@ -475,6 +642,42 @@ export interface TraeTokenAccountBucket extends TraeTokenBucket {
 }
 
 /**
+ * Token 统计的**区域范围**筛选维度（`get_trae_token_statistics` 的 `scope`）。
+ *
+ * **不是**第三种区域，而是「查询范围」——多了「未标注」（升级前的旧日志没有
+ * `variant` 键）与「全部」两档。切勿并进 `TraeRegionId`。
+ *
+ * ⚠️ 档名在 2026-09-21 由**产品线**改为**区域**：国内 / 国际是两套互不相通的账号体系，
+ * 而「Trae Work / Trae CN」只是国内区域下的两条程序。后端对历史标识
+ * （`work` / `trae_work` / `trae_cn`）一律按**国内版**归集，因此老链接不会串档。
+ */
+export type TraeTokenScope = "cn" | "global" | "unlabeled" | "all";
+
+/**
+ * **区域**范围条各档计数（`variantCounts`）。
+ *
+ * 只受**时间窗口**影响、不受当前 `scope` 影响：范围条要能显示「切到哪一档有多少条」。
+ */
+export interface TraeVariantCounts {
+  /** 国内版。历史日志里的 `trae_work` 与 `trae_cn` **都计入此档**（同属国内区域）。 */
+  cn: number;
+  /** 国际版（另一套账号体系）。 */
+  global: number;
+  unlabeled: number;
+  all: number;
+}
+
+/** 按天 × 模型的用量点（`modelDaily`，堆叠柱数据源）。 */
+export interface TraeModelDailyPoint {
+  date: string;
+  model: string;
+  total: number;
+  input: number;
+  output: number;
+  records: number;
+}
+
+/**
  * Trae Token 统计（`get_trae_token_statistics`）。
  *
  * **边界**：数据源只有本机网关的请求日志，因此
@@ -494,6 +697,12 @@ export interface TraeTokenStatistics {
   daily: TraeTokenBucket[];
   hours: TraeTokenBucket[];
   statuses: { key: string; records: number }[];
+  /** 按天 × 模型的用量点（堆叠柱）。 */
+  modelDaily: TraeModelDailyPoint[];
+  /** 变体范围条各档计数。 */
+  variantCounts: TraeVariantCounts;
+  /** 平台做不到的维度（置灰卡），形状见 {@link TraeUnsupported}。 */
+  unsupported: TraeUnsupported[];
   filesScanned: number;
   parseErrors: number;
   coverageStartAt: number | null;

@@ -7,6 +7,7 @@ import type {
 } from "./types";
 import type {
   TraeAccount,
+  TraeApiKeyRecord,
   TraeCapabilities,
   TraeCheckinStatus,
   TraeCreditsOverview,
@@ -445,7 +446,6 @@ function demoGatewayConfig(): GatewayConfig {
     bind_addr: "127.0.0.1",
     port: 57891,
     allow_non_loopback: false,
-    dual_port: false,
     log_keep: 200,
     log_bodies: false,
     per_key_rate_limit: null,
@@ -524,6 +524,10 @@ const traeAccounts: TraeAccount[] = [
     userId: "7481920", name: "主号", groupId: null, jwt: "", jwtExpHours: 320.5,
     jwtExpTimestamp: atLocalTime(0, 9, 12), jwtStatus: "ok", checkedToday: true,
     credits: 120, remainingCredits: 120, creditsExpireAt: futureAt(26),
+    creditPackages: [
+      { packageCode: "pkg_work_month", packageName: "Work 月度包", total: 100, remaining: 80, used: 20, expireAt: Math.floor(futureAt(26) / 1000), expired: false, expiringSoon: false },
+      { packageCode: "pkg_work_bonus", packageName: "签到赠送包", total: 40, remaining: 40, used: 0, expireAt: Math.floor(futureAt(4) / 1000), expired: false, expiringSoon: true },
+    ],
     deviceIdMasked: "a1b2…9f", cooldownType: null, cooldownUntil: null, cooldownReason: null,
     hasRefreshToken: true, jwtAutoRefresh: true,
     addedAt: "2026-09-10T02:11:00Z", updatedAt: "2026-09-17T01:54:00Z",
@@ -532,6 +536,9 @@ const traeAccounts: TraeAccount[] = [
     userId: "7481999", name: "小号 A", groupId: "g1", jwt: "", jwtExpHours: 6.2,
     jwtExpTimestamp: atLocalTime(0, 15, 20), jwtStatus: "warn", checkedToday: false,
     credits: 0, remainingCredits: 64.5, creditsExpireAt: futureAt(5),
+    creditPackages: [
+      { packageCode: "pkg_cn_plan", packageName: "国内套餐包", total: 100, remaining: 64.5, used: 35.5, expireAt: Math.floor(futureAt(5) / 1000), expired: false, expiringSoon: true },
+    ],
     deviceIdMasked: "c3d4…7e", cooldownType: "SoftRate",
     cooldownUntil: Math.floor(Date.now() / 1000) + 5400,
     cooldownReason: "请求过于频繁，请稍后再试",
@@ -542,6 +549,9 @@ const traeAccounts: TraeAccount[] = [
     userId: "7482044", name: "小号 B", groupId: "g1", jwt: "", jwtExpHours: -3,
     jwtExpTimestamp: atLocalTime(0, 5, 30), jwtStatus: "expired", checkedToday: false,
     credits: 8, remainingCredits: 8, creditsExpireAt: futureAt(3),
+    creditPackages: [
+      { packageCode: "pkg_trial", packageName: "试用包", total: 8, remaining: 8, used: 0, expireAt: Math.floor(futureAt(3) / 1000), expired: false, expiringSoon: true },
+    ],
     deviceIdMasked: "e5f6…1a", cooldownType: "SessionDead", cooldownUntil: 9_999_999_999,
     cooldownReason: "会话已失效，需重新登录",
     hasRefreshToken: true, jwtAutoRefresh: false,
@@ -576,31 +586,96 @@ function demoTraeEnv(): TraeEnvStatus {
  * 「并排两个图标各自独立」这件事才看得出来 —— 两条都同状态的话，
  * 分不清是「两条独立探测」还是「同一条画了两遍」。
  */
+/**
+ * 演示用的**区域 + 程序位**状态。
+ *
+ * 形状自 2026-09-21 起改为「按区域列条目、条目内含程序位」：区域才是账号体系的分界，
+ * 程序位只决定客户端。演示数据刻意让两个区域状态不同（国内装齐两条程序、
+ * 国际只装了 TraeWork），这样截图/演示站上能看出**区域与程序是两层**，
+ * 而不是「同一条线画了两遍」。
+ */
 function demoTraeVariants(): TraeVariantsStatus {
+  const program = (
+    program: "trae_work" | "trae_code",
+    label: string,
+    nameAlias: string,
+    variant: "trae_work" | "trae_cn" | "global" | null,
+    installed: boolean,
+    running: boolean,
+    path: string,
+    dataDir: string,
+  ) => ({
+    program,
+    label,
+    nameAlias,
+    variant,
+    installed,
+    running,
+    version: installed ? "1.107.1" : null,
+    path: installed ? path : null,
+    dataDir: installed ? dataDir : null,
+    dataDirExists: installed,
+  });
+
   return {
     platform: "win32",
     variants: [
       {
-        variant: "trae_work",
-        variantLabel: "Trae Work",
-        nameAlias: "TraeWork CN",
+        variant: "cn",
+        variantLabel: "国内版",
         installed: true,
         running: true,
         version: "1.107.1",
         path: "D:\\Programs\\TRAE SOLO CN\\TRAE SOLO CN.exe",
         dataDir: "C:\\Users\\demo\\AppData\\Roaming\\TRAE SOLO CN",
         dataDirExists: true,
+        programs: [
+          program(
+            "trae_work",
+            "TraeWork",
+            "TraeWork CN",
+            "trae_work",
+            true,
+            true,
+            "D:\\Programs\\TRAE SOLO CN\\TRAE SOLO CN.exe",
+            "C:\\Users\\demo\\AppData\\Roaming\\TRAE SOLO CN",
+          ),
+          program(
+            "trae_code",
+            "TraeCode",
+            "TraeCode CN",
+            "trae_cn",
+            true,
+            false,
+            "D:\\Programs\\Trae CN\\Trae CN.exe",
+            "C:\\Users\\demo\\AppData\\Roaming\\Trae CN",
+          ),
+        ],
       },
       {
-        variant: "trae_cn",
-        variantLabel: "Trae CN",
-        nameAlias: "TraeCode CN",
+        variant: "global",
+        variantLabel: "国际版",
         installed: true,
         running: false,
         version: "1.107.1",
-        path: "D:\\Programs\\Trae CN\\Trae CN.exe",
-        dataDir: "C:\\Users\\demo\\AppData\\Roaming\\Trae CN",
+        path: "C:\\Users\\demo\\AppData\\Local\\Programs\\TRAE SOLO\\TRAE SOLO.exe",
+        dataDir: "C:\\Users\\demo\\AppData\\Roaming\\TRAE SOLO",
         dataDirExists: true,
+        programs: [
+          program(
+            "trae_work",
+            "TraeWork AI",
+            "TraeWork",
+            "global",
+            true,
+            false,
+            "C:\\Users\\demo\\AppData\\Local\\Programs\\TRAE SOLO\\TRAE SOLO.exe",
+            "C:\\Users\\demo\\AppData\\Roaming\\TRAE SOLO",
+          ),
+          // 国际版 TraeCode 未安装也**未建模** ⇒ `variant: null`（按钮必须禁用，
+          // 不能拿同区域另一个客户端的标识顶替）。
+          program("trae_code", "Trae AI", "TraeCode（待实测）", null, false, false, "", ""),
+        ],
       },
     ],
   };
@@ -610,7 +685,14 @@ function demoTraeCapabilities(): TraeCapabilities {
   return {
     platform: "win32", processControl: true, clientDetection: true,
     userDataDir: "C:\\Users\\demo\\AppData\\Roaming\\TRAE SOLO CN",
-    machineGuidReset: true, scheduledTask: true, unsupported: [],
+    machineGuidReset: true, scheduledTask: true,
+    // 产品级不支持项（WorkBuddy 有、Trae 无），形状与 `platform::Unsupported` 逐字一致。
+    unsupported: [
+      { capability: "auto_travel", label: "自动旅行（派猫猫）", supportedOn: "WorkBuddy", reason: "Trae 客户端没有该活动接口，本工具也无对应后端实现。" },
+      { capability: "codebuddy_cli", label: "CodeBuddy CLI / IDE 接入", supportedOn: "WorkBuddy", reason: "CodeBuddy 属 WorkBuddy 生态，Trae 分区不提供该客户端的接入与切换。" },
+      { capability: "account_data_migration", label: "会话 / 记忆 / 连接器迁移", supportedOn: "WorkBuddy", reason: "Trae 登录态是一组 Cloud-IDE-JWT 文件，没有会话树 / 记忆 / 连接器对象可迁移。" },
+      { capability: "session_tree", label: "会话列表 / 复制会话 / 切换进度流", supportedOn: "WorkBuddy", reason: "Trae 的账号切换是文件级快照替换，不存在会话列表与切换进度事件流。" },
+    ],
   };
 }
 
@@ -654,6 +736,12 @@ function demoTraeCredits(): TraeCreditsOverview {
       "7481999": Math.floor(futureAt(5) / 1000),
       "7482044": Math.floor(futureAt(3) / 1000),
     },
+    // 逐包明细与账号卡共用同一份假数据（`traeAccounts[..].creditPackages`）。
+    packages: {
+      "7481920": traeAccounts[0].creditPackages ?? [],
+      "7481999": traeAccounts[1].creditPackages ?? [],
+      "7482044": traeAccounts[2].creditPackages ?? [],
+    },
     updatedAt: `${localDate(0)}T09:12:00+08:00`,
     balances: traeAccounts.map((account) => ({
       userId: account.userId,
@@ -667,18 +755,43 @@ function demoTraeCredits(): TraeCreditsOverview {
     daily,
     todayEarned: 20,
     historyDays: 8,
+    // 「官方积分消耗按模型」在 Trae 侧无数据源——形状与 `handlers::unsupported_note` 逐字一致。
+    unsupported: [
+      {
+        capability: "official_credit_by_model",
+        label: "官方积分消耗按模型",
+        supportedOn: "—",
+        reason: "Trae 积分只来自签到快照，不存在「产生这些积分的请求用量」这一口径的数据源。",
+      },
+    ],
   };
 }
 
 /**
- * 演示用的登录态快照总览（**按产品线分家**）。
+ * 演示用的登录态快照总览（**按程序位分家**）。
  *
- * 两条产品线刻意给出**不同的槽位、不同的客户端数据目录**：截图上必须能一眼看出
- * "这是两条独立产品线各自的快照"，而不是同一份数据被渲染了两次。
- * 与 `demoTraeVariants` 同一意图（那边让运行状态不同，这边让快照内容不同）。
+ * 快照是**客户端级**的（只能恢复到采集它的那个客户端），因此这里按**程序位**给数据：
+ * 国内 TraeWork / 国内 TraeCode / 国际版 TraeWork 三者槽位与目录都不同 ——
+ * 截图上必须能一眼看出「这是各自独立的快照」，而不是同一份数据被渲染了两次。
+ *
+ * 入参 `variant` 兼容**区域标识**（`cn` / `global`，页面传的就是它）与**程序位标识**
+ * （`trae_work` / `trae_cn`）：前者落到该区域的**主程序**（TraeWork），
+ * 与 Rust 侧 `TraeVariant::parse` 的映射保持一致。
  */
 function demoTraeProfiles(args?: Record<string, unknown>): TraeProfilesOverview {
-  const isCn = args?.variant === "trae_cn";
+  const raw = typeof args?.variant === "string" ? args.variant : "cn";
+  if (raw === "global") {
+    return {
+      profiles: [
+        { slot: "7481920", sizeBytes: 3_180_000, fileCount: 9, lastModified: `${localDate(2)} 09:31`, sizeText: "3.0 MB" },
+      ],
+      currentAccount: "7481920",
+      dataDir: "C:\\Users\\demo\\AppData\\Roaming\\TRAE SOLO",
+      clientRunning: false,
+      coreEntryCount: 9,
+    };
+  }
+  const isCn = raw === "trae_cn";
   if (isCn) {
     return {
       profiles: [
@@ -765,6 +878,27 @@ function demoTraeGatewayModels(): unknown {
   };
 }
 
+/**
+ * 演示用的 Trae 多 Key 列表（含**两个区域**各一把 + 一条历史归属）。
+ *
+ * 刻意给出不同 `variant`（`cn` / `global`；第三条保留改造前的 `trae_work`）与一条已吊销：
+ * 截图要能看出「归属版本」列与「状态」列的差异，否则演示站会掩盖归属列的存在。
+ * 第三条同时是**历史数据**的样本 —— 升级前建的 Key 存的是**产品线**标识，而那个产品线
+ * 属于国内区域，因此它与第一条在界面上**必须都显示「国内版」**（走 `traeRegionLabelOf`）。
+ * 若哪天有人把归属列改回按标识自身取名，这一行会显示成「TraeWork」，与第一行并列成
+ * 一处**假差异** —— 那时这张演示图就是回归证据。
+ * 明文 / hash 一律不出现（与真实 `list_response` 的脱敏白名单一致）。
+ */
+function demoTraeApiKeys(): { keys: TraeApiKeyRecord[] } {
+  return {
+    keys: [
+      { id: "demo-trae-key-1", name: "Cursor (国内版)", variant: "cn", prefix: "sk-trae-9f2c", createdAt: atLocalTime(3, 17, 3), revokedAt: null, revoked: false, lastUsedAt: atLocalTime(0, 17, 10) },
+      { id: "demo-trae-key-2", name: "Cherry (国际版)", variant: "global", prefix: "sk-trae-4b7e", createdAt: atLocalTime(2, 9, 40), revokedAt: null, revoked: false, lastUsedAt: atLocalTime(0, 16, 41) },
+      { id: "demo-trae-key-3", name: "旧 Key（升级迁移）", variant: "trae_work", prefix: "sk-trae-0a1b…cdef", createdAt: atLocalTime(9, 8, 0), revokedAt: atLocalTime(1, 12, 30), revoked: true, lastUsedAt: atLocalTime(3, 10, 5) },
+    ],
+  };
+}
+
 function demoTraeGatewayLogs(): unknown {
   const now = Math.floor(Date.now() / 1000);
   const logs: TraeGatewayLogEntry[] = [
@@ -815,6 +949,22 @@ function demoTraeTokenStatistics(days?: number): TraeTokenStatistics {
       p95LatencyMs: hour === 10 ? 3120 : 0,
     })),
     statuses: [{ key: "200", records: 2 }, { key: "429", records: 1 }],
+    // 按天 × 模型的堆叠柱数据（两模型与下方两变体对应）。
+    modelDaily: [
+      { date: localDate(2), model: "deepseek-v4-flash", total: 1860, input: 1500, output: 360, records: 1 },
+      { date: localDate(2), model: "glm-5.3", total: 4210, input: 3400, output: 810, records: 1 },
+      { date: localDate(1), model: "deepseek-v4-flash", total: 3120, input: 4021, output: 1188, records: 1 },
+      { date: localDate(0), model: "glm-5.3", total: 6791, input: 5225, output: 1566, records: 1 },
+    ],
+    // **区域**范围条各档计数（含「未标注」= 升级前的旧日志）。
+    // demo 刻意同时给两个区域数据；国内那一档是两条程序位的**合计**。
+    variantCounts: { cn: 3, global: 1, unlabeled: 1, all: 5 },
+    // 平台做不到的维度（置灰卡）——形状与 `handlers::unsupported_note` 逐字一致。
+    unsupported: [
+      { capability: "cache_metrics", label: "缓存读取 / 写入 / 命中率", supportedOn: "—", reason: "Trae 网关日志与上传链路都没有 cache 字段，上游也不回传——无从记录" },
+      { capability: "project_dimension", label: "按项目维度统计", supportedOn: "—", reason: "网关日志的 project_id / session_id 是每请求新生成的 uuid，不对应客户端项目" },
+      { capability: "session_cost", label: "调用最贵的会话", supportedOn: "—", reason: "无稳定会话标识，无法把多次请求归并成一个会话成本" },
+    ],
     filesScanned: 1, parseErrors: 0,
     coverageStartAt: Date.now() - 3600_000, coverageEndAt: Date.now(),
     note: "只统计经过本机 Trae 网关的调用；直接在 Trae IDE 里对话不产生记录。",
@@ -960,6 +1110,7 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
     case "get_trae_gateway_config": return demoTraeGatewayConfig();
     case "trae_gateway_status": return demoTraeGatewayStatus();
     case "get_trae_gateway_models": return demoTraeGatewayModels();
+    case "list_trae_api_keys": return demoTraeApiKeys();
     case "get_trae_gateway_logs": return demoTraeGatewayLogs();
     default: throw new Error(`演示模式缺少只读数据: ${command}`);
   }

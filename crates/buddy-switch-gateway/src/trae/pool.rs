@@ -9,8 +9,13 @@
 //!
 //! 因此本池的取值原则是：**每次选号都重新从磁盘派生**，唯一的例外是「选号结果」
 //! 这种纯计算产物。写回也走既有通道——
-//! [`buddy_switch_core::modules::trae::credits::save_cooldown`]，于是冷却状态的
-//! 唯一真相是 `account_cooldowns.json`，签到页与网关页永远一致。
+//! [`buddy_switch_core::modules::trae::credits::save_cooldown_for`]，于是冷却状态的
+//! 唯一真相是**该产品线自己的**冷却文件（`account_cooldowns.json` /
+//! `account_cooldowns.trae_cn.json`），签到页与网关页看到的是同一份。
+//!
+//! **写读同源**：池构造期固化所属变体（[`TraePool::for_variant`]），写回冷却必须用
+//! 该变体选文件——若写成恒定默认变体，CN 账号的冷却会落进 Work 文件、CN 池却读 CN 文件，
+//! 死号永不被冷却且被反复选中（「读侧改了、写侧没改」的半成品缺陷）。
 //!
 //! 代价是每个请求要读 3 个小 JSON（账号库 / 冷却 / 剩余积分）。对本机单用户工具
 //! 这是可接受的，且与 WorkBuddy 网关「每请求 `load_accounts_for`」的既有做法一致。
@@ -20,6 +25,7 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use buddy_switch_core::modules::trae::variant::TraeVariant;
 use buddy_switch_core::modules::trae::{account, credits, device};
 
 /// 上游错误的治理类别。
@@ -188,27 +194,59 @@ pub struct TraePoolSummary {
 }
 
 /// 账号池。
+///
+/// 每个池**绑定唯一的产品线变体**（[`Self::variant`]）：账号库 / 冷却 / 剩余积分
+/// 都按该变体分家。变体在构造期固化（[`Self::for_variant`]），并在 [`Self::sync_for`]
+/// 中以入参校正一次——因此「池的变体」只有一个来源，**不可能**出现「池是 CN、
+/// 写盘却是 Work」这种读写分离。
 #[derive(Debug, Default)]
 pub struct TraePool {
     entries: Vec<TraePoolEntry>,
+    /// 本池所属的产品线变体。冷却写回（[`Self::apply_error`]）据此选文件。
+    variant: TraeVariant,
 }
 
 impl TraePool {
-    /// 新建空池（首次 [`Self::sync`] 前为空）。
+    /// 新建空池（默认变体；首次 [`Self::sync_for`] 前为空）。
     pub fn new() -> Self {
+        Self::for_variant(TraeVariant::default())
+    }
+
+    /// 新建属于**指定变体**的空池。
+    ///
+    /// 变体在构造期固化：`apply_error` 依据它选冷却文件。配合 `sync_for` 的校正，
+    /// 保证写入侧（冷却落哪个文件）与读取侧（`entries_for` / `load_*_for`）永远同源。
+    pub fn for_variant(variant: TraeVariant) -> Self {
         Self {
             entries: Vec::new(),
+            variant,
         }
     }
 
-    /// 从磁盘重建池。返回条目数。
+    /// 从**指定变体**的磁盘数据重建池。返回条目数。
     ///
     /// 顺序沿用账号库顺序（用户可见顺序），不排序——`pick` 的择优逻辑与顺序无关。
-    pub fn sync(&mut self) -> usize {
-        let remaining = credits::load_remaining();
-        let cooldowns = credits::load_cooldowns();
+    ///
+    /// ## 为什么必须带 `variant`
+    ///
+    /// 两条产品线的账号库 / 冷却 / 剩余积分**各自分家**（`*_for(variant)`）。
+    /// 改造前这里只读默认变体（`account::entries()` = `entries_for(TraeWork)`），
+    /// 于是**只装 Trae CN 账号的用户网关池恒为空、`pick` 永远返回 `None`、调用必然失败**——
+    /// 这就是本次「池按变体分家」要修掉的既有功能洞。
+    ///
+    /// **设备标识不需要分家**：`device::derive(uid)` 是 uid 的纯函数、与变体无关，
+    /// 因此这里直接用 `device::derive`，无需 `ensure_for_variant`。
+    pub fn sync_for(&mut self, variant: TraeVariant) -> usize {
+        // 以入参校正本池变体：即使该池此前由别的路径以默认值创建，这里也保证
+        // 「读哪条线」与「写哪条线」一致（`apply_error` 依据 `self.variant` 落盘）。
+        self.variant = variant;
+        let remaining = credits::load_remaining_for(variant);
+        let cooldowns = credits::load_cooldowns_for(variant);
 
-        self.entries = account::entries()
+        // 账号库按**区域**分家（见 `core::modules::trae::region`）：国内两个产品线标识
+        // 读到的是**同一本**库。这里显式传 `variant.region()`，让"按区域取号"这件事
+        // 在调用点就看得见，而不是靠 `*_for(variant)` 内部的隐式折算。
+        self.entries = account::entries_for_region(variant.region())
             .into_iter()
             .map(|(uid, raw)| {
                 let cooldown = cooldowns.cooldowns.get(&uid);
@@ -295,7 +333,7 @@ impl TraePool {
         })
     }
 
-    /// 记录一次上游错误：写回**共享的**冷却文件，并就地更新内存视图。
+    /// 记录一次上游错误：写回**本池所属变体**的冷却文件，并就地更新内存视图。
     ///
     /// `TraeErrKind::None` 不落盘（既不加冷却也不清冷却）——它是「与账号无关」的
     /// 失败，写进去只会污染状态。
@@ -304,7 +342,10 @@ impl TraePool {
             return false;
         }
         let (error_type, cooldown_seconds) = cooldown_of(kind);
-        credits::save_cooldown(uid, error_type, cooldown_seconds, reason);
+        // 关键：按**本池变体**写回冷却（`self.variant`）。若改回无变体的 `save_cooldown`，
+        // 会恒定写默认产品线，导致 CN 账号的冷却落进 Work 文件、CN 池读 CN 文件读不到，
+        // 死号永不被冷却且被反复选中——正是「读侧改了、写侧没改」的半成品缺陷。
+        credits::save_cooldown_for(self.variant, uid, error_type, cooldown_seconds, reason);
 
         let now = chrono::Local::now().timestamp();
         for entry in self.entries.iter_mut().filter(|entry| entry.uid == uid) {
@@ -465,7 +506,9 @@ mod tests {
     }
 
     fn pool_with(entries: Vec<TraePoolEntry>) -> TraePool {
-        TraePool { entries }
+        let mut pool = TraePool::for_variant(TraeVariant::default());
+        pool.entries = entries;
+        pool
     }
 
     #[test]

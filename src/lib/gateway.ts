@@ -14,7 +14,6 @@ export const DEFAULT_GATEWAY_CONFIG: GatewayConfig = {
   bind_addr: "127.0.0.1",
   port: 57891,
   allow_non_loopback: false,
-  dual_port: false,
   log_keep: 200,
   log_bodies: false,
   per_key_rate_limit: null,
@@ -49,7 +48,6 @@ export function normalizeGatewayConfig(raw: unknown): GatewayConfig {
       asBoolean(record.allow_non_loopback) ??
       asBoolean(record.allowNonLoopback) ??
       DEFAULT_GATEWAY_CONFIG.allow_non_loopback,
-    dual_port: asBoolean(record.dual_port) ?? asBoolean(record.dualPort) ?? DEFAULT_GATEWAY_CONFIG.dual_port,
     log_keep: asNumber(record.log_keep) ?? asNumber(record.logKeep) ?? DEFAULT_GATEWAY_CONFIG.log_keep,
     log_bodies: asBoolean(record.log_bodies) ?? asBoolean(record.logBodies) ?? DEFAULT_GATEWAY_CONFIG.log_bodies,
     per_key_rate_limit:

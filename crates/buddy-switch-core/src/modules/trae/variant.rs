@@ -49,16 +49,36 @@
 //! | `darwinBundleIdentifier` | `cn.trae.solo.app` | `cn.trae.app` |
 //!
 //! **⇒ `TRAE SOLO CN` 的官方别名就是 `TraeWork CN`**，即它是 Trae Work 产品线的 CN 版；
-//! `Trae CN` 才是 IDE 那条线。这就是本模块把两个变体命名为 `TraeWork` / `TraeCn` 的依据，
+//! `Trae CN` 才是 IDE 那条线。这就是本模块把两个变体命名为 `TraeWork` / `Trae` 的依据，
 //! 也是界面上「Trae Work」这一分区名的出处 —— **不是我们起的名字**。
 //!
-//! ## 未验证项（勿凭推理"补全"）
+//! ## 国际化端点：取值来源已更正（2026-09-21）
 //!
-//! [`EndpointSet::oauth_base`] 与 [`EndpointSet::ws_base`] 有变体差异，但**没有**抓包证据
-//! 表明它们在国际化场景下的正确取值；同理 [`TraeVariant::TraeCn`] 的国际化端点虽从
-//! `product.json` 读到，却**从未对真实上游跑通过**（本机没装国际版客户端、没有可用凭据）。
-//! 这些字段一律带「未验证」标注并保留 `Option`，让调用方显式处理缺失，
-//! 而不是静默用 CN 值冒充国际化值。
+//! 本表曾把国际版端点记为 `api.trae.ai` / `api.trae.ai` / `grow-normal.trae.ai`，
+//! 那三个值是**脱离结构的字符串误摘** —— 它们确实出现在**国内版**客户端的
+//! `product.json` 里，但不是 `bootConfig.<能力>.trae.<regionKey>` 的取值，而是
+//! 别的能力表（CDN / 市场域）的 `SG`/`US` 键。按结构读一遍就能发现：
+//! 国内版本机的 `bootConfig.account.trae.*` 只有 `normal` 一个 CN 值，
+//! 而 `grow-normal.trae.ai` 在国际版客户端里是 **account** 基址，被记成了 agent。
+//!
+//! 现在改用**国际版客户端自己声明的**值（本机已装：注册表 `TraeWork (User)`
+//! → `%LOCALAPPDATA%\Programs\TRAE SOLO`，`packageType = SOLO_I18N`），
+//! 取自它的 `<安装根>\resources\app\product.json` → `bootConfig.<能力>.trae.normal`：
+//!
+//! | 能力 | 国内版（`TRAE SOLO CN`） | 国际版（`TRAE SOLO`） |
+//! |:---|:---|:---|
+//! | `account` | `https://api.trae.cn` | `https://grow-normal.trae.ai` |
+//! | `iCube` | `https://api.trae.com.cn` | `https://icube-normal.trae.ai` |
+//! | `agent` | `https://trae-api-cn.mchost.guru` | `https://core-normal.trae.ai` |
+//! | `ws` | `wss://trae-ws-cn.mchost.guru/custom_model` | `wss://wss-normal.trae.ai/custom_model` |
+//!
+//! ## 仍未验证的部分（勿凭推理"补全"）
+//!
+//! 上表**主机名**是客户端自述的权威值，但**接口路径与鉴权头是否与国内版同名**
+//! 没有任何证据 —— 它从未对真实上游跑通过（本机没有可用的国际版凭据）。
+//! 因此国际化联网能力必须**逐项实测**后才能宣称可用，失败方向见
+//! [`VariantSpec::endpoints`]：缺失时返回 `None`，**绝不**用 CN 值冒充国际化值。
+//! 本模块只负责「端点取哪个值」，不负责「上游是否接受」。
 
 use std::path::PathBuf;
 
@@ -70,31 +90,72 @@ use std::path::PathBuf;
 #[serde(rename_all = "lowercase")]
 pub enum TraeVariant {
     /// Trae Work 产品线（对应客户端的 `TRAE SOLO` / `TRAE SOLO CN`）。
+    ///
+    /// ⚠️ 持久化轴翻到区域之后（2026-09-21），本取值在**读写数据**时表示「**国内区域**」
+    /// （见 [`TraeVariant::region`]）：`TraeWork` 与 `Trae` 共用国内库，
+    /// 差别只在**程序**维度（启动哪个客户端、快照落哪个目录）。
     TraeWork,
-    /// Trae IDE 产品线（对应客户端的 `Trae` / `Trae CN`）。
-    TraeCn,
+    /// Trae IDE 产品线（客户端 `product.json`：`nameShort = Trae CN`、`nameAlias = TraeCode CN`）。
+    ///
+    /// 语义同 `TraeWork`：**数据层面＝国内区域**，差别只在程序维度。
+    Trae,
+    /// **国际版区域**（客户端 `packageType = SOLO_I18N`，发布者 SPRING (SG) PTE. LTD）。
+    ///
+    /// 在持久化轴翻到区域之后新增：它让「区域之间互不污染」这条**真契约**继续可表达
+    /// （此前那批断言用的是两个国内产品线，而它们现在共用一本库，断言前提已消失）。
+    ///
+    /// **刻意暂不列入 [`TraeVariant::all`]**：`all()` 是界面与网关遍历产品线的入口，
+    /// 而国际版尚未接入探测与登录，进了 `all()` 会让界面上凭空多出一条「未检测到」的线。
+    /// 等探测按程序位接好后（见 `.trellis/tasks/09-21-trae-region-program-model`）再纳入。
+    Global,
 }
 
 impl TraeVariant {
     /// 稳定标识（用于文件名、序列化与前端传参）。
     ///
-    /// `trae_work` 用下划线而非连字符：它会出现在落盘文件名里，
-    /// 与仓库既有 `profiles_trae` 之类的命名习惯一致。
+    /// ## `Trae` 的字符串**仍是 `trae_cn`**（刻意不改，别"顺手修"）
+    ///
+    /// 它已经写进用户的磁盘与既有集成：
+    ///
+    /// - `api_gateway_keys.json` 里每条 Key 的归属；
+    /// - 网关请求日志的 `variant` 字段（Token 统计按它分档）；
+    /// - 快照目录名 `profiles_trae_cn`（见 `paths::profiles_dir_for`）。
+    ///
+    /// 改这个字符串等于**断老数据**，而它本身只是个键名。所以本次只把**标识符**
+    /// 正名为 `Trae`（与官方 `nameShort` 一致），字符串保持原样；`parse` 同时接受
+    /// `trae_cn` 与 `trae`，两侧都可读。
     pub fn as_str(self) -> &'static str {
         match self {
             TraeVariant::TraeWork => "trae_work",
-            TraeVariant::TraeCn => "trae_cn",
+            TraeVariant::Trae => "trae_cn",
+            TraeVariant::Global => "global",
+        }
+    }
+
+    /// 本取值对应的**持久化区域**（账号库/签到/积分/冷却/日志按它分家）。
+    ///
+    /// `TraeWork` 与 `Trae` **都是国内区域** —— 持久化轴翻到区域后，
+    /// 二者的差别只剩**程序**维度（启动哪个客户端、快照落哪个目录）。
+    pub fn region(self) -> super::region::TraeRegion {
+        match self {
+            TraeVariant::TraeWork | TraeVariant::Trae => super::region::TraeRegion::Cn,
+            TraeVariant::Global => super::region::TraeRegion::Global,
         }
     }
 
     /// 对外展示名（界面分区标题、日志、错误文案）。
     ///
     /// `TraeWork` 用官方 `nameAlias` 的写法 `Trae Work`（带空格）；
-    /// `TraeCn` 用 `Trae CN`（与客户端 `nameShort` 一致）。
+    /// `Trae` 用它自己的产品名（官方 `nameShort` 是 `Trae CN`，界面上取更短的 `Trae`）；
+    /// `Global` 是区域而不是产品线，故用区域名。
+    ///
+    /// ⚠️ 这里是**程序位**级的名，不是区域名。界面顶部的区域切换用的是
+    /// `region::TraeRegion::display_name()`（国内版 / 国际版）。
     pub fn display_name(self) -> &'static str {
         match self {
             TraeVariant::TraeWork => "Trae Work",
-            TraeVariant::TraeCn => "Trae CN",
+            TraeVariant::Trae => "Trae",
+            TraeVariant::Global => "国际版",
         }
     }
 
@@ -107,21 +168,29 @@ impl TraeVariant {
             "trae_work" | "traework" | "trae work" | "work" | "solo" | "trae solo" | "trae solo cn" => {
                 Some(TraeVariant::TraeWork)
             }
-            "trae_cn" | "traecn" | "trae cn" | "cn" | "ide" | "trae" => Some(TraeVariant::TraeCn),
+            // `cn` 是**区域标识**（国内版）⇒ 必须落到该区域的**主程序**（TraeWork）。
+            // 它曾作为 Trae 的宽容别名；但区域标识指向主程序才安全 ——
+            // 否则「保存登录态」这类**程序级**操作会去读 TraeCode 客户端的 userData。
+            "cn" => Some(TraeVariant::TraeWork),
+            "trae_cn" | "traecn" | "trae cn" | "ide" | "trae" => Some(TraeVariant::Trae),
+            // 国际版区域。**不放宽成 `global`/`intl` 之外的词**：区域标识是要落到
+            // 文件名与落盘数据上的，认得太宽会让一个拼错的参数静默读到另一套账号库
+            // （症状是"账号凭空消失"，极难定位）。
+            "global" | "trae_global" | "intl" | "international" => Some(TraeVariant::Global),
             _ => None,
         }
     }
 
     /// 全部已知变体，供遍历用。
     pub fn all() -> [TraeVariant; 2] {
-        [TraeVariant::TraeWork, TraeVariant::TraeCn]
+        [TraeVariant::TraeWork, TraeVariant::Trae]
     }
 }
 
 impl Default for TraeVariant {
     /// 默认 `TraeWork`。
     ///
-    /// 选它而非 `TraeCn` 的理由与参考实现一致：`TraeWorkAssistant` 的
+    /// 选它而非 `Trae` 的理由与参考实现一致：`TraeWorkAssistant` 的
     /// `TargetApp::parse` 对未知值**回退 `TraeWork`**，且 `TRAE SOLO CN` 是本机
     /// 最近活跃的产品线。**注意这只是一处"缺省"**，不是"另一条线不支持"。
     fn default() -> Self {
@@ -218,18 +287,15 @@ const TRAE_WORK_SPEC: VariantSpec = VariantSpec {
         agent_host: "https://trae-api-cn.mchost.guru",
         ws_base: Some("wss://trae-ws-cn.mchost.guru/custom_model"),
     },
-    // 国际化取值来自 CN 客户端 product.json 的 SG/US 键。**未验证可否实际连通**。
-    global_endpoints: Some(EndpointSet {
-        account_base: "https://api.trae.ai",
-        icube_base: "https://api.trae.ai",
-        agent_host: "https://grow-normal.trae.ai",
-        ws_base: None,
-    }),
+    // 国际化取值来自**国际版客户端自己声明的** `bootConfig.<能力>.trae.normal`
+    // （本机装在 `%LOCALAPPDATA%\Programs\TRAE SOLO`，`packageType = SOLO_I18N`）。
+    // 主机名是权威值；接口路径与鉴权**从未对上游跑通**，见模块头「仍未验证的部分」。
+    global_endpoints: Some(GLOBAL_ENDPOINTS),
 };
 
 /// Trae CN 变体（`Trae` / `Trae CN`）。
 const TRAE_CN_SPEC: VariantSpec = VariantSpec {
-    variant: TraeVariant::TraeCn,
+    variant: TraeVariant::Trae,
     display_name: "Trae CN",
     name_alias: "TraeCode CN",
     package_type: "TRAE_CN",
@@ -243,19 +309,48 @@ const TRAE_CN_SPEC: VariantSpec = VariantSpec {
         agent_host: "https://trae-api-cn.mchost.guru",
         ws_base: Some("wss://trae-ws-cn.mchost.guru/custom_model"),
     },
-    global_endpoints: Some(EndpointSet {
-        account_base: "https://api.trae.ai",
-        icube_base: "https://api.trae.ai",
-        agent_host: "https://grow-normal.trae.ai",
-        ws_base: None,
-    }),
+    // 同上：国际版客户端自述值。**产品线不改变端点，region 才改变端点** ——
+    // 所以本变体的国际化端点与 `TRAE_WORK_SPEC` 逐字相同（有单测钉住）。
+    global_endpoints: Some(GLOBAL_ENDPOINTS),
+};
+
+/// 国际版端点（**国际版客户端自述值**）—— 本文件的唯一来源，三处 spec 都引用它。
+///
+/// 取值来自国际版客户端 `<安装根>\resources\app\product.json` 的
+/// `bootConfig.<能力>.trae.normal`（本机 `%LOCALAPPDATA%\Programs\TRAE SOLO`）。
+const GLOBAL_ENDPOINTS: EndpointSet = EndpointSet {
+    account_base: "https://grow-normal.trae.ai",
+    icube_base: "https://icube-normal.trae.ai",
+    agent_host: "https://core-normal.trae.ai",
+    ws_base: Some("wss://wss-normal.trae.ai/custom_model"),
+};
+
+/// **国际版区域**（`TraeWork` 国际构建，`packageType = SOLO_I18N`）。
+///
+/// 与两条 CN 产品线的区别：
+/// - 候选名是**国际版客户端自己的**名字（`TRAE SOLO` / `TRAE SOLO.exe`），
+///   不是 CN 那条的（`TRAE SOLO CN`）—— 混在一起用"按序取第一个存在的"会在
+///   同机装两条线时永远命中 CN 那个，国际版被静默吞掉；
+/// - 端点用国际版那套（本表里 `cn_endpoints` 这一格放的就是**它实际使用的端点**：
+///   `EndpointSet` 的字段名是历史包袱，`Global` 没有"另一套"可切）。
+const GLOBAL_SPEC: VariantSpec = VariantSpec {
+    variant: TraeVariant::Global,
+    display_name: "国际版",
+    name_alias: "TraeWork",
+    package_type: "SOLO_I18N",
+    data_dir_names: &["TRAE SOLO"],
+    exe_names: &["TRAE SOLO.exe"],
+    proc_names: &["TRAE SOLO"],
+    cn_endpoints: GLOBAL_ENDPOINTS,
+    global_endpoints: None,
 };
 
 /// 取变体的描述符。
 pub fn variant_spec(variant: TraeVariant) -> &'static VariantSpec {
     match variant {
         TraeVariant::TraeWork => &TRAE_WORK_SPEC,
-        TraeVariant::TraeCn => &TRAE_CN_SPEC,
+        TraeVariant::Trae => &TRAE_CN_SPEC,
+        TraeVariant::Global => &GLOBAL_SPEC,
     }
 }
 
@@ -294,7 +389,7 @@ pub fn variant_of_name(name: &str) -> Option<TraeVariant> {
         return Some(TraeVariant::TraeWork);
     }
     if lowered.contains("trae") {
-        return Some(TraeVariant::TraeCn);
+        return Some(TraeVariant::Trae);
     }
     None
 }
@@ -306,10 +401,17 @@ mod tests {
     #[test]
     fn 变体标识与展示名稳定() {
         assert_eq!(TraeVariant::TraeWork.as_str(), "trae_work");
-        assert_eq!(TraeVariant::TraeCn.as_str(), "trae_cn");
+        // ★ `Trae` 的字符串**是** `trae_cn`（持久化契约，见 `as_str` 的说明）：
+        // 它已写进用户的 Key 记录、网关日志与快照目录名，改名会断老数据。
+        assert_eq!(TraeVariant::Trae.as_str(), "trae_cn");
+        assert_eq!(TraeVariant::Global.as_str(), "global");
         assert_eq!(TraeVariant::TraeWork.display_name(), "Trae Work");
-        assert_eq!(TraeVariant::TraeCn.display_name(), "Trae CN");
+        assert_eq!(TraeVariant::Trae.display_name(), "Trae");
+        assert_eq!(TraeVariant::Global.display_name(), "国际版");
         assert_eq!(TraeVariant::default(), TraeVariant::TraeWork);
+        // 标识符已正名为 `Trae`，但历史字符串仍可解析（两侧都可读）。
+        assert_eq!(TraeVariant::parse("trae"), Some(TraeVariant::Trae));
+        assert_eq!(TraeVariant::parse("trae_cn"), Some(TraeVariant::Trae));
     }
 
     #[test]
@@ -317,8 +419,8 @@ mod tests {
         for s in ["trae_work", "TraeWork", "Trae Work", "solo", "TRAE SOLO CN"] {
             assert_eq!(TraeVariant::parse(s), Some(TraeVariant::TraeWork), "解析失败: {s}");
         }
-        for s in ["trae_cn", "TraeCn", "Trae CN", "ide", "trae"] {
-            assert_eq!(TraeVariant::parse(s), Some(TraeVariant::TraeCn), "解析失败: {s}");
+        for s in ["trae_cn", "Trae", "Trae CN", "ide", "trae"] {
+            assert_eq!(TraeVariant::parse(s), Some(TraeVariant::Trae), "解析失败: {s}");
         }
         assert_eq!(TraeVariant::parse("doubao"), None);
         assert_eq!(TraeVariant::parse(""), None);
@@ -331,8 +433,8 @@ mod tests {
         assert_eq!(variant_of_name("TRAE SOLO CN"), Some(TraeVariant::TraeWork));
         assert_eq!(variant_of_name("TRAE SOLO"), Some(TraeVariant::TraeWork));
         assert_eq!(variant_of_name("TRAE SOLO CN.exe"), Some(TraeVariant::TraeWork));
-        assert_eq!(variant_of_name("Trae CN"), Some(TraeVariant::TraeCn));
-        assert_eq!(variant_of_name("Trae CN.exe"), Some(TraeVariant::TraeCn));
+        assert_eq!(variant_of_name("Trae CN"), Some(TraeVariant::Trae));
+        assert_eq!(variant_of_name("Trae CN.exe"), Some(TraeVariant::Trae));
         // 目录名不区分大小写。
         assert_eq!(variant_of_name("trae solo cn"), Some(TraeVariant::TraeWork));
         // 不认识的平台（豆包）不能被硬判成某个 Trae 变体。
@@ -344,7 +446,7 @@ mod tests {
     #[test]
     fn 变体候选名互不重叠() {
         let work = variant_spec(TraeVariant::TraeWork);
-        let cn = variant_spec(TraeVariant::TraeCn);
+        let cn = variant_spec(TraeVariant::Trae);
         for a in work.data_dir_names {
             assert!(
                 !cn.data_dir_names.contains(a),
@@ -362,11 +464,58 @@ mod tests {
     #[test]
     fn 两条产品线的cn端点逐字相同() {
         let work = variant_spec(TraeVariant::TraeWork).cn_endpoints;
-        let cn = variant_spec(TraeVariant::TraeCn).cn_endpoints;
+        let cn = variant_spec(TraeVariant::Trae).cn_endpoints;
         assert_eq!(work, cn);
         assert_eq!(work.account_base, "https://api.trae.cn");
         assert_eq!(work.icube_base, "https://api.trae.com.cn");
         assert_eq!(work.agent_host, "https://trae-api-cn.mchost.guru");
+    }
+
+    /// 国际化端点必须是**国际版客户端自述**的那一组（2026-09-21 更正真实缺陷）。
+    ///
+    /// 反例就是本次改掉的那三个值：`api.trae.ai` / `api.trae.ai` /
+    /// `grow-normal.trae.ai`。它们确实出现在**国内版**客户端的 `product.json` 里，
+    /// 但属于别的能力表（CDN / 市场域）的 `SG`/`US` 键，不是
+    /// `bootConfig.<能力>.trae.<regionKey>` 的取值；其中 `grow-normal.trae.ai`
+    /// 在国际版客户端里是 **account** 基址，却被记成了 agent。
+    /// 谁再按字符串搜国内版文件把它抄回去，这条会红。
+    #[test]
+    fn 国际化端点取自国际版客户端自述值() {
+        let expected = EndpointSet {
+            account_base: "https://grow-normal.trae.ai",
+            icube_base: "https://icube-normal.trae.ai",
+            agent_host: "https://core-normal.trae.ai",
+            ws_base: Some("wss://wss-normal.trae.ai/custom_model"),
+        };
+        for spec in all_specs() {
+            assert_eq!(
+                spec.global_endpoints.expect("国际化端点应已登记"),
+                expected,
+                "{} 的国际化端点漂了",
+                spec.name_alias
+            );
+        }
+    }
+
+    /// 国际化端点在**每个主机**上都必须与 CN 不同：混用会把请求打到错的域，
+    /// 而且这种错误在日志里只表现为「401 / 超时」，极难定位。
+    ///
+    /// 另钉住 `ws_base` **必须已登记**：它此前是 `None`（"未验证"占位），
+    /// 这条断言在本次更正前是**红的** —— 正因如此它才值得留在这里。
+    #[test]
+    fn 国际化端点与cn端点主机全不同() {
+        for spec in all_specs() {
+            let global = spec.global_endpoints.expect("国际化端点应已登记");
+            assert_ne!(global.account_base, spec.cn_endpoints.account_base, "account 撞了");
+            assert_ne!(global.icube_base, spec.cn_endpoints.icube_base, "iCube 撞了");
+            assert_ne!(global.agent_host, spec.cn_endpoints.agent_host, "agent 撞了");
+            assert_ne!(global.ws_base, spec.cn_endpoints.ws_base, "ws 撞了");
+            assert!(
+                global.ws_base.is_some(),
+                "{} 的国际版 ws 端点缺失（应为国际版客户端自述的 wss 值）",
+                spec.name_alias
+            );
+        }
     }
 
     /// CN 端点必须等于改造前的硬编码常量原值 —— 保证既有行为零变化。

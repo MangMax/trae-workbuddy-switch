@@ -67,6 +67,17 @@ pub struct TraeSettings {
     #[serde(default = "default_api_port")]
     pub api_port: u16,
     /// API 网关 Bearer Token；留空则不鉴权。
+    ///
+    /// ## ★ 多 Key 化后本字段降级为「**兼容读**」，**不得删除**
+    ///
+    /// 网关的 API Key 已迁移到独立的 `trae/api_gateway_keys.json`（多 Key + 归属产品线，
+    /// 见 `buddy_switch_gateway::trae::apikey`）。但**旧用户**的 Key 只存在这里：
+    /// `TraeApiKeyStore::load()` 在 Key 库缺失/损坏时会回落本字段，合成一条
+    /// `variant = TraeWork`（= `TraeVariant::default()`）的 legacy 记录，从而让
+    /// 「升级前能用的 Key，升级后仍然能用」（R1：多 Key 迁移失败 → 全量 401）。
+    ///
+    /// 本字段**原地保留、不清理**：删掉它会让老用户在升级后立刻 401。
+    /// 它不再被任何写路径更新（旧 `patch({apiKey})` 已随 `regenerate_api_key` 一并删除）。
     #[serde(default)]
     pub api_key: String,
     /// API 网关默认模型。

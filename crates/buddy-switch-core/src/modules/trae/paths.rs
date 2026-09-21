@@ -13,12 +13,12 @@
 //! **命名规则（沿用 `region.rs` 的既有惯例）**：
 //!
 //! - **`TraeWork`（默认变体）沿用无后缀的旧文件名** —— 老用户既有数据零失效；
-//! - **`TraeCn` 加 `.trae_cn` 中缀**，如 `checkin_accounts.trae_cn.json`。
+//! - **`Trae` 加 `.trae_cn` 中缀**，如 `checkin_accounts.trae_cn.json`。
 //!
 //! ⇒ 插入位置在**扩展名之前**，不是简单追加。这样文件名仍是 `.json` 结尾，
 //! 与「同名不同目录」的旧约定不冲突，也让用户一眼能看出归属。
 //!
-//! 布局（`~/.buddy-switch/trae/`，括号内为 `TraeCn` 的额外后缀）：
+//! 布局（`~/.buddy-switch/trae/`，括号内为 `Trae` 的额外后缀）：
 //!
 //! ```text
 //! trae/
@@ -51,28 +51,164 @@ use std::path::PathBuf;
 
 use crate::modules::config::store_dir;
 
+use super::region::{TraeProgram, TraeRegion};
 use super::variant::TraeVariant;
 
-/// 为文件名插入变体中缀。
+/// 拼出**该变体所属区域**的数据文件路径（区域级文件族的唯一入口）。
 ///
-/// `TraeWork` 是默认变体，**原样返回**（沿用旧文件名，老数据不失效）；
-/// 其余变体在**扩展名之前**插入 `.<variant>`，如
-/// `checkin_accounts.json` + `TraeCn` → `checkin_accounts.trae_cn.json`。
+/// ## 为什么按 `variant.region()` 而不是按 `variant` 本身分文件
 ///
-/// 无扩展名时直接追加后缀（`foo` → `foo.trae_cn`），不会产生 `foo.trae_cn.` 这种悬空点。
-fn variant_scoped_file_name(stem_with_ext: &str, variant: TraeVariant) -> String {
-    if variant == TraeVariant::default() {
+/// 改造前这族函数按「**产品线**」分文件；现在账号/签到/积分/冷却这些数据按
+/// **区域**分家（两套互不相通的账号体系）。
+///
+/// 关键事实：改造前的两个产品线（`TraeWork` / `Trae`）**都属于国内区域**
+/// ⇒ 它们必须落到**同一个文件**。合并迁移（[`super::region_migrate`]）负责把
+/// `.trae_cn` 里的内容并进国内库，于是两个旧取值读写同一本库。
+///
+/// ⚠️ **不要**改回按 `variant` 分文件：合并后的库会被读成两半
+/// （一边有账号、另一边空），写入还会互相覆盖 —— 这正是本次要消除的缺陷。
+fn scoped_file(name_with_ext: &str, variant: TraeVariant) -> PathBuf {
+    scoped_file_for_region(name_with_ext, variant.region())
+}
+
+// ---------------------------------------------------------------------------
+// 区域轴（持久化轴）：账号库 / 签到 / 积分 / 冷却 / 快照 的**目标**命名
+// ---------------------------------------------------------------------------
+//
+// 上面那族 `*_for(variant)` 是**改造前的产品线命名**，仍在线上运行；下面这族是
+// 区域轴的目标命名。两族并存是**过渡态**：调用点逐段切换，切换完成后上面那族删除。
+//
+// ## 命名规则（与 WorkBuddy 的 region 后缀惯例一致）
+//
+// - **`Cn`（默认区域）沿用无后缀的旧文件名** —— 老用户既有数据零失效，且
+//   账号主库（`checkin_accounts.json`）原地不动，不需要迁移；
+// - **`Global` 加 `.global` 中缀**，如 `checkin_accounts.global.json`。
+//   （与 `~/.buddy-switch/accounts.global.json` 同款约定，一眼能认出是国际版。）
+//
+// ## 为什么账号库按**区域**分家而不是按程序分家
+//
+// CN 与国际是两套**互不相通**的账号体系（JWT 不通用、端点不同），而同一区域内的
+// 两条程序（TraeWork / TraeCode）共用同一套账号 —— 同一个 Trae 账号可以分别启用
+// 在国内的两条程序上。因此账号库的归属维度是区域；「启用在哪条程序上」由**登录态
+// 快照目录**表达（见下）。
+
+/// 为文件名插入**区域**中缀。
+///
+/// `Cn` 是默认区域 → 原样返回；其余在**扩展名之前**插入 `.<region>`，
+/// 无扩展名时直接追加（不产生悬空点），规则与 [`variant_scoped_file_name`] 同构。
+fn region_scoped_file_name(stem_with_ext: &str, region: TraeRegion) -> String {
+    if region == TraeRegion::default() {
         return stem_with_ext.to_string();
     }
     match stem_with_ext.rsplit_once('.') {
-        Some((stem, ext)) => format!("{stem}.{}.{ext}", variant.as_str()),
-        None => format!("{stem_with_ext}.{}", variant.as_str()),
+        Some((stem, ext)) => format!("{stem}.{}.{ext}", region.as_str()),
+        None => format!("{stem_with_ext}.{}", region.as_str()),
     }
 }
 
-/// 拼出某一变体的数据文件路径。
-fn scoped_file(name_with_ext: &str, variant: TraeVariant) -> PathBuf {
-    trae_dir().join(variant_scoped_file_name(name_with_ext, variant))
+/// 拼出某一区域的数据文件路径。
+fn scoped_file_for_region(name_with_ext: &str, region: TraeRegion) -> PathBuf {
+    trae_dir().join(region_scoped_file_name(name_with_ext, region))
+}
+
+/// 账号库文件（按区域分家）。
+pub fn accounts_file_for_region(region: TraeRegion) -> PathBuf {
+    scoped_file_for_region("checkin_accounts.json", region)
+}
+
+/// 分组文件（按区域分家）。
+pub fn groups_file_for_region(region: TraeRegion) -> PathBuf {
+    scoped_file_for_region("groups.json", region)
+}
+
+/// 设备标识映射文件（按区域分家）。
+pub fn device_map_file_for_region(region: TraeRegion) -> PathBuf {
+    scoped_file_for_region("device_map.json", region)
+}
+
+/// OAuth 登录设备身份文件（按区域分家）。
+pub fn oauth_device_file_for_region(region: TraeRegion) -> PathBuf {
+    scoped_file_for_region("oauth_device.json", region)
+}
+
+/// 签到积分明细文件（按区域分家）。
+pub fn credits_history_file_for_region(region: TraeRegion) -> PathBuf {
+    scoped_file_for_region("credits_history.json", region)
+}
+
+/// 每日积分快照文件（按区域分家）。
+pub fn credits_daily_file_for_region(region: TraeRegion) -> PathBuf {
+    scoped_file_for_region("credits_daily.json", region)
+}
+
+/// 剩余积分缓存文件（按区域分家）。
+pub fn remaining_credits_file_for_region(region: TraeRegion) -> PathBuf {
+    scoped_file_for_region("remaining_credits.json", region)
+}
+
+/// 账号冷却状态文件（按区域分家）。
+pub fn cooldowns_file_for_region(region: TraeRegion) -> PathBuf {
+    scoped_file_for_region("account_cooldowns.json", region)
+}
+
+/// 最近一次签到摘要文件（按区域分家）。
+pub fn checkin_summary_file_for_region(region: TraeRegion) -> PathBuf {
+    scoped_file_for_region("checkin_summary.json", region)
+}
+
+/// 按区域取日志文件路径（默认区域不加中缀）。
+///
+/// 例：`Global` + `checkin.log` → `checkin.global.log`。
+/// 历史上按产品线分家的 `checkin.trae_cn.log` **不再写新内容**，只作为历史保留
+/// （诊断日志不改写旧文件是刻意的：翻旧账时原文比"整理过的"更有用）。
+pub fn log_file_for_region(region: TraeRegion, name: &str) -> PathBuf {
+    log_file(&region_scoped_file_name(name, region))
+}
+
+/// 登录态快照根目录（**按区域 × 程序**分家）。
+///
+/// ## 为什么快照比账号库多一个维度
+///
+/// 账号库的归属是区域（账号属于哪套账号体系），但快照是**某个客户端 userData 的
+/// 文件副本** —— 它只能被恢复到「采集它的那条程序」里去。把 CN TraeWork 的快照灌进
+/// TraeCode，等于把一个未知格式的登录态写进另一个客户端。因此快照必须按程序分家。
+///
+/// ## 目录名规则（**保住历史目录，零迁移**）
+///
+/// 改造前的两个目录名**原样保留**（它们各自恰好就是新模型里的一个程序位）：
+///
+/// | 区域 | 程序 | 目录名 | 来源 |
+/// |:---|:---|:---|:---|
+/// | `Cn` | `TraeWork` | `profiles` | 旧默认变体的目录名 |
+/// | `Cn` | `TraeCode` | `profiles_trae_cn` | 旧 `Trae` 变体的目录名 |
+/// | `Global` | `TraeWork` | `profiles_global_trae_work` | 新 |
+/// | `Global` | `TraeCode` | `profiles_global_trae_code` | 新 |
+///
+/// 新增槽位一律用 `<region>_<program>` 规则；两个历史名当**兼容别名**保留，
+/// 因为改名要搬动用户既有快照，而收益只是"整齐"，不值这个风险。
+pub fn profiles_dir_for_program(region: TraeRegion, program: TraeProgram) -> PathBuf {
+    let name = match (region, program) {
+        // 历史名（零迁移）：与改造前 `profiles` / `profiles_trae_cn` 逐字相同。
+        (TraeRegion::Cn, TraeProgram::TraeWork) => "profiles".to_string(),
+        (TraeRegion::Cn, TraeProgram::TraeCode) => "profiles_trae_cn".to_string(),
+        // 新槽位：`<region>_<program>`。
+        (region, program) => format!("profiles_{}_{}", region.as_str(), program.as_str()),
+    };
+    ensured(trae_dir().join(name))
+}
+
+/// 单个账号在某个程序上的登录态快照目录。
+///
+/// `user_id` 直接拼进路径，必须先用 [`safe_slot_name`] 过滤掉路径分隔符与上跳片段。
+pub fn profile_dir_for_program(
+    region: TraeRegion,
+    program: TraeProgram,
+    user_id: &str,
+) -> Option<PathBuf> {
+    if !safe_slot_name(user_id) {
+        return None;
+    }
+    Some(profiles_dir_for_program(region, program).join(user_id))
 }
 
 /// Trae 模块根目录：`~/.buddy-switch/trae`。
@@ -247,6 +383,16 @@ pub fn api_gateway_log_file() -> PathBuf {
     trae_dir().join("api_gateway_logs.json")
 }
 
+/// API 网关的多 Key 库（数组；**只存 sha256 哈希 + 前缀**，明文仅创建时返回一次）。
+///
+/// **刻意不分变体**：网关是单一进程、单一监听端口（7864），
+/// 与 [`api_gateway_file`] / [`api_gateway_log_file`] 同理。
+/// 单条 Key **自带** `variant`（归属产品线）字段决定它使用哪个账号池，
+/// 因此归属由**记录内容**表达，不由文件名表达。
+pub fn api_gateway_keys_file() -> PathBuf {
+    trae_dir().join("api_gateway_keys.json")
+}
+
 /// 登录态快照根目录（默认变体，兼容壳）。
 pub fn profiles_dir() -> PathBuf {
     profiles_dir_for(TraeVariant::default())
@@ -311,17 +457,13 @@ pub fn log_file(name: &str) -> PathBuf {
 
 /// 按变体取日志文件路径：在文件名前加变体前缀（默认变体不加）。
 ///
-/// 例：`TraeCn` + `checkin.log` → `checkin.trae_cn.log`。
+/// 例：`Trae` + `checkin.log` → `checkin.trae_cn.log`。
 /// **未在文件名里出现 `.log` 时退化为直接追加**，不会丢扩展名。
 pub fn log_file_for(variant: TraeVariant, name: &str) -> PathBuf {
-    if variant == TraeVariant::default() {
-        return log_file(name);
-    }
-    let scoped = match name.rsplit_once('.') {
-        Some((stem, ext)) => format!("{stem}.{}.{ext}", variant.as_str()),
-        None => format!("{name}.{}", variant.as_str()),
-    };
-    log_file(&scoped)
+    // 与 `scoped_file` 同源：按**区域**分日志。国内两条程序共用同一套账号与
+    // 同一份签到/冷却，日志分开写只会让排查一个账号的问题要在两份日志里对照，
+    // 没有信息增益；国际版则必须单独一份（两套账号体系）。
+    log_file_for_region(variant.region(), name)
 }
 
 /// 应用级日志（切换、托盘、启动等关键路径）。
@@ -405,6 +547,7 @@ mod tests {
             checkin_summary_file(),
             api_pool_file(),
             api_gateway_file(),
+            api_gateway_keys_file(),
             api_gateway_log_file(),
             settings_file(),
         ] {
@@ -431,8 +574,8 @@ mod tests {
         assert!(profile_dir("1234567890").is_some());
         assert!(profile_dir("../escape").is_none());
         assert!(profile_dir("").is_none());
-        assert!(profile_dir_for(TraeVariant::TraeCn, "1234567890").is_some());
-        assert!(profile_dir_for(TraeVariant::TraeCn, "../escape").is_none());
+        assert!(profile_dir_for(TraeVariant::Global, "1234567890").is_some());
+        assert!(profile_dir_for(TraeVariant::Global, "../escape").is_none());
     }
 
     /// 默认变体**必须沿用旧文件名**，否则老用户数据白失效。
@@ -474,9 +617,9 @@ mod tests {
     #[test]
     fn 两条产品线的数据文件互不相同() {
         let work = TraeVariant::TraeWork;
-        let cn = TraeVariant::TraeCn;
+        let cn = TraeVariant::Global;
 
-        // 逐个函数族对拍：左边是 TraeWork，右边是 TraeCn。
+        // 逐个函数族对拍：左边是 TraeWork，右边是 Trae。
         let pairs: [(&str, PathBuf, PathBuf); 7] = [
             ("账号库", accounts_file_for(work), accounts_file_for(cn)),
             ("分组", groups_file_for(work), groups_file_for(cn)),
@@ -526,13 +669,13 @@ mod tests {
     /// 这是更可取的写法：能只看文件名就别看全路径。
     #[test]
     fn 变体后缀插在扩展名之前() {
-        let cn = accounts_file_for(TraeVariant::TraeCn);
+        let cn = accounts_file_for(TraeVariant::Global);
         let name = cn.file_name().and_then(|s| s.to_str()).unwrap_or_default();
-        assert_eq!(name, "checkin_accounts.trae_cn.json");
+        assert_eq!(name, "checkin_accounts.global.json");
 
-        let log = checkin_log_file_for(TraeVariant::TraeCn);
+        let log = checkin_log_file_for(TraeVariant::Global);
         let log_name = log.file_name().and_then(|s| s.to_str()).unwrap_or_default();
-        assert_eq!(log_name, "checkin.trae_cn.log");
+        assert_eq!(log_name, "checkin.global.log");
 
         // 分家文件与默认变体同目录（只改文件名，不改目录层级）。
         // 用 basename 比较父级层级数，而不是比较绝对路径。
@@ -561,6 +704,10 @@ mod tests {
         assert_eq!(api_pool_file(), trae_dir().join("api_pool.json"));
         assert_eq!(api_gateway_file(), trae_dir().join("api_gateway.json"));
         assert_eq!(
+            api_gateway_keys_file(),
+            trae_dir().join("api_gateway_keys.json")
+        );
+        assert_eq!(
             api_gateway_log_file(),
             trae_dir().join("api_gateway_logs.json")
         );
@@ -568,17 +715,20 @@ mod tests {
         assert_eq!(api_log_file(), logs_dir().join("api.log"));
     }
 
-    /// 无扩展名的输入不能产生悬空点（`foo.trae_cn.`）。
+    /// 无扩展名的输入不能产生悬空点（`foo.global.`）—— 区域族同样要守这条。
     #[test]
     fn 无扩展名输入不产生悬空点() {
-        assert_eq!(variant_scoped_file_name("bare", TraeVariant::TraeCn), "bare.trae_cn");
         assert_eq!(
-            variant_scoped_file_name("a.b.json", TraeVariant::TraeCn),
-            "a.b.trae_cn.json"
+            region_scoped_file_name("bare", TraeRegion::Global),
+            "bare.global"
         );
-        // 默认变体原样返回。
         assert_eq!(
-            variant_scoped_file_name("checkin_accounts.json", TraeVariant::TraeWork),
+            region_scoped_file_name("a.b.json", TraeRegion::Global),
+            "a.b.global.json"
+        );
+        // 默认区域原样返回。
+        assert_eq!(
+            region_scoped_file_name("checkin_accounts.json", TraeRegion::Cn),
             "checkin_accounts.json"
         );
     }
@@ -597,14 +747,14 @@ mod tests {
         let _lock = crate::modules::config::env_lock();
 
         let work = oauth_device_file_for(TraeVariant::TraeWork);
-        let cn = oauth_device_file_for(TraeVariant::TraeCn);
+        let cn = oauth_device_file_for(TraeVariant::Global);
         assert_eq!(
             work.file_name().and_then(|s| s.to_str()),
             Some("oauth_device.json")
         );
         assert_eq!(
             cn.file_name().and_then(|s| s.to_str()),
-            Some("oauth_device.trae_cn.json")
+            Some("oauth_device.global.json")
         );
         assert_ne!(work, cn, "两条产品线的 OAuth 设备身份必须分家");
         // 与 device_map 同目录（同构语义：只改文件名，不改目录层级）。
@@ -661,17 +811,139 @@ mod tests {
             "默认变体的槽位目录名必须沿用旧名 profiles"
         );
         // 另一变体落在自己的 profiles_<variant>/ 下，互不干扰。
-        let cn_bak = profile_bak_dir_for(TraeVariant::TraeCn, "1234567890123456").unwrap();
+        let cn_bak = profile_bak_dir_for(TraeVariant::Global, "1234567890123456").unwrap();
         assert_eq!(
             cn_bak.parent().and_then(|p| p.file_name()).and_then(|s| s.to_str()),
-            Some("profiles_trae_cn")
+            Some("profiles_global")
         );
         assert_ne!(cn_bak.parent(), bak.parent());
 
         // 不安全的名字一律拒绝，绝不拼出越界路径。
         assert!(profile_bak_dir_for(TraeVariant::TraeWork, "../escape").is_none());
         assert!(profile_bak_dir_for(TraeVariant::TraeWork, "").is_none());
-        assert!(profile_bak_dir_for(TraeVariant::TraeCn, "a/b").is_none());
+        assert!(profile_bak_dir_for(TraeVariant::Global, "a/b").is_none());
+
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 区域文件名规则：`Cn` 沿用旧名（零迁移），`Global` 加 `.global` 中缀。
+    ///
+    /// 反例：若把中缀插在扩展名之后（`checkin_accounts.json.global`），文件就不再是
+    /// `.json` 结尾，备份/清理/用户肉眼辨认全部失效 —— 与产品线那族同款护栏。
+    #[test]
+    fn 区域文件后缀插在扩展名之前() {
+        assert_eq!(
+            region_scoped_file_name("checkin_accounts.json", TraeRegion::Cn),
+            "checkin_accounts.json"
+        );
+        assert_eq!(
+            region_scoped_file_name("checkin_accounts.json", TraeRegion::Global),
+            "checkin_accounts.global.json"
+        );
+        // 无扩展名不产生悬空点。
+        assert_eq!(
+            region_scoped_file_name("bare", TraeRegion::Global),
+            "bare.global"
+        );
+        // 日志同理：`checkin.log` → `checkin.global.log`。
+        assert_eq!(
+            region_scoped_file_name("checkin.log", TraeRegion::Global),
+            "checkin.global.log"
+        );
+    }
+
+    /// ★ 两个区域的**每一个**数据文件都不能同路径。
+    ///
+    /// 若这条红了，说明国际版与国内版共用了一个文件 —— 后果是「国际版的签到把账号
+    /// 灌进国内版的库」这类静默污染（两套账号体系互不相通，混库后必然对不上）。
+    #[test]
+    fn 两个区域的数据文件互不相同() {
+        let cn = TraeRegion::Cn;
+        let global = TraeRegion::Global;
+        let pairs: [(&str, PathBuf, PathBuf); 9] = [
+            ("账号库", accounts_file_for_region(cn), accounts_file_for_region(global)),
+            ("分组", groups_file_for_region(cn), groups_file_for_region(global)),
+            ("设备映射", device_map_file_for_region(cn), device_map_file_for_region(global)),
+            ("OAuth 设备身份", oauth_device_file_for_region(cn), oauth_device_file_for_region(global)),
+            ("签到明细", credits_history_file_for_region(cn), credits_history_file_for_region(global)),
+            ("每日积分", credits_daily_file_for_region(cn), credits_daily_file_for_region(global)),
+            ("剩余积分", remaining_credits_file_for_region(cn), remaining_credits_file_for_region(global)),
+            ("冷却状态", cooldowns_file_for_region(cn), cooldowns_file_for_region(global)),
+            ("签到摘要", checkin_summary_file_for_region(cn), checkin_summary_file_for_region(global)),
+        ];
+        for (label, cn_path, global_path) in pairs {
+            assert_ne!(cn_path, global_path, "{label} 被两个区域共用: {cn_path:?}");
+        }
+        // 国内版必须与**改造前的旧路径**逐字相同（否则老数据白丢）。
+        assert_eq!(accounts_file_for_region(cn), accounts_file());
+        assert_eq!(groups_file_for_region(cn), groups_file());
+        assert_eq!(cooldowns_file_for_region(cn), cooldowns_file());
+        // 国际版必须与国内版不同名（basename 级断言，不受 HOME 影响）。
+        assert_eq!(
+            accounts_file_for_region(global)
+                .file_name()
+                .and_then(|s| s.to_str()),
+            Some("checkin_accounts.global.json")
+        );
+    }
+
+    /// 快照目录按**区域 × 程序**分家，且两个历史目录名必须原样保住（零迁移）。
+    ///
+    /// 用 `HomeOverrideGuard` 隔离 home：`profiles_dir_for_program` 会 `create_dir_all`，
+    /// 不隔离就会在用户真实 `~/.buddy-switch` 下建目录（测试纪律）。
+    #[test]
+    fn 快照目录按程序分家且保住历史目录名() {
+        let dir = std::env::temp_dir().join(format!(
+            "buddy-switch-profile-program-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).expect("临时 home 应能创建");
+        let guard = crate::modules::config::HomeOverrideGuard::set(&dir);
+
+        let name_of = |region: TraeRegion, program: TraeProgram| {
+            profiles_dir_for_program(region, program)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(str::to_string)
+        };
+
+        // 历史名：与改造前 `profiles` / `profiles_global` 逐字相同。
+        assert_eq!(
+            name_of(TraeRegion::Cn, TraeProgram::TraeWork).as_deref(),
+            Some("profiles")
+        );
+        assert_eq!(
+            name_of(TraeRegion::Cn, TraeProgram::TraeCode).as_deref(),
+            Some("profiles_trae_cn")
+        );
+        // 新槽位按 `<region>_<program>` 规则。
+        assert_eq!(
+            name_of(TraeRegion::Global, TraeProgram::TraeWork).as_deref(),
+            Some("profiles_global_trae_work")
+        );
+        assert_eq!(
+            name_of(TraeRegion::Global, TraeProgram::TraeCode).as_deref(),
+            Some("profiles_global_trae_code")
+        );
+
+        // 四个程序位**两两不同目录**：混用会把一条程序的登录态灌进另一条。
+        let all = [
+            profiles_dir_for_program(TraeRegion::Cn, TraeProgram::TraeWork),
+            profiles_dir_for_program(TraeRegion::Cn, TraeProgram::TraeCode),
+            profiles_dir_for_program(TraeRegion::Global, TraeProgram::TraeWork),
+            profiles_dir_for_program(TraeRegion::Global, TraeProgram::TraeCode),
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for b in all.iter().skip(i + 1) {
+                assert_ne!(a, b, "两个程序位的快照目录相同: {a:?}");
+            }
+        }
+
+        // 不安全槽位名一律拒绝，绝不拼出越界路径。
+        assert!(profile_dir_for_program(TraeRegion::Global, TraeProgram::TraeWork, "1234").is_some());
+        assert!(profile_dir_for_program(TraeRegion::Global, TraeProgram::TraeWork, "../escape").is_none());
+        assert!(profile_dir_for_program(TraeRegion::Cn, TraeProgram::TraeCode, "a/b").is_none());
 
         drop(guard);
         let _ = std::fs::remove_dir_all(&dir);

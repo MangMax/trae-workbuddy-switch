@@ -900,7 +900,7 @@ mod tests {
     /// 签到选项的变体默认值必须与 `TraeVariant::default()` 一致。
     ///
     /// 这条不是形式主义：`CheckinOptions::default()` 是 HTTP/Tauri 两条通道在
-    /// 解析失败或调用方漏填时的共同落点，它一旦漂到 `TraeCn`，
+    /// 解析失败或调用方漏填时的共同落点，它一旦漂到 `Trae`，
     /// **老用户的 Trae Work 账号库会瞬间看起来是空的**。
     #[test]
     fn checkin_options_defaults_to_default_variant() {
@@ -932,7 +932,7 @@ mod tests {
         let _guard = crate::modules::config::HomeOverrideGuard::set(&dir);
 
         let work = TraeVariant::TraeWork;
-        let cn = TraeVariant::TraeCn;
+        let cn = TraeVariant::Global;
 
         // 只给 Trae Work 写一条冷却。
         credits::save_cooldown_for(work, "u-work", "SessionDead", 3600, "测试");
@@ -971,7 +971,7 @@ mod tests {
     /// `plan` 必须用**传入选项里的变体**去解析选中范围。
     ///
     /// 反例：若 `plan` 内部写死 `account::resolve_user_ids(...)`（无参，等价于默认变体），
-    /// 那么当 `variant = TraeCn` 时，`Scope::Selected` 里勾选的账号会因为
+    /// 那么当 `variant = Trae` 时，`Scope::Selected` 里勾选的账号会因为
     /// 「在 Trae Work 库里找不到」而被全部静默丢弃 → 签到队列莫名其妙为空。
     #[test]
     fn plan_uses_the_options_variant_for_selected_scope() {
@@ -987,10 +987,10 @@ mod tests {
         let _guard = crate::modules::config::HomeOverrideGuard::set(&dir);
 
         // 只在 Trae CN 库里放一个分组，组内挂一个账号。
-        let group_id = account::group_create_for(TraeVariant::TraeCn, "CN 组", "#fff").unwrap();
+        let group_id = account::group_create_for(TraeVariant::Global, "CN 组", "#fff").unwrap();
         let uid = "u-cn-only";
         account::add_manual_for(
-            TraeVariant::TraeCn,
+            TraeVariant::Global,
             "CN 账号",
             &valid_jwt(uid),
             Some(group_id.clone()),
@@ -1000,7 +1000,7 @@ mod tests {
         let jwt_value = valid_jwt(uid);
         let (cooldowns, remaining) = empty_context();
         let options = CheckinOptions {
-            variant: TraeVariant::TraeCn,
+            variant: TraeVariant::Global,
             scope: Scope::Group(group_id.clone()),
             ..Default::default()
         };

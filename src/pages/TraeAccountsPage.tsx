@@ -17,8 +17,8 @@ import {
 import { toast } from "sonner";
 
 import { DemoAction } from "@/components/demo-action";
-import { TraeVariantSwitch } from "@/components/trae-variant-switch";
-import { TraeAccountCard } from "@/components/trae-account-card";
+import { TraeVariantBar } from "@/components/trae-variant-bar";
+import { TraeAccountCard, type TraeProgram } from "@/components/trae-account-card";
 import { TraeExportAccountsDialog } from "@/components/trae-export-accounts-dialog";
 import { TraeImportAccountsDialog } from "@/components/trae-import-accounts-dialog";
 import { TraeOAuthLoginDialog } from "@/components/trae-oauth-login-dialog";
@@ -44,6 +44,12 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import * as api from "@/lib/api";
 import { isAutoDetected, traeProductLabel } from "@/lib/trae-client";
 import { traeVariantLabel } from "@/lib/trae-types";
+import {
+  TRAE_VARIANT_FALLBACK,
+  loadTraeVariantLogins,
+  loadTraeVariantStatuses,
+  type TraeVariantLogins,
+} from "@/lib/trae-variant-status";
 import type {
   TraeAccount,
   TraeAccountsOverview,
@@ -52,9 +58,9 @@ import type {
   TraeCheckinStatus,
   TraeCreditsOverview,
   TraeEnvStatus,
-  TraeProfilesOverview,
   TraeSettings,
   TraeVariantId,
+  TraeVariantStatus,
 } from "@/lib/trae-types";
 import { cn } from "@/lib/utils";
 import { useCompactMode } from "@/lib/use-compact-mode";
@@ -73,11 +79,20 @@ const UNGROUPED = "__ungrouped__";
  * 卡片栅格 → 各确认 Dialog。用户在两个分区之间切换时不需要重新学习界面。
  *
  * **文案与数据源按 Trae 实情落地**，不搬 WorkBuddy 的：
- * - 没有 region 双版本 Tabs（Trae 只有一套账号库，没有国内版/国际版之分）；
- * - 没有 OAuth 扫码（Trae 只支持粘贴 `Cloud-IDE-JWT`）；
+ * - 版本切换的**语义与 WorkBuddy 完全对应**（国内版 / 国际版），差别只在**控件位置**：
+ *   WorkBuddy 在页头右侧放一枚窄切换器，Trae 用页头下方的**全宽状态条**
+ *   （`trae-variant-bar.tsx`）—— 它还要并排显示每个区域各自的登录账号与程序位状态，
+ *   窄控件放不下。承载标识见 `useTraeVariant`（返回**区域**；旧值 `trae_work`/`trae_cn`
+ *   一律回落国内版，否则老书签会去读空库）；
+ * - 卡片头部的**程序切换按钮**（该区域的每个 Trae 程序各一枚）对应 WorkBuddy 卡片上的
+ *   WorkBuddy / CodeBuddy IDE / CodeBuddy CLI 三枚按钮——都是「把这个账号挂到哪个
+ *   客户端上」。这个维度 Trae 叫**程序位**（TraeWork / TraeCode，见 `TraeProgram`），
+ *   与「区域」是两层：区域决定账号库与端点，程序位决定写进哪个客户端；
+ * - **支持 OAuth 网页登录**（`trae-oauth-login-dialog.tsx` + OAuth 三命令），
+ *   粘贴 `Cloud-IDE-JWT` 只是「优先用网页登录」的兜底方式；
  * - 没有自动签到定时器（Trae 侧无调度器），对应位置是「跳过今日已签」这一
  *   真实生效的批量签到策略开关；
- * - 没有自动旅行 / CodeBuddy CLI / CodeBuddy IDE（Trae 侧不存在这些客户端）。
+ * - 没有自动旅行（Trae 侧不存在该客户端）。
  */
 export default function TraeAccountsPage() {
   const [overview, setOverview] = useState<TraeAccountsOverview | null>(null);
@@ -95,7 +110,26 @@ export default function TraeAccountsPage() {
   const [variant] = useTraeVariant();
   const [credits, setCredits] = useState<TraeCreditsOverview | null>(null);
   const [checkin, setCheckin] = useState<TraeCheckinStatus | null>(null);
-  const [profiles, setProfiles] = useState<TraeProfilesOverview | null>(null);
+  /**
+   * 本机全部 Trae 产品线的环境状态（并排视角），与状态条、卡片共用同一份。
+   *
+   * 账号卡片上的「程序切换按钮」要按**每条线**渲染，因此这里必须拿全量，
+   * 而不是 `env`（后者只是「自动挑中的那一条」的单一视角）。
+   *
+   * 初值是**兜底的两条线占位**而不是空数组：状态条与卡片都直接按它渲染，
+   * 空数组会让首次加载期间出现「一枚 Tab 都没有」的空条（模板占了位却什么都没画）。
+   * 用占位起步、加载完成后替换，形态与 WorkBuddy 的 region Tabs 一致
+   * （后者也是先渲染两枚 Tab，再逐区填状态）。
+   */
+  const [variantStatuses, setVariantStatuses] = useState<TraeVariantStatus[]>(TRAE_VARIANT_FALLBACK);
+  /**
+   * 每条产品线各自的当前登录账号（`profiles.currentAccount`）。
+   *
+   * **不能**只读当前这条线：卡片上每条程序按钮的「是否当前账号」是**各判各的**，
+   * 同一个 Trae 账号完全可以同时是 Trae Work 的当前账号、却不是 Trae CN 的。
+   * 只拿当前线的值会让另一枚按钮永远显示成「未启用」——那是谎报，不是简化。
+   */
+  const [logins, setLogins] = useState<TraeVariantLogins>({});
   const [settings, setSettings] = useState<TraeSettings | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -114,27 +148,51 @@ export default function TraeAccountsPage() {
    *  Tauri WebView 不支持原生 confirm，且原生弹窗无法保持主题与无障碍契约。 */
   const [pendingDelete, setPendingDelete] = useState<TraeAccount | null>(null);
 
+  /**
+   * 状态条第二行（每条产品线各自已登录哪个账号）的数据由**本页持有并注入**，
+   * 状态条不再自己读一遍。
+   *
+   * ## 为什么不再用「修订号」触发状态条重读
+   *
+   * 状态条原先自己读各线登录态，因此需要一个 `variantBarRevision`：否则用户执行
+   * 「切换账号 / 保存登录态 / 删除账号 / OAuth 新增」之后，页面主体已更新、
+   * 状态条第二行却仍写着旧账号名。
+   *
+   * 现在卡片上的程序切换按钮**本来就要**每条线的当前账号（否则画不出「那条线上
+   * 有没有挂着这个账号」），本页于是成为唯一数据源，状态条改为接收 `logins`。
+   * 一次性取齐、同一次渲染下发，不一致在结构上就不可能出现 —— 修订号随之取消，
+   * 它要解决的问题已经不存在了。
+   */
+
   const loadAll = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
       // 四份分家数据全部按**当前选中的产品线**读取，与侧栏分区同源。
       // `env` 仍然单独取：它是「单一视角」的环境快照，用于展示该线的安装/运行状态。
-      const [accountData, envData, creditData, checkinData, profileData, settingsData] =
+      //
+      // `statuses` 与「各线当前账号」则是**跨产品线**的：卡片上的程序切换按钮条
+      // （对应 WorkBuddy 卡片的 WorkBuddy / CodeBuddy IDE / CLI 三枚按钮）必须知道
+      // 「本机装了哪几条线、每条线当前挂的是哪个账号」，缺一条就渲染不出那一枚按钮。
+      const [accountData, envData, creditData, checkinData, settingsData, statuses] =
         await Promise.all([
           api.getTraeAccounts(variant),
           api.getTraeEnv(),
           api.getTraeCredits(variant),
           api.getTraeCheckinStatus(variant),
-          api.getTraeProfiles(variant),
           api.getTraeSettings(),
+          loadTraeVariantStatuses(),
         ]);
+      // 登录态读取依赖刚拿到的产品线清单（要遍历它逐条读），故串在探测之后。
+      // 它自己逐条容错：某条线读不到只记 `null`，不会把整页拖成错误态。
+      const currentLogins = await loadTraeVariantLogins(statuses);
       setOverview(accountData);
       setEnv(envData);
       setCredits(creditData);
       setCheckin(checkinData);
-      setProfiles(profileData);
       setSettings(settingsData);
+      setVariantStatuses(statuses);
+      setLogins(currentLogins);
     } catch (e) {
       setError(api.asError(e));
     } finally {
@@ -144,6 +202,51 @@ export default function TraeAccountsPage() {
 
   useEffect(() => {
     void loadAll();
+  }, [loadAll]);
+
+  /**
+   * 一次性把旧「产品线」账号库并入国内版区域账号库（幂等）。
+   *
+   * ## 为什么挂在页面挂载时
+   *
+   * 后端在没有旧库、或已经并完时立刻返回 `changed: false`（成本只是一次文件
+   * 存在性判断），所以不需要前端再维护「跑过没有」的状态 —— 那反而会引入
+   * 「换了台机器/清了缓存就不跑了」这类新缺陷。依赖 `loadAll` 会让切换产品线时
+   * 再调一次：**这是有意的**，代价是一次廉价请求，换来的是「用户切过去时数据已就绪」。
+   *
+   * ## 为什么只在真并了东西时提示
+   *
+   * 改写用户账号库这件事，用户有权知道改了什么、旧数据备份在哪 ——
+   * 因此提示里带上账号数、分组数与**备份路径**；备份失败单独警告（凭据仍在旧文件里，
+   * 未被删除，所以不必阻断）。
+   *
+   * 失败**不阻断页面**：读侧此刻仍按旧库工作，账号一个都没少，用户照常用。
+   */
+  useEffect(() => {
+    if (api.isDemoMode()) return;
+    let disposed = false;
+    void (async () => {
+      try {
+        const report = await api.traeMergeLegacyRegions();
+        if (disposed || !report.changed) return;
+        toast.success("已合并旧产品线账号库", {
+          description: [
+            `并入 ${report.accountsAdded} 个账号（保留现有 ${report.accountsKept} 个）`,
+            report.groupsAdded > 0 ? `分组 ${report.groupsAdded} 个` : null,
+            report.backup ? `旧数据已备份到 ${report.backup}` : null,
+            report.backupFailed ? "⚠️ 备份失败，请先手动复制数据目录" : null,
+          ]
+            .filter(Boolean)
+            .join(" · "),
+        });
+        await loadAll();
+      } catch (e) {
+        toast.error("合并旧账号库失败", { description: api.asError(e) });
+      }
+    })();
+    return () => {
+      disposed = true;
+    };
   }, [loadAll]);
 
   // 签到进度：仅桌面端有事件通道；webui 只在结束时拿到完整报告。
@@ -232,6 +335,52 @@ export default function TraeAccountsPage() {
     );
   }
 
+  /**
+   * 单账号签到（卡片菜单里的「手动签到」，与 WorkBuddy 卡片的同名菜单项对齐）。
+   *
+   * 与 `checkinAll` 的差别只有范围：走 `scope: "selected"` + 当个 `userId`，
+   * 与「全部签到」共用同一条后端路径、同一套跳过与冷却规则 ——
+   * **不为单账号另开旁路**，否则「整批签到会跳过它、单独点却签了」这类不一致
+   * 迟早出现，且两个入口的说辞会互相矛盾。
+   *
+   * 不走 `run()`：批量动作统一报「××完成」够用，但单账号签到的结果有三种真实形态
+   * （签到成功 / 今天已签 / 失败），用户点一下就该直接看到是哪一种，
+   * 而不是先收到一句通用的「签到完成」、再自己到底下那张结果卡里找答案。
+   */
+  async function checkinOne(account: TraeAccount) {
+    const label = account.name || account.userId;
+    setBusy(`checkin-${account.userId}`);
+    try {
+      const result = await api.traeCheckin({
+        scope: "selected",
+        userIds: [account.userId],
+        variant,
+      });
+      setReport(result);
+      const outcome = result.results[0];
+      if (!outcome) {
+        // 一条结果都没有 = 该账号在计划阶段就被跳过（今日已签 / 冷却中 / 凭据过期）。
+        // 如实说「没有执行」，不要为了好看谎报成功。
+        toast.info("未执行签到", {
+          description: result.warnings[0] ?? `${label} 已被跳过（今日已签、冷却中或凭据过期）`,
+        });
+      } else if (outcome.action === "skip_already") {
+        toast.success("今天已签到", { description: label });
+      } else if (!outcome.ok) {
+        toast.error("签到失败", { description: `${label}：${outcome.message || outcome.action}` });
+      } else {
+        toast.success("签到成功", {
+          description: `${label}${outcome.delta > 0 ? `：+${outcome.delta} 积分` : ""}`,
+        });
+      }
+      await loadAll();
+    } catch (e) {
+      toast.error("签到失败", { description: api.asError(e) });
+    } finally {
+      setBusy(null);
+    }
+  }
+
   /** 导入本机账号：读客户端登录态里的 `Cloud-IDE-JWT`，已存在的账号就地覆盖刷新。 */
   async function importLocal() {
     if (importing) return;
@@ -267,9 +416,41 @@ export default function TraeAccountsPage() {
 
   const coolingCount = overview?.cooling ?? 0;
   const expiringSoon = accounts.filter((account) => account.jwtStatus === "warn").length;
-  /** 当前登录账号：由「登录态快照」记录的槽位判定，用于卡片上的当前账号角标。 */
-  const currentUserId = profiles?.currentAccount ?? null;
+  /**
+   * **当前正在管理的这条产品线**的当前登录账号（由该线登录态快照的 `currentAccount` 判定）。
+   *
+   * 它只用于卡片本体（头部高亮、幽灵 logo）：卡片上每枚程序按钮的「是否当前账号」
+   * 各判各的，见 {@link programsFor}。
+   */
+  const currentUserId = logins[variant] ?? null;
   const switchBusy = busy?.startsWith("switch-") ?? false;
+
+  /**
+   * 该账号在**每条 Trae 程序**上的状态 —— 卡片上那排切换按钮的数据源。
+   *
+   * 与 WorkBuddy 卡片的 `workbuddyActive` / `codebuddyCnIdeActive` / `codebuddyCliActive`
+   * 是同一层语义：先在本页把「有哪些程序、各自装没装、这个账号是不是它当前的账号」
+   * 算清楚，卡片只负责画。**判断不下沉到卡片里** —— 否则同一账号会被各卡片各算一遍，
+   * 迟早与状态条、详情弹窗的口径出现分歧。
+   */
+  function programsFor(account: TraeAccount): TraeProgram[] {
+    // 程序位来自**当前区域**的条目：区域决定账号体系（读哪本库），
+    // 程序位决定客户端（登录态写进谁、启动谁）。
+    const entry = variantStatuses.find((item) => item.variant === variant);
+    return (entry?.programs ?? []).map((program) => ({
+      // 尚未建模的程序位（如国际版 TraeCode）没有可回传的标识 ⇒ 用程序位标识占位；
+      // 它的 `installed` 必为 false，卡片会渲染成禁用按钮，不会被误点。
+      variant: program.variant ?? program.program,
+      label: program.label,
+      installed: program.installed,
+      // 登录态是**客户端级**的：只有拿到程序位标识才能比较，
+      // 且两边都非空（`logins` 读不到时是 `null`，不能让 `null` 与空 userId 相互匹配）。
+      current:
+        program.variant !== null &&
+        Boolean(account.userId) &&
+        logins[program.variant] === account.userId,
+    }));
+  }
   // 探测到的是哪条产品线。同机装多个 Trae 时，用户靠这个确认切换器管的是哪一个。
   const productLabel = traeProductLabel(env);
   const autoDetected = isAutoDetected(env);
@@ -295,18 +476,22 @@ export default function TraeAccountsPage() {
           曾经这里堆了 4 个按钮（刷新 / 刷新积分 / 全部签到 / 添加账号），
           与 WorkBuddy 的骨架冲突，也让同一功能出现两个入口。 */}
       <header className="mb-6">
-        <div className="flex flex-wrap items-start justify-between gap-x-6 gap-y-3">
-          <div className="min-w-0">
-            <h1 className="text-[28px] font-semibold tracking-tight">账号管理</h1>
-            <p className="mt-2 text-sm leading-6 text-muted-foreground">
-              管理 {variantLabel} 账号的登录凭据、签到与登录态切换。与 WorkBuddy 的账号库彼此独立。
-            </p>
-          </div>
-          {/* 产品线切换器放在页头右侧（详情页动作区域），宽屏下与标题同排、
-              窄屏自动换行到下一行。它从侧栏下沉到这里的原因见组件自身注释。 */}
-          <TraeVariantSwitch className="shrink-0" />
+        <div className="min-w-0">
+          <h1 className="text-[28px] font-semibold tracking-tight">账号管理</h1>
+          <p className="mt-2 text-sm leading-6 text-muted-foreground">
+            管理 {variantLabel} 账号的登录凭据、签到与登录态切换。与 WorkBuddy 的账号库彼此独立。
+          </p>
         </div>
       </header>
+
+      {/* 全宽产品线状态条（替代页头右侧的 `TraeVariantSwitch`）。
+          `value` / `onValueChange` 映射到 URL `?line=`（`useTraeVariant`）；切换**只改 URL**，
+          由下方既有 `loadAll` 重取四份数据——**不**用 `TabsContent` 为每个变体各放一个面板，
+          那会让两个面板各自挂载一次取数、每次切换都触发重复请求。 */}
+      {/* 两条线的状态与登录态**由本页注入**（本页为了卡片上的程序切换按钮本来就要取全）。
+          这比让状态条自己再读一遍更不易错：同一次渲染只有一份数据，
+          「主体已是新账号、顶部还写着旧账号」在结构上不可能出现。 */}
+      <TraeVariantBar className="mb-6" statuses={variantStatuses} logins={logins} />
 
       {error && (
         <Alert variant="destructive" className="mb-4">
@@ -565,18 +750,33 @@ export default function TraeAccountsPage() {
                 {visible.map((account) => (
                   <TraeAccountCard
                     key={account.userId}
-                    account={account}
+                    account={{
+                      ...account,
+                      // 逐包明细来自 `get_trae_credits` 的 `packages[uid]`：账号视图（`list_account_views_for`）
+                      // 只带聚合积分，包粒度明细在积分总览里，按 uid 合并后交给卡片渲染「近期到期」进度条。
+                      creditPackages: credits?.packages?.[account.userId] ?? account.creditPackages ?? null,
+                    }}
                     groupName={groupNameOf(account)}
                     current={account.userId === currentUserId}
+                    programs={programsFor(account)}
                     compact={compact}
                     busy={busy}
                     switchBusy={switchBusy}
                     featuresDisabled={api.isDemoMode()}
-                    onSwitch={(target) =>
+                    /* 「把这个账号挂到哪条 Trae 线上」——对应 WorkBuddy 卡片上的
+                       WorkBuddy / CodeBuddy IDE / CodeBuddy CLI 三枚按钮。
+                       `variant` 取按钮自己那条线（不是当前页面那条）：用户就是要
+                       在当前页面上给另一条线挂账号，用页面的 `variant` 会挂错线。 */
+                    onSwitchTo={(target, programVariant) =>
                       void run(
-                        `switch-${target.userId}`,
-                        "切换账号",
-                        () => api.traeSwitchAccount({ userId: target.userId, launch: true, variant }),
+                        `switch-${target.userId}@${programVariant}`,
+                        `切换${traeVariantLabel(programVariant)}账号`,
+                        () =>
+                          api.traeSwitchAccount({
+                            userId: target.userId,
+                            launch: true,
+                            variant: programVariant,
+                          }),
                         (outcome) => {
                           if (!outcome.success) {
                             const last = outcome.steps[outcome.steps.length - 1];
@@ -585,6 +785,7 @@ export default function TraeAccountsPage() {
                         },
                       )
                     }
+                    onCheckin={(target) => void checkinOne(target)}
                     onSaveLogin={(target) =>
                       void run(`save-${target.userId}`, "保存登录态", () => api.traeSaveLogin(target.userId, variant))
                     }

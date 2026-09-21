@@ -1481,7 +1481,7 @@ mod tests {
     fn cloudide_auth_info_debug_is_redacted() {
         let info = cloudide_from_plain(
             r#"{"token":"a.b.c","refreshToken":"rt","host":"https://api.trae.cn","userId":123,"userRegion":"cn","expiredAt":100,"account":"me"}"#,
-            TraeVariant::TraeCn,
+            TraeVariant::Trae,
         )
         .unwrap();
         let debug = format!("{info:?}");
@@ -1646,7 +1646,7 @@ mod tests {
             }),
             TraeVariant::TraeWork,
         );
-        let failed = credential_status_value(&Err(IcubeError::PrivateKeyMissing), TraeVariant::TraeCn);
+        let failed = credential_status_value(&Err(IcubeError::PrivateKeyMissing), TraeVariant::Trae);
         for value in [&ok, &failed] {
             let text = serde_json::to_string(value).unwrap();
             let upper = text.to_ascii_uppercase();
@@ -1664,11 +1664,14 @@ mod tests {
             failed.get("errorKind").and_then(|v| v.as_str()),
             Some("privateKeyMissing")
         );
-        assert!(failed
+        // 错误文案必须点名**该程序位**。⚠️ `Trae` 与 `Trae Work` 前缀相同，
+        // `contains("Trae")` 单独用会被 TraeWork 的文案蒙混过关，故补一条反向断言。
+        let message = failed
             .get("errorMessage")
             .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .contains("Trae CN"));
+            .unwrap_or_default();
+        assert!(message.contains("Trae"), "{message}");
+        assert!(!message.contains("Trae Work"), "{message}");
     }
 
     /// 每种错误都有稳定的 `kind()` 标签（前端与日志依赖它）。

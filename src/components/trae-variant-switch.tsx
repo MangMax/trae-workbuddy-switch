@@ -2,7 +2,8 @@ import { useEffect, useState } from "react";
 
 import { TraeVariantMark } from "@/components/product-marks";
 import * as api from "@/lib/api";
-import type { TraeVariantId, TraeVariantStatus } from "@/lib/trae-types";
+import { TRAE_VARIANT_FALLBACK } from "@/lib/trae-variant-status";
+import type { TraeRegionId, TraeVariantStatus } from "@/lib/trae-types";
 import { cn } from "@/lib/utils";
 import { useTraeVariant } from "@/lib/use-trae-variant";
 
@@ -62,34 +63,24 @@ export function TraeVariantSwitch({
   const probed = statuses ?? local;
 
   /*
-   * 探测不到任何变体时**仍然把两条线列出来**（而不是 `return null`）。
+   * 探测不到任何区域时**仍然把两个区域列出来**（而不是 `return null`）。
    *
-   * 这是与前一版实现的关键差别：切换器是**选产品的控件**，它必须在后端不可用
-   * 时依然可用（否则用户连切回另一条线的入口都没有，只能改 URL）。
+   * 这是与前一版实现的关键差别：切换器是**选版本/区域的控件**，它必须在后端不可用
+   * 时依然可用（否则用户连切回另一个区域的入口都没有，只能改 URL）。
    * 探测结果只用来补「运行状态」，不决定「有哪些选项」——
-   * 选项集合由 Rust 侧 `TraeVariant::ALL` 固定，前端不维护第二份清单，
-   * 因此这里的兜底值只是「状态未知」的占位，不是一份会漂移的产品名表。
+   * 选项集合由 Rust 侧 `TraeRegion::all()` 固定（`platform::variants_status` 按区域列条目），
+   * 前端不维护第二份清单，因此这里的兜底值只是「状态未知」的占位，
+   * 不是一份会漂移的选项表。
    *
-   * `variantLabel` 仍写 `Trae Work` / `Trae CN` 是因为**此刻拿不到后端值**，
-   * 而这两个名字是与 Rust `display_name()` 对齐的既有文案；一旦探测成功，
-   * 显示的永远是后端返回的 `variantLabel`。
+   * ⚠️ 契约在 2026-09-21 由「产品线」改为「**区域**」：切换器切的是区域（国内版/国际版），
+   * 账号库/端点/冷却都按区域分家；程序位（TraeWork / TraeCode）是卡片上的第二层，
+   * 由账号页的每程序一枚按钮表达，**不出现在本控件里**。
+   *
+   * `variantLabel` 由**共享兜底表**给出（`TRAE_VARIANT_FALLBACK`，与账号页的状态条同源），
+   * 不再在本文件里另写一份 —— 两份清单迟早漂移，而漂移的表现是
+   * 「同一个区域在两个控件里叫不同名字」。探测成功时显示的永远是后端返回的 `variantLabel`。
    */
-  const fallback: TraeVariantStatus[] = (
-    [
-      ["trae_work", "Trae Work"],
-      ["trae_cn", "Trae CN"],
-    ] as const
-  ).map(([variant, variantLabel]) => ({
-    variant,
-    variantLabel,
-    nameAlias: null,
-    installed: false,
-    running: false,
-    version: null,
-    path: null,
-    dataDir: null,
-    dataDirExists: false,
-  }));
+  const fallback: TraeVariantStatus[] = TRAE_VARIANT_FALLBACK;
 
   const items: TraeVariantStatus[] =
     probed && probed.length > 0 ? probed : fallback;
@@ -101,7 +92,7 @@ export function TraeVariantSwitch({
         className,
       )}
       role="tablist"
-      aria-label="选择 Trae 产品线"
+      aria-label="选择 Trae 版本"
     >
       {items.map((item) => {
         const active = item.variant === variant;
@@ -112,7 +103,7 @@ export function TraeVariantSwitch({
             type="button"
             role="tab"
             aria-selected={active}
-            onClick={() => setVariant(item.variant as TraeVariantId)}
+            onClick={() => setVariant(item.variant as TraeRegionId)}
             title={`${item.variantLabel}：${state}${item.version ? ` · v${item.version}` : ""}`}
             className={cn(
               "inline-flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-xs outline-none transition-colors",
@@ -122,7 +113,8 @@ export function TraeVariantSwitch({
                 : "text-muted-foreground hover:bg-background/60 hover:text-foreground",
             )}
           >
-            <TraeVariantMark variant={item.variant} size={18} />
+            {/* 图标用该区域**主程序**的（区域自身不是客户端）。 */}
+            <TraeVariantMark variant={item.programs?.[0]?.variant ?? item.variant} size={18} />
             <span>{item.variantLabel}</span>
             {/* 运行状态点：`installed` 但未运行时用暗点，未安装则完全不显示点——
                 这里只表达「此刻在不在跑」，安装与否放在 title 里，不占视觉额度。 */}

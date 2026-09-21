@@ -356,11 +356,38 @@ export default function TraeCreditsPage() {
         </Card>
       </section>
 
+      {/* ---- 平台做不到的维度（置灰说明；形状来自 handlers::unsupported_note） ---- */}
+      {(credits?.unsupported.length ?? 0) > 0 && (
+        <section className="mt-6 min-w-0 space-y-2.5" aria-labelledby="trae-credits-unsupported-title">
+          <div className="px-1">
+            <h2 id="trae-credits-unsupported-title" className="text-[13px] font-medium leading-5">
+              平台不支持的维度
+            </h2>
+          </div>
+          <Card className="min-w-0 gap-0 overflow-hidden rounded-xl border-dashed py-0 shadow-none">
+            <div className="divide-y divide-border/60">
+              {credits?.unsupported.map((item) => (
+                <div key={item.capability} className="flex flex-wrap items-baseline gap-x-3 gap-y-1 px-5 py-3 opacity-70">
+                  <span className="text-sm font-medium text-muted-foreground">{item.label}</span>
+                  <span className="text-xs text-muted-foreground">（仅 {item.supportedOn}）</span>
+                  <span className="w-full text-xs leading-5 text-muted-foreground">{item.reason}</span>
+                </div>
+              ))}
+            </div>
+          </Card>
+        </section>
+      )}
+
       <section className="mt-6 min-w-0 space-y-2.5" aria-labelledby="trae-credits-detail-title">
         <div className="px-1">
           <h2 id="trae-credits-detail-title" className="text-[13px] font-medium leading-5">
             账号积分明细
           </h2>
+          {/* 口径说明：Trae 积分来自签到快照，**没有**「请求用量」这一口径的数据源，
+              因此这里是单栏明细 + 说明，而不是 WorkBuddy 那套「明细 / 请求用量」分栏。 */}
+          <p className="mt-1 text-xs leading-5 text-muted-foreground">
+            数据来源为签到快照与「同步积分」的结果；Trae 侧不存在「产生这些积分的请求用量」口径，故不设分栏。
+          </p>
         </div>
         <Card className="min-w-0 gap-0 overflow-hidden rounded-xl py-0 shadow-none">
           <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border/60 px-5 py-3">

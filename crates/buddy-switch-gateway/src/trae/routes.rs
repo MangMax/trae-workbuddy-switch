@@ -24,7 +24,7 @@ use std::collections::HashSet;
 use std::time::Instant;
 
 use axum::body::Bytes;
-use axum::extract::{Request, State};
+use axum::extract::{Extension, RawQuery, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -32,13 +32,24 @@ use axum::Json;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
+use buddy_switch_core::modules::trae::account;
+use buddy_switch_core::modules::trae::region::TraeRegion;
+use buddy_switch_core::modules::trae::variant::TraeVariant;
+
 use super::payload;
-use super::pool::{classify_http, classify_solo, PickedTraeAccount, TraeErrKind};
+use super::pool::{classify_http, classify_solo, PickedTraeAccount, TraeErrKind, TraePool};
 use super::sse::{self, TokenUsage};
 use super::{
     now_secs, TraeGatewayState, TRAE_APP_ID, TRAE_IDE_VERSION,
     TRAE_IDE_VERSION_CODE, TRAE_LLM_CHAT_PATH,
 };
+
+/// 请求扩展：承载 Bearer Key 的**归属产品线**，供 handler 选择对应的账号池。
+///
+/// 用「请求扩展」而非给每个 handler 加参数：鉴权中间件解析出归属后写入，
+/// `chat_completions` 读出，避免中间件 → handler 的签名穿透一堆函数。
+#[derive(Clone, Copy, Debug)]
+pub struct TraeKeyVariant(pub TraeVariant);
 
 /// 日志里的端点名（与 WorkBuddy 网关同名字符串，便于统一聚合）。
 const ENDPOINT: &str = "/v1/chat/completions";
@@ -53,10 +64,13 @@ const TRAE_USER_AGENT: &str = "TraeClient/TTNet";
 /// `GET /health`：存活探针，**免鉴权**。
 ///
 /// 附带账号池摘要：探活时顺手看一眼「还有没有可用账号」比再发一次 `/status` 省事。
+/// 摘要取**默认变体**的池（探针无 Key、无归属，只能给一条产品线的概览）。
 pub async fn health(State(state): State<TraeGatewayState>) -> Response {
+    let variant = TraeVariant::default();
     let summary = {
-        let mut pool = state.pool.lock().await;
-        pool.sync();
+        let mut pools = state.pools.lock().await;
+        let pool = pools.entry(variant).or_insert_with(|| TraePool::for_variant(variant));
+        pool.sync_for(variant);
         pool.summary(now_secs())
     };
     json_response(
@@ -73,19 +87,22 @@ pub async fn health(State(state): State<TraeGatewayState>) -> Response {
 
 /// Bearer 鉴权中间件：`/health` 免鉴权，其余端点校验 `Authorization: Bearer <key>`。
 ///
-/// 与参考实现的一处**有意差异**：Key 为空时**拒绝**而不是放行。参考实现「留空即不鉴权」
-/// 意味着任何人只要猜到 7864 端口就能白嫖额度；本网关的 Key 由 [`super::ensure_api_key`]
-/// 自动生成并写回设置，不存在「用户忘了配」的场景，所以宁严勿宽。
+/// 与参考实现的一处**有意差异**：没有任何可用 Key 时**拒绝**而不是放行。参考实现
+/// 「留空即不鉴权」意味着任何人只要猜到 7864 端口就能白嫖额度；本网关要求 Key 由
+/// 用户显式创建（或经旧 `settings.apiKey` 兼容读得来），不存在「用户忘了配」的放行场景，
+/// 所以宁严勿宽。
+///
+/// 鉴权通过后把 `record.variant`（**归属产品线**）写进请求扩展
+/// （[`TraeKeyVariant`]），下游据此选择对应的账号池；同时 `touch` 刷新最近使用时间。
 pub async fn bearer_auth(
     State(state): State<TraeGatewayState>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     if request.uri().path() == "/health" {
         return next.run(request).await;
     }
 
-    let expected = state.api_key().await;
     let presented = request
         .headers()
         .get(header::AUTHORIZATION)
@@ -105,22 +122,51 @@ pub async fn bearer_auth(
             "invalid_request_error",
             "缺少凭据：请在 Authorization 头携带 `Bearer <API Key>`",
         ),
-        Some(key) if !expected.is_empty() && key == expected => next.run(request).await,
-        Some(_) => openai_error(
-            StatusCode::UNAUTHORIZED,
-            "invalid_request_error",
-            "API Key 无效：请到「API 服务」页复制当前 Key",
-        ),
+        Some(key) => match state.key_store.verify(key) {
+            Some(record) => {
+                // 归属产品线透传给 handler（决定用哪个账号池）。
+                request
+                    .extensions_mut()
+                    .insert(TraeKeyVariant(record.variant));
+                state.key_store.touch(&record.id);
+                next.run(request).await
+            }
+            None => openai_error(
+                StatusCode::UNAUTHORIZED,
+                "invalid_request_error",
+                "API Key 无效：请到「API 服务」页创建或复制一把可用的 Key",
+            ),
+        },
     }
 }
 
 /// `GET /status`：运行状态 + 账号明细 + 诊断。
-pub async fn status(State(state): State<TraeGatewayState>) -> Response {
+///
+/// 可选 query `variant`（`trae_work` / `trae_cn`）决定看哪个账号池；
+/// 缺失或无法识别一律回落 [`TraeVariant::default`]（TraeWork），与旧行为一致。
+pub async fn status(
+    State(state): State<TraeGatewayState>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let variant = parse_variant_query(query.as_deref());
     // 复用管理面那份组装逻辑：`/status` 与「API 服务」页显示的必须是同一份状态。
     let config = state.config_snapshot().await;
     let addr = Some(format!("{}:{}", config.bind_addr, config.port));
-    let body = super::status_view(&state, true, addr, env!("CARGO_PKG_VERSION")).await;
+    let body =
+        super::status_view(&state, true, addr, env!("CARGO_PKG_VERSION"), variant).await;
     json_response(StatusCode::OK, body)
+}
+
+/// 从 query 串解析变体参数（最简实现，与 server 的 `query_value` 同风格）。
+fn parse_variant_query(query: Option<&str>) -> TraeVariant {
+    query
+        .unwrap_or("")
+        .split('&')
+        .find_map(|pair| {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            (key == "variant").then(|| TraeVariant::parse(value).unwrap_or_default())
+        })
+        .unwrap_or_default()
 }
 
 /// `GET /v1/models`：静态模型清单。
@@ -132,12 +178,16 @@ pub async fn models() -> Response {
 }
 
 /// `POST /v1/chat/completions`。
+///
+/// 归属产品线由鉴权中间件经请求扩展（[`TraeKeyVariant`]）传入，决定用哪个账号池。
 pub async fn chat_completions(
     State(state): State<TraeGatewayState>,
+    Extension(key_variant): Extension<TraeKeyVariant>,
     _headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let started = Instant::now();
+    let variant = key_variant.0;
     let parsed: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(error) => {
@@ -156,8 +206,17 @@ pub async fn chat_completions(
     let chat_id = format!("chatcmpl-{}", uuid_like());
 
     if stream {
-        stream_chat(&state, &body, &config.default_model, &model, &chat_id, max_rotate, started)
-            .await
+        stream_chat(
+            &state,
+            &body,
+            &config.default_model,
+            &model,
+            &chat_id,
+            max_rotate,
+            started,
+            variant,
+        )
+        .await
     } else {
         aggregate_chat(
             &state,
@@ -167,6 +226,7 @@ pub async fn chat_completions(
             &chat_id,
             max_rotate,
             started,
+            variant,
         )
         .await
     }
@@ -186,12 +246,13 @@ async fn stream_chat(
     chat_id: &str,
     max_rotate: usize,
     started: Instant,
+    variant: TraeVariant,
 ) -> Response {
     let mut tried: HashSet<String> = HashSet::new();
     let mut last: Option<UpstreamFailure> = None;
 
     for _ in 0..max_rotate {
-        match attempt_once(state, body, default_model, &mut tried).await {
+        match attempt_once(state, body, default_model, &mut tried, variant).await {
             None => break,
             Some(AttemptResult::Failed { failure, .. }) => last = Some(failure),
             Some(AttemptResult::Ok { account, response }) => {
@@ -209,6 +270,7 @@ async fn stream_chat(
                         started,
                         outcome.error,
                         outcome.usage,
+                        variant,
                     )
                     .await;
                 });
@@ -218,8 +280,8 @@ async fn stream_chat(
     }
 
     // 没拿到任何可用上游：这里**还没发过响应头**，可以正常返回 JSON 错误。
-    let failure = last.unwrap_or_else(|| no_account_failure_sync(state));
-    settle_failure(state, model, true, started, &failure).await;
+    let failure = last.unwrap_or_else(|| no_account_failure_sync(state, variant));
+    settle_failure(state, model, true, started, &failure, variant).await;
     openai_error(
         StatusCode::from_u16(failure.status).unwrap_or(StatusCode::BAD_GATEWAY),
         &failure.code,
@@ -241,40 +303,46 @@ async fn aggregate_chat(
     chat_id: &str,
     max_rotate: usize,
     started: Instant,
+    variant: TraeVariant,
 ) -> Response {
     let mut tried: HashSet<String> = HashSet::new();
     let mut last: Option<UpstreamFailure> = None;
 
     for _ in 0..max_rotate {
-        let (account, response) = match attempt_once(state, body, default_model, &mut tried).await {
-            None => break,
-            Some(AttemptResult::Failed { failure, .. }) => {
-                last = Some(failure);
-                continue;
-            }
-            Some(AttemptResult::Ok { account, response }) => (account, response),
-        };
+        let (account, response) =
+            match attempt_once(state, body, default_model, &mut tried, variant).await {
+                None => break,
+                Some(AttemptResult::Failed { failure, .. }) => {
+                    last = Some(failure);
+                    continue;
+                }
+                Some(AttemptResult::Ok { account, response }) => (account, response),
+            };
 
         let (payload, error, usage) = sse::aggregate(response, chat_id, model).await;
 
         match (payload, error) {
             (Some(payload), None) => {
-                settle(state, &account, model, false, started, None, usage).await;
+                settle(state, &account, model, false, started, None, usage, variant).await;
                 return json_response(StatusCode::OK, payload);
             }
             (_, Some((code, message))) => {
                 // 流内错误：冷却该账号 → 换下一个账号整轮重来（响应头还没发）。
-                last = Some(record_stream_error(state, &account, code, &message).await);
+                last = Some(
+                    record_stream_error(state, &account, code, &message, variant).await,
+                );
             }
             _ => {
                 // 既没有 payload 也没有错误：上游给了个空流。按 5xx 处理并换号。
-                last = Some(record_stream_error(state, &account, 0, "上游返回空事件流").await);
+                last = Some(
+                    record_stream_error(state, &account, 0, "上游返回空事件流", variant).await,
+                );
             }
         }
     }
 
-    let failure = last.unwrap_or_else(|| no_account_failure_sync(state));
-    settle_failure(state, model, false, started, &failure).await;
+    let failure = last.unwrap_or_else(|| no_account_failure_sync(state, variant));
+    settle_failure(state, model, false, started, &failure, variant).await;
     openai_error(
         StatusCode::from_u16(failure.status).unwrap_or(StatusCode::BAD_GATEWAY),
         &failure.code,
@@ -309,11 +377,13 @@ async fn attempt_once(
     body: &Bytes,
     default_model: &str,
     tried: &mut HashSet<String>,
+    variant: TraeVariant,
 ) -> Option<AttemptResult> {
     let picked = {
-        let mut pool = state.pool.lock().await;
+        let mut pools = state.pools.lock().await;
+        let pool = pools.entry(variant).or_insert_with(|| TraePool::for_variant(variant));
         // 每次选号前重新同步：另一个入口（签到页 / 桌面端）可能刚写了冷却或刷新了积分。
-        pool.sync();
+        pool.sync_for(variant);
         pool.pick(now_secs(), tried)
     }?;
     tried.insert(picked.uid.clone());
@@ -349,8 +419,11 @@ async fn attempt_once(
                 ),
             };
             {
-                let mut pool = state.pool.lock().await;
-                pool.apply_error(&picked.uid, kind, &failure.message);
+                let mut pools = state.pools.lock().await;
+                pools
+                    .entry(variant)
+                    .or_insert_with(|| TraePool::for_variant(variant))
+                    .apply_error(&picked.uid, kind, &failure.message);
             }
             *state.last_error.write().await = Some(failure.message.clone());
             Some(AttemptResult::Failed {
@@ -429,6 +502,7 @@ async fn send_llm_chat(
 // ---------------------------------------------------------------------------
 
 /// 一次请求的收尾（流式与非流式共用）。
+#[allow(clippy::too_many_arguments)]
 async fn settle(
     state: &TraeGatewayState,
     account: &PickedTraeAccount,
@@ -437,6 +511,7 @@ async fn settle(
     started: Instant,
     error: Option<(i64, String)>,
     usage: TokenUsage,
+    variant: TraeVariant,
 ) {
     let latency_ms = started.elapsed().as_millis() as i64;
 
@@ -453,10 +528,22 @@ async fn settle(
         let kind = classify_solo(*code, detail);
         if kind != TraeErrKind::None {
             let reason = message.clone().unwrap_or_default();
-            state.pool.lock().await.apply_error(&account.uid, kind, &reason);
+            state
+                .pools
+                .lock()
+                .await
+                .entry(variant)
+                .or_insert_with(|| TraePool::for_variant(variant))
+                .apply_error(&account.uid, kind, &reason);
         }
     } else {
-        state.pool.lock().await.note_success(&account.uid);
+        state
+            .pools
+            .lock()
+            .await
+            .entry(variant)
+            .or_insert_with(|| TraePool::for_variant(variant))
+            .note_success(&account.uid);
     }
 
     // 状态码恒为 200：SSE 已经以 200 开头发出，错误只能体现在事件里。
@@ -471,6 +558,7 @@ async fn settle(
             usage.prompt,
             usage.completion,
             message,
+            variant,
         )
         .await;
 }
@@ -481,6 +569,7 @@ async fn record_stream_error(
     account: &PickedTraeAccount,
     code: i64,
     detail: &str,
+    variant: TraeVariant,
 ) -> UpstreamFailure {
     let kind = classify_solo(code, detail);
     let message = format!(
@@ -490,9 +579,11 @@ async fn record_stream_error(
     );
     if kind != TraeErrKind::None {
         state
-            .pool
+            .pools
             .lock()
             .await
+            .entry(variant)
+            .or_insert_with(|| TraePool::for_variant(variant))
             .apply_error(&account.uid, kind, &message);
     }
     *state.last_error.write().await = Some(message.clone());
@@ -510,6 +601,7 @@ async fn settle_failure(
     stream: bool,
     started: Instant,
     failure: &UpstreamFailure,
+    variant: TraeVariant,
 ) {
     state
         .record_request(
@@ -522,31 +614,77 @@ async fn settle_failure(
             0,
             0,
             Some(failure.message.clone()),
+            variant,
         )
         .await;
 }
 
-/// 池里挑不出账号时的失败：带上**逐账号原因**。
+/// 池里挑不出账号时的失败：带上**逐账号原因**，且**文案必须点名用户当前所在的区域**。
 ///
 /// 只回一句「没有可用账号」等于把排查成本转嫁给用户；把 `diagnose()` 的结果拼进去，
 /// 用户能立刻看出是「全部冷却中」还是「积分都过期了」。
-fn no_account_failure_sync(state: &TraeGatewayState) -> UpstreamFailure {
+///
+/// 按区域取名的原因：Key 的**归属就是区域**（账号库、冷却、积分都按区域分家），
+/// 账号管理页的切换器也是「国内版 / 国际版」两个 Tab。文案若按程序位取名
+/// （`Trae Work` / `Trae`），用户会被指到界面上**根本不存在**的入口去加账号。
+fn no_account_failure_sync(state: &TraeGatewayState, variant: TraeVariant) -> UpstreamFailure {
     // 这里不能 await（调用点在 `unwrap_or_else` 里），用阻塞锁读一次内存视图即可：
     // 池状态在 `attempt_once` 里刚同步过，读到的不会比磁盘旧。
-    let diagnose = match state.pool.try_lock() {
-        Ok(pool) => pool.diagnose(now_secs()),
+    let diagnose = match state.pools.try_lock() {
+        Ok(pools) => pools
+            .get(&variant)
+            .map(|pool| pool.diagnose(now_secs()))
+            .unwrap_or_default(),
         Err(_) => Vec::new(),
     };
-    let message = if diagnose.is_empty() {
-        "账号库为空或全部不可用：请先在「账号管理」中添加 Trae 账号，或在「一键签到」页查看冷却原因"
-            .to_string()
+    // 选中的池为空时，顺手看一眼**另一个区域**是否有账号：若另一个有而这个没有，
+    // 用户多半是「账号加在了另一个区域、Key 却归属这个区域」——直接点出该怎么改。
+    //
+    // ⚠️ 必须遍历 [`TraeRegion::all`]，**不能**用 `TraeVariant::all()`：后者只有两条
+    // **国内**程序位，于是「国内 Key + 国内库为空 + 国际版库有账号」这一情形
+    // 永远得不到提示 —— 真正可能有账号的那条线根本不在候选里。提示要双向覆盖，
+    // 否则国际版接入后，只在「国际版 Key 配国内账号」这一个方向上给指引。
+    let other_region_with_accounts = if diagnose.is_empty() {
+        TraeRegion::all()
+            .into_iter()
+            .filter(|candidate| *candidate != variant.region())
+            .find(|candidate| !account::entries_for_region(*candidate).is_empty())
     } else {
-        format!("没有可用账号：{}", diagnose.join("、"))
+        None
     };
     UpstreamFailure {
         status: 503,
         code: "no_healthy_account".to_string(),
-        message,
+        message: no_account_message(variant, &diagnose, other_region_with_accounts),
+    }
+}
+
+/// 空池文案的唯一构造点（纯函数，便于单测钉住「区域名必须出现」）。
+///
+/// `other_region_with_accounts` 为「另一个区域有账号」时的提示对象；`None` 表示不提。
+///
+/// 取名一律走 [`TraeVariant::region`] + [`TraeRegion::display_name`]：
+/// `TraeWork` 与 `Trae` **同属国内区域**，因此两者产出的文案**逐字相同**。
+fn no_account_message(
+    variant: TraeVariant,
+    diagnose: &[String],
+    other_region_with_accounts: Option<TraeRegion>,
+) -> String {
+    let name = variant.region().display_name();
+    let base = if diagnose.is_empty() {
+        format!(
+            "「{name}」没有可用账号：请先在「账号管理」切到 {name} 添加账号，\
+             或在「一键签到」页查看冷却原因"
+        )
+    } else {
+        format!("「{name}」没有可用账号：{}", diagnose.join("、"))
+    };
+    match other_region_with_accounts {
+        Some(other) => {
+            let other_name = other.display_name();
+            format!("{base}（检测到 {other_name} 有账号：请改用归属 {other_name} 的 API Key）")
+        }
+        None => base,
     }
 }
 
@@ -609,17 +747,12 @@ fn preview(text: &str, max: usize) -> String {
 ///
 /// 用户该看到「连接超时」而不是 `error sending request for url (...)`，
 /// 但原始错误也不能丢——排查时它是唯一线索。
+///
+/// 实现在 core 的 `modules::net`，**本 crate 不再自己维护一份**：
+/// 两个 crate 各写一遍必然出现「同一个故障两种说法」，而且 core 那份还会
+/// 额外展开 `source` 链（DNS / TCP / TLS / 超时的具体原因），排查时才够用。
 fn describe_transport_error(error: &reqwest::Error) -> String {
-    let kind = if error.is_timeout() {
-        "连接超时"
-    } else if error.is_connect() {
-        "无法连接（DNS 解析失败 / 网络不可达 / TLS 握手失败）"
-    } else if error.is_body() || error.is_decode() {
-        "响应体读取失败"
-    } else {
-        "请求失败"
-    };
-    format!("{kind}：{error}")
+    buddy_switch_core::modules::net::describe_transport_error(error)
 }
 
 #[cfg(test)]
@@ -669,10 +802,63 @@ mod tests {
     }
 
     #[test]
-    fn no_account_failure_message_is_actionable() {
-        // 这条文案是用户唯一能看到的排障线索，必须包含「下一步做什么」。
-        let text = "账号库为空或全部不可用：请先在「账号管理」中添加 Trae 账号，或在「一键签到」页查看冷却原因";
-        assert!(text.contains("账号管理"));
-        assert!(text.contains("一键签到"));
+    fn no_account_failure_message_is_actionable_and_region_aware() {
+        // 这条文案是用户唯一能看到的排障线索：必须包含「下一步做什么」且**点名区域**。
+        let cn = no_account_message(TraeVariant::TraeWork, &[], None);
+        assert!(cn.contains("账号管理"), "{cn}");
+        assert!(cn.contains("一键签到"), "{cn}");
+        assert!(cn.contains("国内版"), "文案必须点名选中的区域: {cn}");
+
+        // ⚠️ 契约在 2026-09-21 变了：网关的号池按**区域**分区（`pool.rs::sync_for`
+        // 走 `entries_for_region`），Key 的归属也是区域，因此文案按区域取名。
+        // `TraeWork` 与 `Trae` 是**程序位**、同属国内区域 ⇒ 两段文案必须**逐字相同**。
+        // 若哪天又按程序位取名（用户会在账号管理页找不到那个入口），这条 `assert_eq!` 会红。
+        let trae = no_account_message(TraeVariant::Trae, &[], None);
+        assert_eq!(cn, trae, "国内两个程序位共用一本账号库，文案不得按程序位分叉");
+
+        // 国际版必须是另一个名字（否则用户分不清该去哪一版加账号）。
+        let global = no_account_message(TraeVariant::Global, &[], None);
+        assert!(global.contains("国际版"), "{global}");
+        assert_ne!(cn, global, "两个区域的文案必须可区分: {cn} / {global}");
+
+        // 有逐账号原因时，原因必须出现在文案里。
+        let with_reason = no_account_message(
+            TraeVariant::Trae,
+            &["主号(7481920:冷却中,积分=0)".to_string()],
+            None,
+        );
+        assert!(with_reason.contains("国内版"), "{with_reason}");
+        assert!(with_reason.contains("冷却中"), "{with_reason}");
+
+        // 「另一个区域有账号」的提示必须**双向**都给。
+        // 方向①：国际版 Key + 只有国内账号（R8①的原始场景）。
+        let hinted_global = no_account_message(TraeVariant::Global, &[], Some(TraeRegion::Cn));
+        assert!(
+            hinted_global.contains("国际版"),
+            "选中的区域必须出现: {hinted_global}"
+        );
+        assert!(
+            hinted_global.contains("国内版"),
+            "另一个有账号的区域必须出现（否则用户不知道该往哪加 Key）: {hinted_global}"
+        );
+        // 方向②：国内版 Key + 只有国际版账号。**这条在修复前做不到** ——
+        // 旧实现遍历的是 `TraeVariant::all()`（两条国内程序位），候选里根本没有国际版。
+        let hinted_cn = no_account_message(TraeVariant::TraeWork, &[], Some(TraeRegion::Global));
+        assert!(hinted_cn.contains("国内版"), "{hinted_cn}");
+        assert!(
+            hinted_cn.contains("国际版"),
+            "另一个有账号的区域必须出现: {hinted_cn}"
+        );
+    }
+
+    #[test]
+    fn status_query_variant_parsing_falls_back_to_default() {
+        assert_eq!(parse_variant_query(Some("variant=trae_cn")), TraeVariant::Trae);
+        assert_eq!(parse_variant_query(Some("variant=trae_work")), TraeVariant::TraeWork);
+        // 缺失 / 未知 → 默认（TraeWork），老客户端行为不变。
+        assert_eq!(parse_variant_query(None), TraeVariant::default());
+        assert_eq!(parse_variant_query(Some("")), TraeVariant::default());
+        assert_eq!(parse_variant_query(Some("variant=unknown")), TraeVariant::default());
+        assert_eq!(parse_variant_query(Some("days=7")), TraeVariant::default());
     }
 }

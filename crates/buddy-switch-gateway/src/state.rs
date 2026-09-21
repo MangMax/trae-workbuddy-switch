@@ -37,7 +37,14 @@ pub struct GatewayConfig {
     /// 是否允许非回环监听（默认 false）。
     #[serde(alias = "allowNonLoopback")]
     pub allow_non_loopback: bool,
-    /// 双端口模式（P1，默认 false，本版仅保留配置位）。
+    /// 双端口模式（P1，**未实现**，默认 false）。
+    ///
+    /// ⚠️ 本字段只有配置位、**没有任何读取方**：设置页曾据此渲染一个开关，但打开与否
+    /// 对监听行为毫无影响（典型的假控件），故 UI 已移除。之所以保留字段本身，是因为
+    /// `/api/gateway/config` 的返回键集合被契约测试钉死（见 `buddy-switch-server`
+    /// 的 `gateway_read_only_routes_expose_pinned_contracts`），且老配置文件里可能已存在该键。
+    /// 真要实现「按 region 分别监听独立端口」时，需一并补：第二端口的配置位、
+    /// 监听生命周期与按 region 的路由分发。
     #[serde(alias = "dualPort")]
     pub dual_port: bool,
     /// 请求日志保留条数，默认 200。

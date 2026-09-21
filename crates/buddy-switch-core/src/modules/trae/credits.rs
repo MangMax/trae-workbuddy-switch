@@ -248,7 +248,7 @@ pub async fn post_json_for(
             let text = response.text().await.unwrap_or_default();
             (status, text)
         }
-        Err(error) => (0, format!("{error}")),
+        Err(error) => (0, crate::modules::net::describe_transport_error(&error)),
     }
 }
 
@@ -319,6 +319,95 @@ pub struct CreditsDailyFile {
     pub snapshots: Vec<CreditsDailySnapshot>,
 }
 
+/// 单个积分包（资源包）的明细。
+///
+/// 源：`user_entitlement_pack_list` 里**逐包**解析而来（改造前只算聚合总额与最早到期，
+/// 把逐包明细丢弃了）。落进 `remaining_credits.json` 的 `packages` 字段，
+/// 经 `credits_overview_for` 透出，供账号卡渲染「积分包进度条」。
+///
+/// 线上/磁盘形状为 camelCase（`packageCode` / `packageName` / `expireAt` /
+/// `expiringSoon`），前端类型 `TraeCreditPackage` 逐字对齐。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreditPackage {
+    /// 包编码（上游字段缺失时为 `None`）。
+    pub package_code: Option<String>,
+    /// 包名（上游字段缺失时为 `None`）。
+    pub package_name: Option<String>,
+    /// 包总额度（`credits_limit`）。
+    pub total: f64,
+    /// 剩余额度（`credits_limit - usage.credits_amount`，下限 0）。
+    pub remaining: f64,
+    /// 已用额度（`usage.credits_amount`，无 usage 视为 0）。
+    pub used: f64,
+    /// 到期时间（Unix 秒；无则 `None`）。
+    pub expire_at: Option<i64>,
+    /// 是否已过期（`expire_at` 存在且 `< now`）。
+    pub expired: bool,
+    /// 是否 7 天内到期（未过期且 `expire_at - now <= 7 天`）。
+    pub expiring_soon: bool,
+}
+
+/// 「7 天内到期」的判定窗口（秒）。
+const EXPIRING_SOON_SECS: i64 = 7 * 24 * 3600;
+
+/// 由一组 `user_entitlement_pack_list` 元素解析逐包明细（纯函数，便于单测）。
+///
+/// 只统计 `entitlement_base_info.quota.credits_limit` 存在的包（与聚合口径一致）：
+/// 无额度上限的包不参与剩余量统计（可能是无限制资源）。
+pub fn parse_credit_packages(packs: &[Value], now_ts: i64) -> Vec<CreditPackage> {
+    let mut packages = Vec::new();
+    for pack in packs {
+        let base = pack.get("entitlement_base_info");
+        let limit = base
+            .and_then(|info| info.get("quota"))
+            .and_then(|quota| quota.get("credits_limit"))
+            .and_then(Value::as_f64);
+        let Some(limit) = limit else {
+            continue;
+        };
+        let used = pack
+            .get("usage")
+            .and_then(|usage| usage.get("credits_amount"))
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let remaining = (limit - used).max(0.0);
+        let expire_at = pack.get("expire_time").and_then(Value::as_i64);
+        let expired = expire_at.map(|expire| expire > 0 && expire < now_ts).unwrap_or(false);
+        let expiring_soon = !expired
+            && expire_at
+                .map(|expire| expire - now_ts <= EXPIRING_SOON_SECS)
+                .unwrap_or(false);
+        let package_name = base
+            .and_then(|info| {
+                info.get("package_name")
+                    .or_else(|| info.get("name"))
+                    .and_then(Value::as_str)
+            })
+            .map(str::to_string)
+            .filter(|text| !text.trim().is_empty());
+        let package_code = base
+            .and_then(|info| {
+                info.get("package_code")
+                    .or_else(|| info.get("package_type"))
+                    .and_then(Value::as_str)
+            })
+            .map(str::to_string)
+            .filter(|text| !text.trim().is_empty());
+        packages.push(CreditPackage {
+            package_code,
+            package_name,
+            total: crate::modules::trae::credits::round2(limit),
+            remaining: crate::modules::trae::credits::round2(remaining),
+            used: crate::modules::trae::credits::round2(used),
+            expire_at,
+            expired,
+            expiring_soon,
+        });
+    }
+    packages
+}
+
 /// 剩余积分与到期时间缓存。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RemainingCreditsFile {
@@ -326,6 +415,12 @@ pub struct RemainingCreditsFile {
     pub credits: HashMap<String, f64>,
     #[serde(default)]
     pub expire_times: HashMap<String, i64>,
+    /// 逐账号的积分包明细（`uid -> [CreditPackage…]`）。
+    ///
+    /// `#[serde(default)]`：旧 `remaining_credits.json`（无此字段）读出为空 map，
+    /// **不 panic**——这是升级零回归的必要条件（R4）。
+    #[serde(default)]
+    pub packages: HashMap<String, Vec<CreditPackage>>,
     #[serde(default)]
     pub updated_at: Option<String>,
 }
@@ -561,15 +656,18 @@ fn round2(value: f64) -> f64 {
 
 /// 查询某账号的剩余积分。
 ///
-/// 返回 `(剩余积分, 最早过期时间戳, 今日购买获得积分)`。
+/// 返回 `(剩余积分, 最早过期时间戳, 今日购买获得积分, 逐包明细)`。
 ///
 /// 计算规则（与参考实现一致）：
 /// - 只统计 `entitlement_base_info.quota.credits_limit` 存在的资源包；
 /// - 每包剩余 = `credits_limit - usage.credits_amount`（无 usage 视为已用 0），**下限为 0**；
 /// - 「最早过期」只在 `expire_time > now` 的包里取（已过期的包不影响紧迫度排序）；
 /// - 「今日购买获得」只计 `start_time` 落在**北京时区**今日、且 `charge_amount > 0` 的包
-///   ——签到获得的包 `charge_amount = 0`，因此天然不会被误计为购买。
-pub async fn calc_remaining_credits(jwt_value: &str) -> Result<(f64, Option<i64>, f64), String> {
+///   ——签到获得的包 `charge_amount = 0`，因此天然不会被误计为购买；
+/// - 逐包明细（第 4 个返回值）由 [`parse_credit_packages`] 统一解析，供账号卡进度条。
+pub async fn calc_remaining_credits(
+    jwt_value: &str,
+) -> Result<(f64, Option<i64>, f64, Vec<CreditPackage>), String> {
     let device = device_for_jwt(jwt_value)?;
     let (_status, body) = post_json_parsed(TRAE_ENTITLEMENT_PATH, jwt_value, &device).await?;
 
@@ -644,6 +742,7 @@ pub async fn calc_remaining_credits(jwt_value: &str) -> Result<(f64, Option<i64>
         round2(total),
         earliest_expire,
         round2(purchased_today),
+        parse_credit_packages(packs, now_ts),
     ))
 }
 
@@ -672,12 +771,13 @@ pub async fn refresh_remaining_for_variant(
 ) -> Result<f64, String> {
     let account =
         crate::modules::trae::account::find_for(variant, user_id).ok_or("账号不存在")?;
-    let (credits, expire_at, _purchased) = calc_remaining_credits(&account.jwt).await?;
+    let (credits, expire_at, _purchased, packages) = calc_remaining_credits(&account.jwt).await?;
     let mut remaining = load_remaining_for(variant);
     remaining.credits.insert(user_id.to_string(), credits);
     if let Some(expire_at) = expire_at {
         remaining.expire_times.insert(user_id.to_string(), expire_at);
     }
+    remaining.packages.insert(user_id.to_string(), packages);
     remaining.updated_at = Some(store::now_iso());
     save_remaining_for(variant, &remaining)?;
     Ok(credits)
@@ -703,11 +803,12 @@ pub async fn refresh_all_remaining_for(variant: TraeVariant) -> usize {
 
     for (uid, account) in &accounts {
         match calc_remaining_credits(&account.jwt).await {
-            Ok((credits, expire_at, purchased)) => {
+            Ok((credits, expire_at, purchased, packages)) => {
                 remaining.credits.insert(uid.clone(), credits);
                 if let Some(expire_at) = expire_at {
                     remaining.expire_times.insert(uid.clone(), expire_at);
                 }
+                remaining.packages.insert(uid.clone(), packages);
                 purchased_today += purchased;
                 succeeded += 1;
 
@@ -896,6 +997,89 @@ mod tests {
             created: None,
             gen: 2,
         }
+    }
+
+    /// 签到/积分请求失败时**必须**走全仓统一的传输层文案出口
+    /// （`net::describe_transport_error`），否则又会退化成只剩一行
+    /// 「error sending request for url (…)」、看不出原因的提示。
+    /// 该出口的行为由 `modules/net.rs` 的单测钉住，这里不再重复。
+    #[test]
+    fn parse_credit_packages_extracts_per_package_details() {
+        let now = 1_000_000_i64;
+        let packs = vec![
+            serde_json::json!({
+                "entitlement_base_info": {
+                    "package_name": "月卡",
+                    "package_code": "month",
+                    "quota": { "credits_limit": 100.0 }
+                },
+                "usage": { "credits_amount": 30.0 },
+                "expire_time": now + 3 * 24 * 3600,
+            }),
+            serde_json::json!({
+                "entitlement_base_info": {
+                    "name": "年卡",
+                    "quota": { "credits_limit": 500.0 }
+                },
+                "usage": { "credits_amount": 600.0 },
+                "expire_time": now - 10,
+            }),
+            // 无额度上限的包：不参与剩余量统计，也不应出现在明细里。
+            serde_json::json!({ "entitlement_base_info": { "quota": {} } }),
+        ];
+        let packages = parse_credit_packages(&packs, now);
+        assert_eq!(packages.len(), 2, "无额度上限的包应被跳过");
+
+        assert_eq!(packages[0].package_name.as_deref(), Some("月卡"));
+        assert_eq!(packages[0].package_code.as_deref(), Some("month"));
+        assert_eq!(packages[0].total, 100.0);
+        assert_eq!(packages[0].remaining, 70.0);
+        assert_eq!(packages[0].used, 30.0);
+        assert!(packages[0].expiring_soon, "3 天内到期应为 expiringSoon");
+        assert!(!packages[0].expired);
+
+        // 已用超过额度 → remaining 下限 0；已过期 → expired 且不再 expiringSoon。
+        assert_eq!(packages[1].remaining, 0.0);
+        assert!(packages[1].expired);
+        assert!(!packages[1].expiring_soon);
+    }
+
+    #[test]
+    fn old_remaining_file_without_packages_deserializes() {
+        // R4：旧 remaining_credits.json（无 packages 键）必须能读，且 packages 回落为空。
+        let old = r#"{"credits":{"u1":12.5},"expire_times":{"u1":1700000000},"updated_at":"2026-01-01T00:00:00Z"}"#;
+        let parsed: RemainingCreditsFile =
+            serde_json::from_str(old).expect("旧结构必须可反序列化（R4：升级不得 panic）");
+        assert_eq!(parsed.credits.get("u1"), Some(&12.5));
+        assert!(parsed.packages.is_empty(), "缺失的 packages 应回落为空 map");
+    }
+
+    #[test]
+    fn credit_package_serializes_camel_case() {
+        let package = CreditPackage {
+            package_code: Some("month".into()),
+            package_name: Some("月卡".into()),
+            total: 100.0,
+            remaining: 70.0,
+            used: 30.0,
+            expire_at: Some(1),
+            expired: false,
+            expiring_soon: true,
+        };
+        let value = serde_json::to_value(&package).expect("序列化");
+        for key in [
+            "packageCode",
+            "packageName",
+            "total",
+            "remaining",
+            "used",
+            "expireAt",
+            "expired",
+            "expiringSoon",
+        ] {
+            assert!(value.get(key).is_some(), "缺少 camelCase 键 {key}");
+        }
+        assert!(value.get("expire_at").is_none(), "不得出现 snake_case 键");
     }
 
     #[test]

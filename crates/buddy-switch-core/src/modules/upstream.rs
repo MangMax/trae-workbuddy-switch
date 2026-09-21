@@ -16,6 +16,7 @@ use tokio::sync::watch;
 use crate::modules::account;
 use crate::modules::catalog::CatalogModel;
 use crate::modules::identity;
+use crate::modules::net;
 use crate::modules::region::{region_spec, CatalogUa, Region};
 
 /// 共享 CLI 形态 UA（刷新 / CN 目录使用）。
@@ -413,7 +414,9 @@ impl UpstreamClient {
             Err(error) => UpstreamChatResult::Err {
                 status: 0,
                 kind: UpstreamErrorKind::Server,
-                message: format!("transport error: {error}"),
+                // 走统一出口：只有顶层一行「error sending request for url (…)」
+                // 是没法排障的，网关日志需要看到具体原因（超时/拒绝/TLS）。
+                message: format!("transport error: {}", net::describe_transport_error(&error)),
             },
         }
     }
@@ -448,7 +451,7 @@ impl UpstreamClient {
             .json(&json!({}))
             .send()
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| net::describe_transport_error(&error))?;
         let status = response.status().as_u16();
         let text = response.text().await.unwrap_or_default();
         let document = parse_envelope(&text)
@@ -538,7 +541,7 @@ impl UpstreamClient {
             .map_err(|error| UpstreamFailure {
                 status: 0,
                 kind: UpstreamErrorKind::Server,
-                message: error.to_string(),
+                message: net::describe_transport_error(&error),
             })?;
         let status = response.status().as_u16();
         let text = response.text().await.unwrap_or_default();
@@ -634,7 +637,7 @@ impl UpstreamClient {
             .map_err(|error| UpstreamFailure {
                 status: 0,
                 kind: UpstreamErrorKind::Server,
-                message: error.to_string(),
+                message: net::describe_transport_error(&error),
             })?;
         let status = response.status().as_u16();
         let text = response.text().await.unwrap_or_default();

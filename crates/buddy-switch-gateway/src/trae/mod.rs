@@ -20,14 +20,18 @@
 //!
 //! 账号、设备标识、冷却、剩余积分**全部复用** `buddy_switch_core::modules::trae`：
 //! 网关不另建账号库，也不另建冷却文件——否则「签到页显示正常、网关页显示冷却中」
-//! 这类不一致会立刻出现。网关的错误会经 [`buddy_switch_core::modules::trae::credits::save_cooldown`]
-//! 写回同一个冷却文件，两个页面看到的是同一份状态。
+//! 这类不一致会立刻出现。网关的错误会经
+//! [`buddy_switch_core::modules::trae::credits::save_cooldown_for`] 写回**该产品线自己的**
+//! 冷却文件（`account_cooldowns.json` / `account_cooldowns.trae_cn.json`），
+//! 与签到页的变体分家口径一致：两个页面看到的是同一份状态。
 
+pub mod apikey;
 pub mod payload;
 pub mod pool;
 pub mod routes;
 pub mod sse;
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -39,7 +43,8 @@ use tokio::net::TcpListener;
 use tokio::sync::{oneshot, Mutex, RwLock};
 
 use buddy_switch_core::modules::config as core_config;
-use buddy_switch_core::modules::trae::{paths, settings as trae_settings, TRAE_DEFAULT_API_PORT};
+use buddy_switch_core::modules::trae::variant::TraeVariant;
+use buddy_switch_core::modules::trae::{paths, TRAE_DEFAULT_API_PORT};
 
 use crate::logging::RequestLog;
 use crate::GatewayHandle;
@@ -57,7 +62,7 @@ use pool::{TraePool, TraePoolSummary};
 ///
 /// 取值与 [`buddy_switch_core::modules::trae::variant`] 的 CN 端点表逐字一致
 /// （实测两条 CN 产品线都是这个主机）；该表另登记了国际化的
-/// `https://grow-normal.trae.ai`，**但从未对真实上游跑通过**。
+/// `https://core-normal.trae.ai`，**但从未对真实上游跑通过**。
 /// 想按变体/地区切换出站时，请改 [`TraeGatewayConfig::upstream`] 的取值来源，
 /// 不要在调用点写分支 —— 该字段本来就是为"可重定向出站"设计的（e2e 测试也靠它）。
 pub const TRAE_AGENT_HOST: &str = "https://trae-api-cn.mchost.guru";
@@ -190,12 +195,18 @@ pub fn body_limit_bytes(max_body_mb: usize) -> usize {
 pub struct TraeGatewayState {
     /// 运行配置。
     pub config: Arc<RwLock<TraeGatewayConfig>>,
-    /// 账号池（选号 / 冷却 / 计数）。
-    pub pool: Arc<Mutex<TraePool>>,
+    /// **按产品线分家的账号池**：Key 的归属（`variant`）决定用哪个池。
+    ///
+    /// 用 `HashMap<TraeVariant, TraePool>` 而非「一个池 + 每条目带 variant」：
+    /// - 两条产品线的账号库、冷却文件、积分缓存**本就分家**（`*_for(variant)`），
+    ///   分成两个池可以各自 `sync_for`，不必在选号里再过滤；
+    /// - 避免「同一 uid 在两条线是两个不同账号」被错误合并
+    ///   （`core::modules::trae::account` 的 `find_for` 注释）。
+    pub pools: Arc<Mutex<HashMap<TraeVariant, TraePool>>>,
     /// 请求日志（与 WorkBuddy 网关同一个 [`RequestLog`]，只是换了落盘路径）。
     pub log: Arc<RequestLog>,
-    /// 当前生效的 API Key（明文；来自 Trae 设置，缺失时自动生成并写回设置）。
-    pub api_key: Arc<RwLock<String>>,
+    /// 多 API Key 存储（哈希 + 前缀 + **归属产品线**；含旧 `settings.apiKey` 兼容读）。
+    pub key_store: Arc<apikey::TraeApiKeyStore>,
     /// 进程启动时刻（毫秒）。
     pub started_at: i64,
     /// 累计请求数。
@@ -216,6 +227,11 @@ pub struct TraeGatewayState {
 
 impl TraeGatewayState {
     /// 依据配置构造一份完整运行状态。
+    ///
+    /// **不在此处自动生成 Key**：多 Key 化后 Key 只存哈希，自动生成的明文无处可取，
+    /// 会造出一把「存在但无人知道明文」的幽灵 Key。改为由用户在「API 服务」页显式创建
+    /// （[`apikey::create_response`]），或由 [`ensure_api_key`] 在需要时兜底生成。
+    /// 老用户则经 [`apikey::TraeApiKeyStore::load`] 的 legacy 回落继续可用。
     pub fn new(config: TraeGatewayConfig) -> Self {
         let log = Arc::new(RequestLog::new(
             paths::api_gateway_log_file(),
@@ -224,9 +240,11 @@ impl TraeGatewayState {
         ));
         Self {
             config: Arc::new(RwLock::new(config.clone())),
-            pool: Arc::new(Mutex::new(TraePool::new())),
+            pools: Arc::new(Mutex::new(HashMap::new())),
             log,
-            api_key: Arc::new(RwLock::new(ensure_api_key())),
+            key_store: Arc::new(apikey::TraeApiKeyStore::new(
+                paths::api_gateway_keys_file(),
+            )),
             started_at: core_config::now_ms(),
             total_requests: Arc::new(AtomicU64::new(0)),
             last_error: Arc::new(RwLock::new(None)),
@@ -241,17 +259,12 @@ impl TraeGatewayState {
         self.config.read().await.clone()
     }
 
-    /// 当前 API Key。
-    pub async fn api_key(&self) -> String {
-        self.api_key.read().await.clone()
-    }
-
     /// 记一次请求（计数 + 日志 + 最近错误）。
     ///
     /// 日志条目字段名与 WorkBuddy 网关的 [`RequestMeta::to_value`] 对齐
     /// （`ts` / `endpoint` / `method` / `account` / `model` / `status` / `latencyMs` /
-    /// `promptTokens` / `completionTokens` / `stream`），只是多了 `error`。
-    /// 这样「Token 统计」页可以用同一套归一化逻辑聚合两侧日志。
+    /// `promptTokens` / `completionTokens` / `stream`），只是多了 `error` 与 `variant`。
+    /// 这样「Token 统计」页可以用同一套归一化逻辑聚合两侧日志，且能按变体过滤。
     ///
     /// [`RequestMeta::to_value`]: crate::logging::RequestMeta::to_value
     #[allow(clippy::too_many_arguments)]
@@ -266,6 +279,7 @@ impl TraeGatewayState {
         prompt_tokens: u64,
         completion_tokens: u64,
         error: Option<String>,
+        variant: TraeVariant,
     ) {
         self.total_requests.fetch_add(1, Ordering::Relaxed);
         self.log.record(serde_json::json!({
@@ -280,6 +294,9 @@ impl TraeGatewayState {
             "completionTokens": completion_tokens,
             "stream": stream,
             "error": error,
+            // 归属产品线：Token 统计页据此出「变体范围条」（筛选维度）。
+            // 用 as_str() 的下划线形态，与 Key/查询参数口径一致（勿用派生 serde）。
+            "variant": variant.as_str(),
         }));
         if let Some(message) = error {
             *self.last_error.write().await = Some(message);
@@ -303,31 +320,31 @@ fn build_http_client() -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
-/// 取（必要时生成）API Key，并写回 Trae 设置。
+/// 确保 Key 库里**至少有一把可用 Key**（load + legacy 优先，都没有才新建）。
 ///
-/// Key 存在 `TraeSettings::api_key` 而非独立的 Key 库：Trae 侧只需要「一把钥匙」，
-/// 多 Key 与吊销是 WorkBuddy 网关的诉求（一个 Key 绑一个 region）。
-pub fn ensure_api_key() -> String {
-    let current = trae_settings::load();
-    if !current.api_key.trim().is_empty() {
-        return current.api_key;
+/// 语义（T01）：返回**新建时**的明文（`Some`）；若已存在至少一把未吊销的 Key，
+/// 则不新建、返回 `None` —— 明文不落库、不可复原，因此已有 Key 的明文无从返回。
+///
+/// 升级用户：`key_store.load()` 会回落 `settings.apiKey`，故这里不会给他们凭空造 Key，
+/// 走的是「已存在 → 返回 None」分支，行为与升级前一致。
+///
+/// 新装用户：键库与 `settings.apiKey` 皆空 → 这里生成一把 `sk-trae-<32hex>` 并落库，
+/// 明文由调用方（首启流程 / 管理命令）一次性呈现，之后不再可取。
+pub fn ensure_api_key(store: &apikey::TraeApiKeyStore) -> Option<String> {
+    if store.list().iter().any(|record| !record.is_revoked()) {
+        return None;
     }
-    let generated = generate_api_key();
-    let _ = trae_settings::patch(serde_json::json!({ "apiKey": generated }));
-    generated
+    let (_record, plaintext) = store.create("默认 Key".to_string(), TraeVariant::default());
+    Some(plaintext)
 }
 
-/// 生成新 Key：`sk-trae-` + 32 位 hex。
+/// 生成新 Key 明文：`sk-trae-` + 32 位 hex。
+///
+/// 仅用于测试 / 诊断的形态校验；正常发号走 [`apikey::TraeApiKeyStore::create`]
+/// （它同时算出前缀与哈希并落库）。
 pub fn generate_api_key() -> String {
     let secret = uuid::Uuid::new_v4().simple().to_string();
     format!("sk-trae-{secret}")
-}
-
-/// 重新生成 Key 并写回设置，返回新明文。
-pub fn regenerate_api_key() -> Result<String, String> {
-    let generated = generate_api_key();
-    trae_settings::patch(serde_json::json!({ "apiKey": generated.clone() }))?;
-    Ok(generated)
 }
 
 // ---------------------------------------------------------------------------
@@ -404,12 +421,17 @@ pub fn now_secs() -> i64 {
 /// 组装管理面状态视图（Tauri 命令与 webui 路由**共用**）。
 ///
 /// `running` / `addr` / `version` 由宿主提供——只有宿主知道监听是否真的起来了、
-/// 应用版本是多少。池摘要与账号明细在这里现算，因此两个宿主看到的永远是同一份。
+/// 应用版本是多少。池摘要与账号明细针对**指定变体**的池现算，因此两个宿主看到的永远是同一份。
+///
+/// **响应键集合不变**（`trae/mod.rs` 的 `status_view_keys_are_pinned` 护栏仍通过）：
+/// `variant` 只是入参，不进入响应体——池摘要本身已隐含「这是哪条产品线」，
+/// 多一个键反而要与前端重新对齐形状。
 pub async fn status_view(
     state: &TraeGatewayState,
     running: bool,
     addr: Option<String>,
     version: &str,
+    variant: TraeVariant,
 ) -> serde_json::Value {
     let now = now_secs();
     let config = state.config_snapshot().await;
@@ -419,11 +441,20 @@ pub async fn status_view(
     view.version = version.to_string();
     view.total_requests = state.total_requests.load(Ordering::Relaxed);
     view.last_error = state.last_error.read().await.clone();
-    view.api_key_prefix = mask_api_key(&state.api_key().await);
+    // 最近一把未吊销 Key 的前缀（缺省空串；明文不可复原，故只给前缀）。
+    view.api_key_prefix = state
+        .key_store
+        .list()
+        .into_iter()
+        .filter(|record| !record.is_revoked())
+        .max_by_key(|record| record.created_at)
+        .map(|record| record.prefix)
+        .unwrap_or_default();
 
     let (summary, accounts, diagnose) = {
-        let mut pool = state.pool.lock().await;
-        pool.sync();
+        let mut pools = state.pools.lock().await;
+        let pool = pools.entry(variant).or_insert_with(|| TraePool::for_variant(variant));
+        pool.sync_for(variant);
         (
             pool.summary(now),
             pool.status_list(now),

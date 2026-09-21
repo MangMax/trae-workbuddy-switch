@@ -199,6 +199,43 @@ pub fn entries_for(variant: TraeVariant) -> Vec<(String, RawAccount)> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// 区域轴读取（新代码请优先用这一族）
+// ---------------------------------------------------------------------------
+//
+// `*_for(variant)` 那一族仍然可用，但它们内部都按 `variant.region()` 落到**同一本区域库**
+// （国内两条产品线共用一本，见 `paths::scoped_file` 的说明）。想明确表达「按区域」时
+// 用下面这族，避免读者误以为参数还分家。
+
+/// 读取某**区域**的账号库。
+pub fn load_accounts_for_region(region: super::region::TraeRegion) -> AccountsFile {
+    store::read_json(&paths::accounts_file_for_region(region))
+}
+
+/// 写入某**区域**的账号库。
+///
+/// ⚠️ 必须**整体回存** `AccountsFile`，不得字面重建容器 —— 否则 `device_bindings`
+/// 会被清空（见该字段的三条不变式）。
+pub fn save_accounts_for_region(
+    region: super::region::TraeRegion,
+    accounts: &AccountsFile,
+) -> Result<(), String> {
+    store::write_json(&paths::accounts_file_for_region(region), accounts)
+}
+
+/// 读取某区域的账号并附带解析后的 uid（过滤掉无法确定 uid 的脏记录）。
+///
+/// gateway 的账号池按**区域**取号：国内两套产品线共用一本库，池也必须按区域建，
+/// 否则会出现「两个池服务同一批账号」（选号、冷却、日志归属全部对不上）。
+pub fn entries_for_region(region: super::region::TraeRegion) -> Vec<(String, RawAccount)> {
+    load_accounts_for_region(region)
+        .accounts
+        .into_iter()
+        .map(|account| (resolve_user_id(&account), account))
+        .filter(|(uid, _)| !uid.is_empty())
+        .collect()
+}
+
 /// 查找单个账号（默认变体，兼容壳）。
 pub fn find(user_id: &str) -> Option<RawAccount> {
     find_for(TraeVariant::default(), user_id)
@@ -1152,7 +1189,14 @@ async fn try_refresh_variant(
         .json(&plan.payload)
         .send()
         .await
-        .map_err(|e| RefreshExchangeError::transport(format!("请求失败: {e}")))?;
+        .map_err(|e| {
+            // 与签到路径同一出口：展开 source 链，否则只剩「请求失败: error sending
+            // request for url (…)」，用户无从判断是重试还是修网络。
+            RefreshExchangeError::transport(format!(
+                "请求失败: {}",
+                crate::modules::net::describe_transport_error(&e)
+            ))
+        })?;
 
     let status = response.status().as_u16();
     let body: Value = response
@@ -1796,7 +1840,7 @@ mod tests {
         let _guard = crate::modules::config::HomeOverrideGuard::set(&temp);
 
         let work = TraeVariant::TraeWork;
-        let cn = TraeVariant::TraeCn;
+        let cn = TraeVariant::Global;
 
         // 各写一条**不同**账号进各自的书。
         let mut work_file = load_accounts_for(work);
@@ -1819,7 +1863,7 @@ mod tests {
             added_at: None,
             updated_at: None,
         });
-        save_accounts_for(cn, &cn_file).expect("写 TraeCn 账号库");
+        save_accounts_for(cn, &cn_file).expect("写 Trae 账号库");
 
         // 各自只读到自己那条 —— 绝不能互相看见。
         let work_uids: Vec<String> = entries_for(work).into_iter().map(|(uid, _)| uid).collect();
@@ -1838,7 +1882,7 @@ mod tests {
         let work_path = paths::accounts_file_for(work);
         let cn_path = paths::accounts_file_for(cn);
         assert!(work_path.is_file(), "TraeWork 账号库未落盘: {work_path:?}");
-        assert!(cn_path.is_file(), "TraeCn 账号库未落盘: {cn_path:?}");
+        assert!(cn_path.is_file(), "Trae 账号库未落盘: {cn_path:?}");
         assert_ne!(work_path, cn_path);
 
         let _ = std::fs::remove_dir_all(&temp);
@@ -1858,7 +1902,7 @@ mod tests {
         let _guard = crate::modules::config::HomeOverrideGuard::set(&temp);
 
         let work = TraeVariant::TraeWork;
-        let cn = TraeVariant::TraeCn;
+        let cn = TraeVariant::Global;
 
         save_accounts_for(
             work,
@@ -1889,7 +1933,7 @@ mod tests {
                 device_bindings: HashMap::new(),
             },
         )
-        .expect("写 TraeCn");
+        .expect("写 Trae");
 
         assert_eq!(
             resolve_user_ids_for(work, &Scope::All, None),
@@ -2193,7 +2237,7 @@ hLkrYGiVNhsErnjKIgS7/EIHdsihRANCAARznG0WLhenNiMW5jA3SwFpTNyet2zw\n\
             assert_eq!(kept.refresh_token.as_deref(), Some("rt-2"));
 
             // 另一条产品线**看不到**这条账号（变体隔离）。
-            assert!(entries_for(TraeVariant::TraeCn).is_empty());
+            assert!(entries_for(TraeVariant::Global).is_empty());
         });
     }
 
@@ -2247,7 +2291,7 @@ hLkrYGiVNhsErnjKIgS7/EIHdsihRANCAARznG0WLhenNiMW5jA3SwFpTNyet2zw\n\
             );
 
             // 变体隔离：另一条产品线不得出现这条账号。
-            assert!(find_for(TraeVariant::TraeCn, uid).is_none());
+            assert!(find_for(TraeVariant::Global, uid).is_none());
         });
     }
 
@@ -2651,7 +2695,7 @@ hLkrYGiVNhsErnjKIgS7/EIHdsihRANCAARznG0WLhenNiMW5jA3SwFpTNyet2zw\n\
             assert_eq!(bound_device_id(variant, "u1").as_deref(), Some("dev-1"));
             // 变体分家：另一条线读不到这条绑定。
             assert_eq!(
-                bound_device_id(TraeVariant::TraeCn, "u1"),
+                bound_device_id(TraeVariant::Global, "u1"),
                 None,
                 "绑定必须按变体分家"
             );
@@ -2804,16 +2848,16 @@ hLkrYGiVNhsErnjKIgS7/EIHdsihRANCAARznG0WLhenNiMW5jA3SwFpTNyet2zw\n\
             work.device_bindings.insert("same-uid".into(), "dev-work".into());
             save_accounts_for(TraeVariant::TraeWork, &work).expect("写 TraeWork 绑定");
 
-            let mut cn = load_accounts_for(TraeVariant::TraeCn);
+            let mut cn = load_accounts_for(TraeVariant::Global);
             cn.device_bindings.insert("same-uid".into(), "dev-cn".into());
-            save_accounts_for(TraeVariant::TraeCn, &cn).expect("写 TraeCn 绑定");
+            save_accounts_for(TraeVariant::Global, &cn).expect("写 Trae 绑定");
 
             assert_eq!(
                 bound_device_id(TraeVariant::TraeWork, "same-uid").as_deref(),
                 Some("dev-work")
             );
             assert_eq!(
-                bound_device_id(TraeVariant::TraeCn, "same-uid").as_deref(),
+                bound_device_id(TraeVariant::Global, "same-uid").as_deref(),
                 Some("dev-cn")
             );
 
@@ -2824,7 +2868,7 @@ hLkrYGiVNhsErnjKIgS7/EIHdsihRANCAARznG0WLhenNiMW5jA3SwFpTNyet2zw\n\
 
             assert_eq!(bound_device_id(TraeVariant::TraeWork, "same-uid"), None);
             assert_eq!(
-                bound_device_id(TraeVariant::TraeCn, "same-uid").as_deref(),
+                bound_device_id(TraeVariant::Global, "same-uid").as_deref(),
                 Some("dev-cn"),
                 "另一条产品线的绑定不得被污染"
             );

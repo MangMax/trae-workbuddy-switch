@@ -187,7 +187,11 @@ pub fn sha256_hex(input: &str) -> String {
 }
 
 /// 常量时间字节比较（长度不同直接 false）。
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+///
+/// `pub(crate)`：Trae 的多 Key 存储（[`crate::trae::apikey`]）复用同一实现，
+/// 避免两处各写一份常量时间比较——**鉴权比较的安全属性必须只定义一次**，
+/// 否则任何一处被改成短路比较都不会被对方发现。
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }

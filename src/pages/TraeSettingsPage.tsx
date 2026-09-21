@@ -1206,7 +1206,7 @@ export default function TraeSettingsPage() {
             </div>
             <p className="mt-3 flex items-start gap-1.5 text-xs leading-5 text-muted-foreground">
               <Info className="mt-0.5 size-3.5 shrink-0" />
-              标记为「不支持」的能力在当前平台会明确返回失败原因，而不是伪装成功。
+              标记为「不支持」的能力会明确给出「在哪支持 + 为什么这里不行」，而不是伪装成功。
             </p>
           </div>
           {capabilities && capabilities.unsupported.length > 0 && (

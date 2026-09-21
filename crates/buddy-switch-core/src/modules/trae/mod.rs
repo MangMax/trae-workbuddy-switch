@@ -103,6 +103,12 @@ pub mod oauth_client;
 pub mod paths;
 pub mod platform;
 pub mod profile;
+/// 区域 × 程序两根正交轴（区域=持久化轴、程序=执行轴）。
+///
+/// 见模块头说明；这是把「产品线」单轴升级为双轴的落地层。
+pub mod region;
+/// 旧「产品线」账号库 → 新「区域」账号库的一次性合并迁移（幂等、带备份、不动旧文件）。
+pub mod region_migrate;
 pub mod settings;
 pub mod store;
 /// 测试专用的环境隔离与 fixture 构造（`cfg(test)` 下才编译，生产代码零引用）。
