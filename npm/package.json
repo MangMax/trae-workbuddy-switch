@@ -1,6 +1,6 @@
 {
   "name": "workbuddy-switch",
-  "version": "2026.9.210935",
+  "version": "2026.9.211453",
   "description": "BuddySwitch（WorkBuddy 账号切换工具）：本地 webui（浏览器操作）+ 桌面 App（安装后运行 workbuddy-switch）",
   "bin": {
     "workbuddy-switch": "bin/workbuddy-switch.js"
@@ -10,10 +10,10 @@
     "scripts"
   ],
   "optionalDependencies": {
-    "workbuddy-switch-darwin-arm64": "2026.9.210935",
-    "workbuddy-switch-darwin-x64": "2026.9.210935",
-    "workbuddy-switch-win32-x64": "2026.9.210935",
-    "workbuddy-switch-linux-x64": "2026.9.210935"
+    "workbuddy-switch-darwin-arm64": "2026.9.211453",
+    "workbuddy-switch-darwin-x64": "2026.9.211453",
+    "workbuddy-switch-win32-x64": "2026.9.211453",
+    "workbuddy-switch-linux-x64": "2026.9.211453"
   },
   "scripts": {
     "postinstall": "node scripts/install.js"

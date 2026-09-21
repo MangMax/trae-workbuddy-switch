@@ -1,6 +1,6 @@
 {
   "name": "workbuddy-switch-linux-x64",
-  "version": "2026.9.210935",
+  "version": "2026.9.211453",
   "description": "BuddySwitch platform binary (linux-x64)",
   "os": [
     "linux"

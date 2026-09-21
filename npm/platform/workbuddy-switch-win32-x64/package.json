@@ -1,6 +1,6 @@
 {
   "name": "workbuddy-switch-win32-x64",
-  "version": "2026.9.210935",
+  "version": "2026.9.211453",
   "description": "BuddySwitch platform binary (win32-x64)",
   "os": [
     "win32"
