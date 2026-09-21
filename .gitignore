@@ -72,4 +72,6 @@ deliverables/
 _*.txt
 _*.py
 _*.png
+_*.mjs
+_*.cjs
 .verify-*.txt
