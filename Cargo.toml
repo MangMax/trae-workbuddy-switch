@@ -6,3 +6,37 @@ members = [
   "src-tauri",
 ]
 resolver = "2"
+
+# ---------------------------------------------------------------------------
+# 体积治理：debug/test 产物的调试信息分级
+#
+# 为什么需要（实测 2026-09-20，target 9.59GB）：
+#   dev profile 默认 `debug = true`（full debuginfo，level 2）→ Windows/MSVC 下每个
+#   target 都产出一份 .pdb，且**把依赖的全部类型信息也写进去**，于是：
+#     · 工作区 12 个 lib/bin/测试 target 的 .pdb 合计 0.96GB（单个测试最高 101.7MB）；
+#     · 248 个依赖的 build script（`build_script_build*.pdb`）合计 643MB；
+#     · 全部 .pdb 1.83GB / 329 个，是 debug 侧 7.41GB 里最大的一块可避免开销。
+#
+# 取值理由：
+#   · 工作区自身保留 `line-tables-only` —— 回溯里仍有 `文件:行号`（定位失败断言够用），
+#     但不再写类型/局部变量信息；**不要降到 0**，否则自家代码的回溯失去行号，排查变瞎。
+#   · 依赖（含其 build script）用 `false` —— 罕见需要单步进 tauri/windows 内部，
+#     换掉它们之后 pdb 基本清零。
+#   · `test` 必须与 `dev` 显式保持一致：`cargo test` 的依赖单元同样吃这些覆盖，
+#     两处不一致会让依赖被**再编一份**（体积翻倍）。
+#   · **刻意不动 release** —— 打包快速缓存（约 2.7 分钟）依赖 release 产物，
+#     改 release profile 会让它全部失效。
+#   · `incremental` 保持默认开启：它占 debug 侧约 2.1GB，但换回的是一行改动即可增量重编，
+#     是本项目「多会话频繁改 crate」场景的核心收益，不建议为省空间关掉。
+# ---------------------------------------------------------------------------
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.test]
+debug = "line-tables-only"
+
+[profile.test.package."*"]
+debug = false
