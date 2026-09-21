@@ -71,6 +71,12 @@
 //! | `iCube` | `https://api.trae.com.cn` | `https://icube-normal.trae.ai` |
 //! | `agent` | `https://trae-api-cn.mchost.guru` | `https://core-normal.trae.ai` |
 //! | `ws` | `wss://trae-ws-cn.mchost.guru/custom_model` | `wss://wss-normal.trae.ai/custom_model` |
+//! | `consoleHost`（授权页域） | `https://www.trae.cn` | `https://www.trae.ai` |
+//!
+//! `consoleHost` 那一行**不是 API**：它是「浏览器里打开的那一页」的域，
+//! 授权页 = `${consoleHost}/authorization`。它与 `account`/`iCube` 不同主机，
+//! 且**必须按区域分家** —— 拿 CN 域给国际版发登录，用户会在错的账号体系的
+//! 授权页上登录，页面走完也不回调（见 [`EndpointSet::console_base`]）。
 //!
 //! ## 仍未验证的部分（勿凭推理"补全"）
 //!
@@ -185,6 +191,87 @@ impl TraeVariant {
     pub fn all() -> [TraeVariant; 2] {
         [TraeVariant::TraeWork, TraeVariant::Trae]
     }
+
+    /// 本变体的**授权页产品线**（决定 `auth_from` / `client_id` / `hide_saas_login`）。
+    ///
+    /// ★ 判定依据**逐字照抄客户端自己的分派**（本机 2026-09-21 读国际版
+    /// `out/main.js`）：客户端按 `packageType` 选产品线，而 `packageType`
+    /// 正是本表里每个变体已经登记的字段：
+    ///
+    /// ```js
+    /// function Su(t){ return t.packageType===SOLO_CN || t.packageType===SOLO_I18N
+    ///                       || t.packageType===SOLO_CN_ENTERPRISE ? "SOLO_Lite" : "TRAE" }
+    /// clientId = Pr(t) ? authConfig.SOLO[channel] : authConfig.TRAE[channel]
+    /// authFrom = Su(t)==="SOLO_Lite" ? "solo" : "trae"     // 且 solo 时追加 hide_saas_login=true
+    /// ```
+    ///
+    /// ⚠️ **授权页产品线 ≠ 区域**：`SOLO_CN` 与 `SOLO_I18N` 是**两条区域的同一个产品线**，
+    /// 因此 `TraeWork`（CN）与 `Global`（国际版 TraeWork）落到**同一条授权页产品线** ——
+    /// 本机实测两台客户端的 `iCubeApp.authConfig` 逐字相同，也印证了这一点。
+    pub fn oauth_line(self) -> OAuthLine {
+        OAuthLine::from_package_type(variant_spec(self).package_type)
+    }
+}
+
+/// 授权页的**产品线**（客户端 `iCubeApp.authConfig` 的两把钥匙）。
+///
+/// 它与 [`TraeRegion`](super::region::TraeRegion) **正交**，也与 [`TraeProgram`]
+/// 同构但不是同一个东西：`TraeProgram` 是**本项目的执行轴**（写哪个目录、启动哪个 exe），
+/// 本枚举是**上游授权页的入参选择器**。二者当前取值一一对应，但依据不同
+/// （前者来自 userData/exe 名，后者来自客户端 `packageType` 的分派），
+/// 所以**刻意不互相转换** —— 合并会让「授权页参数该按什么分」这个事实被藏起来。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OAuthLine {
+    /// SOLO 产品线（`packageType` ∈ {`SOLO_CN`, `SOLO_I18N`, `SOLO_CN_ENTERPRISE`}）。
+    Solo,
+    /// TRAE / IDE 产品线（其余 `packageType`）。
+    Trae,
+}
+
+impl OAuthLine {
+    /// 客户端的 `packageType → 产品线` 分派（**逐字照抄**，含企业版取值）。
+    ///
+    /// 未登记的取值一律落 [`OAuthLine::Trae`] —— 与客户端 `? :` 的 `else` 分支同向。
+    /// 本项目三条变体的 `packageType` 都已登记，故这只是一条与上游对齐的兜底。
+    ///
+    /// ⚠️ **不是 `const fn`**：`match` 一个 `&str` 在 const 上下文里尚未稳定
+    /// （`cannot match on str in constant functions`）。本函数不需要 const，
+    /// 真正需要 const 的是 [`OAuthLine::default_client_id`]（`mod.rs` 的常量引用它）。
+    pub fn from_package_type(package_type: &str) -> OAuthLine {
+        match package_type {
+            "SOLO_CN" | "SOLO_I18N" | "SOLO_CN_ENTERPRISE" => OAuthLine::Solo,
+            _ => OAuthLine::Trae,
+        }
+    }
+
+    /// 授权页 `auth_from` 参数（客户端同名字符串）。
+    pub const fn auth_from(self) -> &'static str {
+        match self {
+            OAuthLine::Solo => "solo",
+            OAuthLine::Trae => "trae",
+        }
+    }
+
+    /// 内置 `client_id` 默认值 —— 即客户端 `product.json` 的
+    /// `iCubeApp.authConfig.<本产品线>.stable`（本机 2026-09-21 实测；
+    /// **两条区域的客户端取值逐字相同**，所以它只按产品线分，不按区域分）。
+    ///
+    /// ⚠️ 拿另一条线的值去发登录，授权页会停在 billing status 后**不回跳**
+    /// （参考实现踩过：拿 SOLO 的值 `en1oxy7wnw8j9n` 去走 IDE 的流程）。
+    pub const fn default_client_id(self) -> &'static str {
+        match self {
+            OAuthLine::Solo => "en1oxy7wnw8j9n",
+            OAuthLine::Trae => "ono9krqynydwx5",
+        }
+    }
+
+    /// 是否追加 `hide_saas_login=true`。
+    ///
+    /// 客户端原文：`auth_from === "solo" && (url += "&hide_saas_login=true")`
+    /// —— 它是 `auth_from` 的**从属**参数，不是独立开关，因此不单独配置。
+    pub const fn hide_saas_login(self) -> bool {
+        matches!(self, OAuthLine::Solo)
+    }
 }
 
 impl Default for TraeVariant {
@@ -213,6 +300,18 @@ pub struct EndpointSet {
     ///
     /// **未验证**：CN 值是实测读到的，国际化值同样读到了但**从未连通过**。
     pub ws_base: Option<&'static str>,
+    /// 网页控制台 / **授权页**基址（`bootConfig.consoleHost`）。
+    ///
+    /// ⚠️ 这是**网页域，不是 API 域**：它与 `account_base` / `icube_base` 不同主机，
+    /// 只用于「浏览器里打开的那一页」。授权页完整地址 = `${console_base}/authorization`，
+    /// 拼法照抄客户端自身（`loginHost = bootConfig.consoleHost`，
+    /// 再拼 `/authorization?login_version=1&…`，见 `out/main.js` 的 OAuth 构造段）。
+    ///
+    /// ⚠️ **必须按区域分家**：CN 是 `https://www.trae.cn`，国际版是 `https://www.trae.ai`。
+    /// 拿 CN 域给国际版发登录 ⇒ 用户在**错的账号体系**的授权页上登录，
+    /// 页面即使走完也不会把凭据回调回本机（域与客户端不匹配），
+    /// 症状与「回调端口没人监听」几乎一样（停在「认证中」），极易误判成端口问题。
+    pub console_base: &'static str,
 }
 
 /// 一个变体的全部差异。
@@ -286,6 +385,7 @@ const TRAE_WORK_SPEC: VariantSpec = VariantSpec {
         icube_base: "https://api.trae.com.cn",
         agent_host: "https://trae-api-cn.mchost.guru",
         ws_base: Some("wss://trae-ws-cn.mchost.guru/custom_model"),
+        console_base: "https://www.trae.cn",
     },
     // 国际化取值来自**国际版客户端自己声明的** `bootConfig.<能力>.trae.normal`
     // （本机装在 `%LOCALAPPDATA%\Programs\TRAE SOLO`，`packageType = SOLO_I18N`）。
@@ -308,6 +408,7 @@ const TRAE_CN_SPEC: VariantSpec = VariantSpec {
         icube_base: "https://api.trae.com.cn",
         agent_host: "https://trae-api-cn.mchost.guru",
         ws_base: Some("wss://trae-ws-cn.mchost.guru/custom_model"),
+        console_base: "https://www.trae.cn",
     },
     // 同上：国际版客户端自述值。**产品线不改变端点，region 才改变端点** ——
     // 所以本变体的国际化端点与 `TRAE_WORK_SPEC` 逐字相同（有单测钉住）。
@@ -323,6 +424,10 @@ const GLOBAL_ENDPOINTS: EndpointSet = EndpointSet {
     icube_base: "https://icube-normal.trae.ai",
     agent_host: "https://core-normal.trae.ai",
     ws_base: Some("wss://wss-normal.trae.ai/custom_model"),
+    // 授权页域：国际版客户端 `product.json` 的 `bootConfig.consoleHost` **实测值**
+    // （本机 2026-09-21 读取，与 `homeUrl` 同值）。客户端自己的 OAuth 构造把它当
+    // `loginHost` 用，见 `out/main.js`：`${loginHost}/authorization?login_version=1…`。
+    console_base: "https://www.trae.ai",
 };
 
 /// **国际版区域**（`TraeWork` 国际构建，`packageType = SOLO_I18N`）。
@@ -458,6 +563,70 @@ mod tests {
         }
     }
 
+    /// ★★ 授权页**产品线**必须由 `packageType` 派生（客户端自己的分派），
+    /// 且**只按产品线分、不按区域分**。
+    ///
+    /// 依据（本机 2026-09-21 读客户端 `out/main.js`，逐字）：
+    /// ```js
+    /// function Su(t){ return t.packageType===SOLO_CN || t.packageType===SOLO_I18N
+    ///                       || t.packageType===SOLO_CN_ENTERPRISE ? "SOLO_Lite" : "TRAE" }
+    /// clientId = Pr(t) ? authConfig.SOLO[channel] : authConfig.TRAE[channel]
+    /// authFrom = Su(t)==="SOLO_Lite" ? "solo" : "trae"
+    /// ```
+    /// 而本机三台客户端的 `iCubeApp.authConfig` **逐字相同**：
+    /// `SOLO.stable = en1oxy7wnw8j9n`、`TRAE.stable = ono9krqynydwx5`
+    /// ⇒ 钥匙是**产品线级**的，不是区域级的（否则 CN 与国际版会各有一套）。
+    ///
+    /// 缺陷形态（本轮修掉的那个）：三处全用 IDE 那把钥匙 + `auth_from=trae`，
+    /// 于是两条 SOLO 线的登录都拿错了钥匙 ⇒ 授权页停在 billing status 后不回跳。
+    #[test]
+    fn 授权页产品线由package_type派生且不按区域分() {
+        // 三条变体各自的产品线。
+        assert_eq!(
+            variant_spec(TraeVariant::TraeWork).variant.oauth_line(),
+            OAuthLine::Solo,
+            "TraeWork（SOLO_CN）必须落 SOLO 线"
+        );
+        assert_eq!(
+            variant_spec(TraeVariant::Global).variant.oauth_line(),
+            OAuthLine::Solo,
+            "国际版 TraeWork（SOLO_I18N）必须落 SOLO 线 —— 它与 CN 是同一条产品线"
+        );
+        assert_eq!(
+            variant_spec(TraeVariant::Trae).variant.oauth_line(),
+            OAuthLine::Trae,
+            "Trae（TRAE_CN）必须落 TRAE 线"
+        );
+
+        // 分派是 `packageType` 的函数，与区域无关：同一 `packageType` 必然同一产品线。
+        for spec in all_specs() {
+            assert_eq!(
+                OAuthLine::from_package_type(spec.package_type),
+                spec.variant.oauth_line(),
+                "{} 的产品线没有从 package_type 派生",
+                spec.name_alias
+            );
+        }
+        // 企业版取值按客户端原样识别（本项目暂无该变体，但规则必须完整）。
+        assert_eq!(OAuthLine::from_package_type("SOLO_CN_ENTERPRISE"), OAuthLine::Solo);
+        assert_eq!(OAuthLine::from_package_type("TRAE_CN_ENTERPRISE"), OAuthLine::Trae);
+
+        // 两条线的三件取值必须**两两不同**（否则「按线分家」等于没分）。
+        assert_ne!(OAuthLine::Solo.auth_from(), OAuthLine::Trae.auth_from());
+        assert_ne!(
+            OAuthLine::Solo.default_client_id(),
+            OAuthLine::Trae.default_client_id()
+        );
+        assert_ne!(OAuthLine::Solo.hide_saas_login(), OAuthLine::Trae.hide_saas_login());
+        // 逐字值（与客户端 `authConfig` / `auth_from` 分派对拍）。
+        assert_eq!(OAuthLine::Solo.auth_from(), "solo");
+        assert_eq!(OAuthLine::Trae.auth_from(), "trae");
+        assert_eq!(OAuthLine::Solo.default_client_id(), "en1oxy7wnw8j9n");
+        assert_eq!(OAuthLine::Trae.default_client_id(), "ono9krqynydwx5");
+        assert!(OAuthLine::Solo.hide_saas_login());
+        assert!(!OAuthLine::Trae.hide_saas_login());
+    }
+
     /// 两条产品线的 CN 端点**逐字相同**（实测结论）。
     /// 这个断言是"产品线不改变端点、region 才改变端点"的机器可读证据；
     /// 若有人给某条产品线单独改了端点，这里会红。
@@ -486,6 +655,7 @@ mod tests {
             icube_base: "https://icube-normal.trae.ai",
             agent_host: "https://core-normal.trae.ai",
             ws_base: Some("wss://wss-normal.trae.ai/custom_model"),
+            console_base: "https://www.trae.ai",
         };
         for spec in all_specs() {
             assert_eq!(
@@ -510,6 +680,11 @@ mod tests {
             assert_ne!(global.icube_base, spec.cn_endpoints.icube_base, "iCube 撞了");
             assert_ne!(global.agent_host, spec.cn_endpoints.agent_host, "agent 撞了");
             assert_ne!(global.ws_base, spec.cn_endpoints.ws_base, "ws 撞了");
+            // 授权页域同样必须分家：共用 CN 域 = 国际版用户在错的账号体系上登录。
+            assert_ne!(
+                global.console_base, spec.cn_endpoints.console_base,
+                "授权页域（consoleHost）撞了"
+            );
             assert!(
                 global.ws_base.is_some(),
                 "{} 的国际版 ws 端点缺失（应为国际版客户端自述的 wss 值）",
@@ -520,8 +695,7 @@ mod tests {
 
     /// CN 端点必须等于改造前的硬编码常量原值 —— 保证既有行为零变化。
     #[test]
-    fn cn端点等于改造前的常量原值() {
-        let spec = variant_spec(TraeVariant::TraeWork);
+    fn cn端点等于改造前的常量原值() {        let spec = variant_spec(TraeVariant::TraeWork);
         assert_eq!(spec.cn_endpoints.account_base, super::super::TRAE_API_BASE_CN);
         assert_eq!(spec.cn_endpoints.icube_base, super::super::TRAE_OAUTH_BASE_CN);
     }

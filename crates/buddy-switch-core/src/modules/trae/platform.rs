@@ -351,6 +351,12 @@ fn region_status(region: super::region::TraeRegion) -> Value {
         // 区域标识（`cn` / `global`）—— 前端选区域、以及账号类接口的入参。
         "variant": region.as_str(),
         "variantLabel": region.display_name(),
+        // 该区域**用户看得见的那一页**所在的域（客户端 `bootConfig.consoleHost`）。
+        // 与 `variantLabel` 不同：它**不是展示名**，而是可直接拼 URL 的基址 ——
+        // 前端「关于」外链、以及任何「在浏览器里打开官方站点」的动作都取它，
+        // 免得前端另立第二份域常量（漏改会把国际版用户导到国内站）。
+        // 单一来源：与授权页域同取自 [`super::region::region_endpoints`]。
+        "consoleBase": super::region::region_endpoints(region).console_base,
         "installed": any("installed"),
         "running": any("running"),
         "version": field("version"),
@@ -1681,6 +1687,7 @@ mod tests {
             for key in [
                 "variant",
                 "variantLabel",
+                "consoleBase",
                 "installed",
                 "running",
                 "version",
@@ -1709,6 +1716,46 @@ mod tests {
             assert!(seen.contains(&expected), "缺少区域 {expected}");
         }
         assert_eq!(seen.len(), 2, "区域标识重复: {seen:?}");
+    }
+
+    /// 区域状态带出的「站点域」（`consoleBase`）必须**按区域分家**，且与授权页域**同源**。
+    ///
+    /// 断言的是**字面值**，不是「等于某个函数」—— 后者会退化成同义反复：函数改错时
+    /// 两边一起错、测试照样绿。字面值来自实测的客户端 `bootConfig.consoleHost`。
+    #[test]
+    fn 区域状态带出的站点域按区域分家() {
+        let value = variants_status();
+        let items = value.get("variants").and_then(|v| v.as_array()).unwrap();
+        let domain_of = |region: &str| -> &str {
+            items
+                .iter()
+                .find(|item| item.get("variant").and_then(|v| v.as_str()) == Some(region))
+                .unwrap_or_else(|| panic!("缺少区域 {region}"))
+                .get("consoleBase")
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| panic!("区域 {region} 缺少 consoleBase"))
+        };
+
+        assert_eq!(domain_of("cn"), "https://www.trae.cn");
+        assert_eq!(domain_of("global"), "https://www.trae.ai");
+        assert_ne!(
+            domain_of("cn"),
+            domain_of("global"),
+            "两个区域的站点域不得相同 —— 否则国际版用户会被导到国内站"
+        );
+
+        // **同源**：前端「关于」外链的域与授权页的域必须出自同一份端点表，
+        // 否则会出现「外链指 trae.ai、授权页却开 trae.cn」这种自相矛盾。
+        for (region, variant) in [
+            ("cn", super::super::variant::TraeVariant::TraeWork),
+            ("global", super::super::variant::TraeVariant::Global),
+        ] {
+            assert_eq!(
+                domain_of(region),
+                super::super::endpoints_for(variant).console_base,
+                "区域 {region} 的站点域与授权页域不同源"
+            );
+        }
     }
 
     /// 逐变体运行探测：结果只取决于该变体的进程名。

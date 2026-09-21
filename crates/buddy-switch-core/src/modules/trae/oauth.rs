@@ -11,8 +11,13 @@
 //!
 //! 授权页 `login_channel=native_ide` 的原生流程：
 //!
-//! 1. 客户端构造 **22 参数**授权 URL（`build_authorize_url`），其中
+//! 1. 客户端构造授权 URL（`build_authorize_url`）：**22 参数**（TRAE/IDE 线）或
+//!    **23 参数**（SOLO 线，多一个从属的 `hide_saas_login=true`）。其中
 //!    `login_trace_id` 兼作 CSRF 绑定值、`code_challenge` 是 PKCE S256；
+//!    **授权页的域按区域分家**（国内 `https://www.trae.cn`、国际 `https://www.trae.ai`，
+//!    取自 [`endpoints_for`]`(variant).console_base`），
+//!    **`auth_from` / `client_id` 按产品线分家**（SOLO 线 `solo` + `en1oxy7wnw8j9n`、
+//!    TRAE 线 `trae` + `ono9krqynydwx5`，取自 `variant.oauth_line()`）。
 //! 2. 用户在浏览器登录并点授权 → 授权页前端调 `GetPCAuthCode`（绑定 challenge）
 //!    → 302 回 `auth_callback_url`，参数为 `authCodeInfo`（URL 编码 JSON）+ `userInfo`
 //!    + `host` + `userRegion` + `loginTraceID`；
@@ -57,7 +62,8 @@
 //! ## 安全边界
 //!
 //! 监听**只绑 `127.0.0.1`**，且**只在拿到凭据前应答探测**：拿到凭据立即关闭。
-//! 探测响应体不含任何凭据；回调响应体也不含凭据，只回一句「可以关闭本页」。
+//! 探测响应体不含任何凭据；回调响应体也不含凭据，只回一张结果卡片
+//! （见 [`super::oauth_result_page`]）。
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -71,6 +77,7 @@ use tokio::sync::Notify;
 
 use crate::modules::trae::icube::{self, DeviceIdentity};
 use crate::modules::trae::oauth_client::oauth_client;
+use crate::modules::trae::oauth_result_page::{result_page, PageKind};
 use crate::modules::trae::store;
 use crate::modules::trae::variant::TraeVariant;
 use crate::modules::trae::{
@@ -79,8 +86,15 @@ use crate::modules::trae::{
     TRAE_PAGE_PLATFORM_CODE, TRAE_PAGE_PLUGIN_VERSION,
 };
 
-/// 授权页基址（**不是** API 基址——`www.trae.cn/authorization` 是网页）。
-const TRAE_AUTHORIZE_PAGE: &str = "https://www.trae.cn/authorization";
+/// 授权页路径（挂在**该变体的 `console_base`** 后面）。
+///
+/// ⚠️ 这里**只有路径**，域由 [`crate::modules::trae::endpoints_for`] 的
+/// `console_base` 提供 —— 域是**按区域分家**的（CN `www.trae.cn` / 国际 `www.trae.ai`），
+/// 曾经把它写成单个常量，于是国际版的登录会打开**国内版**的授权页
+/// （用户在错的账号体系上登录，走完也不回调）。
+///
+/// 路径与客户端的拼法逐字一致（`${loginHost}/authorization`，见 `out/main.js`）。
+const AUTHORIZE_PATH: &str = "/authorization";
 
 /// 回调路径。与构造进 `auth_callback_url` 的路径必须一致，否则浏览器跳回来接不住。
 const CALLBACK_PATH: &str = "/authorize";
@@ -510,11 +524,28 @@ fn pkce_pair() -> (String, String) {
     (verifier, challenge)
 }
 
-/// 构造授权 URL（**22 参数**，逐字对齐抓包固化值）。
+/// 构造授权 URL（**22 参数**，逐字对齐抓包固化值；SOLO 线再多一个 `hide_saas_login`）。
 ///
 /// 出处：`reference/TraeWorkAssistant-main/src-tauri/src/commands/oauth.rs:321-355`。
 /// **不要按语义改写参数顺序或取值** —— 授权页按这些参数进入 `native_ide` 原生流程，
 /// 少一个或值不对就会停在 billing status 后不回跳。
+///
+/// ## ★ 三处取值**必须**按 `variant` 派生（本轮修的两个真实缺陷）
+///
+/// | 项 | 取值来源 | 国内版 | 国际版 |
+/// |:---|:---|:---|:---|
+/// | 授权页**域** | `endpoints_for(variant).console_base` | `https://www.trae.cn` | `https://www.trae.ai` |
+/// | `auth_from` | `variant.oauth_line().auth_from()` | `solo` | `solo` |
+/// | `client_id` | `oauth_client().client_id_for(line)` | `en1oxy7wnw8j9n` | `en1oxy7wnw8j9n` |
+///
+/// 前两行是「按**区域**分家」（`TraeWork` 与 `Global` 不同），第三行是
+/// 「按**产品线**分家」（`TraeWork`/`Global` 同属 SOLO 线，`Trae` 是 TRAE 线）。
+/// **两个轴不要混为一谈**：域随区域变，钥匙随产品线变。
+///
+/// 把域做成**入参**（而不是再写一个常量）是有意的：它让「忘了按区域分家」
+/// 在类型层面不可能 —— 调用方必须给出变体，而变体是唯一决定域的东西。
+/// 曾经的缺陷形态就是「域写死 CN + 参数按区域分家」，于是国际版登录
+/// 打开的是国内版授权页，症状（停在「认证中」不回跳）与端口问题几乎一样。
 ///
 /// ## ★ `device_id` **只能**取自 `identity`（红线，结构性护栏）
 ///
@@ -527,6 +558,7 @@ fn pkce_pair() -> (String, String) {
 /// `machine_id` 则是**本机自造**的值（`device::oauth_login_machine_for`），
 /// 变体级持久稳定 —— 参考自身这两者也不相等（见 arch §10 #2-b）。
 fn build_authorize_url(
+    variant: TraeVariant,
     identity: &DeviceIdentity,
     machine_id: &str,
     port: u16,
@@ -537,10 +569,13 @@ fn build_authorize_url(
     let callback = format!("http://127.0.0.1:{port}{CALLBACK_PATH}");
     // `COMPUTERNAME` 可能含空格/非 ASCII，必须走通用 URL 编码（手写 `:`/`/` 替换不够）。
     let hostname = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows-PC".into());
-    format!(
-        "{TRAE_AUTHORIZE_PAGE}?\
+    // 授权页产品线：决定 `auth_from` / `client_id` / 是否追加 `hide_saas_login`。
+    // 判定依据是客户端自己的 `packageType` 分派（见 `OAuthLine::from_package_type`）。
+    let line = variant.oauth_line();
+    let mut url = format!(
+        "{console_base}{AUTHORIZE_PATH}?\
         login_version=1\
-        &auth_from=trae\
+        &auth_from={auth_from}\
         &login_channel=native_ide\
         &plugin_version={plugin_version}\
         &auth_type=local\
@@ -561,13 +596,21 @@ fn build_authorize_url(
         &code_challenge={code_challenge}\
         &code_challenge_method=S256\
         &channel_name=common",
+        console_base = endpoints_for(variant).console_base,
+        auth_from = line.auth_from(),
         plugin_version = TRAE_PAGE_PLUGIN_VERSION,
-        client_id = oauth_client().client_id,
+        client_id = oauth_client().client_id_for(line),
         redirect_uri = urlencoding::encode(&callback),
         hostname = urlencoding::encode(&hostname),
         os_version = urlencoding::encode("Windows"),
         app_version = TRAE_PAGE_APP_VERSION,
-    )
+    );
+    // `hide_saas_login` 是 `auth_from=solo` 的**从属**参数（客户端：`A==="solo" && (D+=…)`），
+    // 追加在**最末**，与客户端拼串顺序一致。
+    if line.hide_saas_login() {
+        url.push_str("&hide_saas_login=true");
+    }
+    url
 }
 
 /// 解析交换端点主机：回调回传的 `host` 优先，缺失时回落该变体的 `icube_base`。
@@ -665,7 +708,9 @@ async fn exchange_auth_code(
     identity: &DeviceIdentity,
 ) -> Result<account::ExchangedToken, String> {
     let auth_device_id = identity.device_id.as_str();
-    let client_id = oauth_client().client_id.clone();
+    // ★ 交换请求体里的 `ClientID` 必须与**授权 URL 用的那把钥匙同源**（按产品线分）。
+    // 两处取不同的值 = 拿 A 线的钥匙去兑 B 线签发的 AuthCode，上游只会拒绝。
+    let client_id = oauth_client().client_id_for(variant.oauth_line()).to_string();
     let legacy_url = format!(
         "{}{}",
         endpoints_for(variant).icube_base,
@@ -980,7 +1025,14 @@ pub async fn login_start_for(variant: TraeVariant) -> Result<Value, String> {
         );
     }
 
-    let authorize_url = build_authorize_url(&identity, &machine.machine_id, port, &trace_id, &code_challenge);
+    let authorize_url = build_authorize_url(
+        variant,
+        &identity,
+        &machine.machine_id,
+        port,
+        &trace_id,
+        &code_challenge,
+    );
     let session_id = login_id.clone();
     // 身份随监听任务一起搬进去：回调到达时要拿**同一个** `device_id` 去填
     // `DeviceInfo.DeviceID` 与 `x-device-id`（三方同源）。
@@ -1058,7 +1110,12 @@ pub async fn login_start_for(variant: TraeVariant) -> Result<Value, String> {
             // 重新发起登录），浏览器随后才把回调打过来。若只看「端口上来了请求」就落库，
             // 用户会看到一个自己已经取消的登录突然多出一个账号。
             if view.cancelled {
-                let _ = respond(&mut stream, "本次登录已取消，可以关闭本页", &method).await;
+                let page = result_page(
+                    PageKind::Cancelled,
+                    "已取消",
+                    &["本次登录已取消，可以关闭本页。".to_string()],
+                );
+                let _ = respond_html(&mut stream, &page, &method).await;
                 return;
             }
 
@@ -1067,7 +1124,14 @@ pub async fn login_start_for(variant: TraeVariant) -> Result<Value, String> {
             // 而不带任何参数的才是探测。两者都以「无凭据」为特征，
             // 只靠凭据有无区分会把拒绝回调误当成探测、让用户白等。
             if let Some(err) = params.get("error").filter(|e| !e.trim().is_empty()) {
-                let _ = respond(&mut stream, "授权被拒绝，可以关闭本页", &method).await;
+                // 拒绝是**用户自己的动作**，不是故障：用中性文案，不回显上游错误码
+                // （`error=` 的值是浏览器可控的，进页面只会变成噪音，且必须转义才安全）。
+                let page = result_page(
+                    PageKind::Cancelled,
+                    "已取消授权",
+                    &["你在授权页拒绝了本次登录，可以关闭本页。".to_string()],
+                );
+                let _ = respond_html(&mut stream, &page, &method).await;
                 finish_session(
                     &session_id,
                     None,
@@ -1090,7 +1154,12 @@ pub async fn login_start_for(variant: TraeVariant) -> Result<Value, String> {
             // CSRF：期望值来自在途会话（无会话时宽容放行）。
             let expected = (!view.trace_id.is_empty()).then_some(view.trace_id.as_str());
             if let Err(error) = verify_login_trace(&params, expected) {
-                let _ = respond(&mut stream, "登录校验失败，请重新授权", &method).await;
+                let page = result_page(
+                    PageKind::Failure,
+                    "登录失败",
+                    &["登录校验失败，请回到应用重新授权。".to_string()],
+                );
+                let _ = respond_html(&mut stream, &page, &method).await;
                 finish_session(&session_id, None, Some(error));
                 return;
             }
@@ -1098,7 +1167,12 @@ pub async fn login_start_for(variant: TraeVariant) -> Result<Value, String> {
             let callback = match parse_callback(&params) {
                 Ok(callback) => callback,
                 Err(detail) => {
-                    let _ = respond(&mut stream, "登录信息不完整，请重新授权", &method).await;
+                    let page = result_page(
+                        PageKind::Failure,
+                        "登录失败",
+                        &["登录信息不完整，请回到应用重新授权。".to_string()],
+                    );
+                    let _ = respond_html(&mut stream, &page, &method).await;
                     finish_session(&session_id, None, Some(classify_error("callback", &detail)));
                     return;
                 }
@@ -1106,7 +1180,12 @@ pub async fn login_start_for(variant: TraeVariant) -> Result<Value, String> {
 
             if callback.auth_code.is_none() && callback.refresh_token.is_none() {
                 // 有凭据标记却两种凭据都没有：明确失败，不要空等到 300 秒。
-                let _ = respond(&mut stream, "登录信息不完整，请重新授权", &method).await;
+                let page = result_page(
+                    PageKind::Failure,
+                    "登录失败",
+                    &["登录信息不完整，请回到应用重新授权。".to_string()],
+                );
+                let _ = respond_html(&mut stream, &page, &method).await;
                 finish_session(
                     &session_id,
                     None,
@@ -1118,13 +1197,34 @@ pub async fn login_start_for(variant: TraeVariant) -> Result<Value, String> {
                 return;
             }
 
-            // 先把浏览器那页回掉再走网络交换：让用户立刻看到「完成」，
-            // 而不是盯着一个白屏等 ExchangeToken 的两秒。
-            let _ = respond(&mut stream, "登录成功，可以关闭本页并返回应用", &method).await;
-
+            // ★ 结果页在**兑换之后**才回，不在兑换之前。
+            //
+            // 两个理由，任一都足以定案：
+            //
+            // 1. 页面要写「账号 [昵称] 登录成功」，而昵称只有兑换成功才拿得到
+            //    （参考实现同样是在 `oauth_login` 之后才渲染结果页）；
+            // 2. **先回页会让兑换失败时也显示「登录成功」** —— 页面在说谎，
+            //    而用户此刻正盯着它，只会以为账号已经加好了。
+            //
+            // 代价是浏览器多等一次 ExchangeToken 往返（通常 1~2 秒）：
+            // 换来的是「页面说的结果 == 实际结果」。
             match perform_login(view.variant, &callback, &view.pkce_verifier, &identity).await {
-                Ok(account_view) => finish_session(&session_id, Some(account_view), None),
-                Err(error) => finish_session(&session_id, None, Some(error)),
+                Ok(account_view) => {
+                    let page = success_page(&account_view, view.variant);
+                    // 先落终态再写浏览器页：应用侧的轮询结果不该被「写浏览器响应」这一步拖住
+                    // （浏览器提前断开时 write_all 会失败，但那只影响那一页）。
+                    finish_session(&session_id, Some(account_view), None);
+                    let _ = respond_html(&mut stream, &page, &method).await;
+                }
+                Err(error) => {
+                    let page = result_page(
+                        PageKind::Failure,
+                        "登录失败",
+                        &[error.clone(), "请回到应用重新发起登录。".to_string()],
+                    );
+                    finish_session(&session_id, None, Some(error));
+                    let _ = respond_html(&mut stream, &page, &method).await;
+                }
             }
             return;
         }
@@ -1142,46 +1242,121 @@ pub async fn login_start_for(variant: TraeVariant) -> Result<Value, String> {
     }))
 }
 
-/// 极简 HTTP 响应。回调页只需一句人话，不引模板。
+/// 极简 HTTP 响应（`text/plain`）。**只用于应答上游的在线探测**。
 ///
 /// ## 为什么必须回 CORS 头
 ///
-/// 授权页是 `https://www.trae.cn`，它对本机端口（`http://127.0.0.1:17388`）的
-/// 在线探测属于**跨源请求**。没有 `Access-Control-Allow-Origin` 时浏览器会把
-/// 响应拦在 JS 之外，授权页因此判不出「客户端在线」——**表现与端口没监听完全一样，
-/// 都是永久卡在「认证中」**。这一条极易漏掉：用 curl 测是通的，只有浏览器会失败。
+/// 授权页是**网页域**（国内版 `https://www.trae.cn`、国际版 `https://www.trae.ai`，
+/// 见 [`crate::modules::trae::endpoints_for`] 的 `console_base`），它对本机端口
+/// （`http://127.0.0.1:17388`）的在线探测属于**跨源请求**。没有
+/// `Access-Control-Allow-Origin` 时浏览器会把响应拦在 JS 之外，授权页因此判不出
+/// 「客户端在线」——**表现与端口没监听完全一样，都是永久卡在「认证中」**。
+/// 这一条极易漏掉：用 curl 测是通的，只有浏览器会失败。
+///
+/// ⚠️ 回的是 `*` 而**不是**某个具体域：两个区域的授权页都会来探，写死一个域
+/// 会让另一个区域的登录卡在「认证中」（这正是「域按区域分家」后新增的坑，
+/// 好在 `*` 天然免疫 —— 别为了"收紧"改成白名单）。
 ///
 /// `OPTIONS` 预检也一并回应（`Access-Control-Allow-Methods` 覆盖到）。
 /// 响应的 `Content-Type` 用 `text/plain` 而非 `text/html`：探测方只关心状态码，
 /// 而工具链（含各种代理）对 text/html 有额外的嗅探与安全头推断。
+///
+/// ⚠️ **用户看得见的结果页不走这里**，走 [`respond_html`]：
+/// 纯文本会被浏览器渲染成左上角一行小字，用户看不出这是登录流程的一部分
+/// （见 [`super::oauth_result_page`] 模块头）。
 async fn respond(
     stream: &mut tokio::net::TcpStream,
     message: &str,
     method: &str,
 ) -> std::io::Result<()> {
+    write_response(stream, "text/plain; charset=utf-8", message, method).await
+}
+
+/// 结果页响应（`text/html`）。**用户可见的每一页都走这里**。
+///
+/// 与 [`respond`] 只差 `Content-Type`——`text/plain` 在浏览器里是纯文本，
+/// 卡片布局不可能生效。
+async fn respond_html(
+    stream: &mut tokio::net::TcpStream,
+    html: &str,
+    method: &str,
+) -> std::io::Result<()> {
+    write_response(stream, "text/html; charset=utf-8", html, method).await
+}
+
+/// 两种响应的公共部分：CORS 头、`Content-Length`（**字节数**，非字符数）、连接关闭。
+async fn write_response(
+    stream: &mut tokio::net::TcpStream,
+    content_type: &str,
+    body: &str,
+    method: &str,
+) -> std::io::Result<()> {
+    let response = build_response(content_type, body, method);
+    tokio::io::AsyncWriteExt::write_all(stream, response.as_bytes()).await?;
+    tokio::io::AsyncWriteExt::flush(stream).await
+}
+
+/// 组装完整响应报文（**纯函数**，可单测）。
+///
+/// ## `Content-Length` 必须是**字节数**
+///
+/// 结果页正文全是中文（一个汉字 3 字节）。若写成字符数，浏览器会**按声明长度截断**
+/// 响应体 ⇒ 卡片只渲染一半、`</html>` 之后的字节被丢掉，而**服务端一切正常**——
+/// 这类缺陷用 `read_to_string` 读到 EOF 的集成测试**抓不到**（连接关了，
+/// 长度对不对它不看），只有真浏览器会暴露。故这里把它钉成纯函数单测。
+///
+/// `Cache-Control: no-store`：结果页含账号昵称（个人信息），且回调 URL 是**一次性**的
+/// （查询串里带 AuthCode）；不让浏览器留副本。
+fn build_response(content_type: &str, body: &str, method: &str) -> String {
     // 预检请求不要 body，回一组头即可。
-    let (status, content_type, body) = if method.eq_ignore_ascii_case("OPTIONS") {
-        ("204 No Content", "text/plain; charset=utf-8", String::new())
+    let (status, body) = if method.eq_ignore_ascii_case("OPTIONS") {
+        ("204 No Content", "")
     } else {
-        (
-            "200 OK",
-            "text/plain; charset=utf-8",
-            message.to_string(),
-        )
+        ("200 OK", body)
     };
 
-    let response = format!(
+    format!(
         "HTTP/1.1 {status}\r\n\
          Content-Type: {content_type}\r\n\
+         Cache-Control: no-store\r\n\
          Access-Control-Allow-Origin: *\r\n\
          Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
          Access-Control-Allow-Headers: *\r\n\
          Access-Control-Max-Age: 600\r\n\
          Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
-    );
-    tokio::io::AsyncWriteExt::write_all(stream, response.as_bytes()).await?;
-    tokio::io::AsyncWriteExt::flush(stream).await
+    )
+}
+
+/// 成功结果页：账号昵称 + 落库区域。
+///
+/// ## 为什么写「区域」而不是 `variant.display_name()`
+///
+/// 持久化轴是**区域**（`TraeWork` 与 `Trae` 共用国内库）。页面说「账号已添加到哪」，
+/// 就必须按**账号库**那一轴说：写成程序名会出现「已添加到 Trae Work」，
+/// 而用户在 Trae 分区里也看得到这个账号（本来就是同一本库）——用户会以为提示在骗人。
+fn success_page(account_view: &Value, variant: TraeVariant) -> String {
+    // 昵称可能为空（上游没给）；退回 userId 与前端 `result.name || result.userId` 同款，
+    // 两处显示同一个名字，用户才不会怀疑「加错账号了」。
+    let name = account_view
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .or_else(|| account_view.get("userId").and_then(Value::as_str))
+        .unwrap_or("未知账号")
+        .to_string();
+
+    result_page(
+        PageKind::Success,
+        "登录成功",
+        &[
+            format!("账号 [{name}] 登录成功"),
+            format!(
+                "账号已添加到「{}」账号库，可关闭此页面返回应用。",
+                variant.region().display_name()
+            ),
+        ],
+    )
 }
 
 /// 用回调里的凭据走完「换 JWT → 落盘」，返回账号视图。
@@ -1482,75 +1657,257 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // 授权 URL（22 参数，逐键对拍）
+    // 授权 URL（22 参数，逐键对拍；**按产品线**分成两种形态）
     // -----------------------------------------------------------------------
 
-    /// ★ 22 个参数**逐键**对拍（键名与固定值全等）。
+    /// ★ 参数**逐键**对拍（键名与固定值全等），并**按产品线**分别对拍。
     ///
     /// 出处：抓包固化 2026-09-16，
     /// `reference/TraeWorkAssistant-main/src-tauri/src/commands/oauth.rs:321-355`。
+    ///
+    /// ## 为什么必须分成两条线对拍
+    ///
+    /// 抓包固化的是 **TRAE / IDE 线**（参考自述「真实 Trae **IDE** 登录 URL 实证值」），
+    /// 即 `auth_from=trae` + `client_id=ono9krqynydwx5` + **22 参数**。
+    /// SOLO 线（TraeWork / 国际版）在客户端里走的是**另一处分支**：
+    /// `auth_from=solo` + `client_id=en1oxy7wnw8j9n` + 末尾追加 `hide_saas_login=true`
+    /// ⇒ **23 参数**。把 IDE 那套照抄给 SOLO 线，授权页会停在 billing status 后不回跳。
     #[test]
     fn authorize_url_carries_all_native_ide_params() {
         let identity = identity_with_device_id("dev");
-        let url = build_authorize_url(&identity, "mach", 12345, "trace-1", "challenge-1");
-        assert!(url.starts_with(TRAE_AUTHORIZE_PAGE));
-        let query = url.split_once('?').expect("授权 URL 必须带查询串").1;
-        let params = parse_query(query);
-
         let hostname = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows-PC".into());
-        let expected: [(&str, &str); 22] = [
-            ("login_version", "1"),
-            ("auth_from", "trae"),
-            ("login_channel", "native_ide"),
-            ("plugin_version", "2.3.83560"),
-            ("auth_type", "local"),
-            ("client_id", "ono9krqynydwx5"),
-            ("redirect", "0"),
-            ("login_trace_id", "trace-1"),
-            ("auth_callback_url", "http://127.0.0.1:12345/authorize"),
-            ("machine_id", "mach"),
-            ("device_id", "dev"),
-            ("x_device_id", "dev"),
-            ("x_machine_id", "mach"),
-            ("x_device_brand", hostname.as_str()),
-            ("x_device_type", "windows"),
-            ("x_os_version", "Windows"),
-            ("x_env", ""),
-            ("x_app_version", "3.3.100"),
-            ("x_app_type", "stable"),
-            ("code_challenge", "challenge-1"),
-            ("code_challenge_method", "S256"),
-            ("channel_name", "common"),
+
+        // (变体, auth_from, client_id, 是否带 hide_saas_login)
+        let cases: [(TraeVariant, &str, &str, bool); 3] = [
+            // TRAE / IDE 线：与抓包固化值逐字一致（**零行为变化**的回归护栏）。
+            (TraeVariant::Trae, "trae", "ono9krqynydwx5", false),
+            // SOLO 线：CN 与 国际版**同属 SOLO 线**（`packageType` 都是 SOLO_*）。
+            (TraeVariant::TraeWork, "solo", "en1oxy7wnw8j9n", true),
+            (TraeVariant::Global, "solo", "en1oxy7wnw8j9n", true),
         ];
-        for (key, value) in expected {
+
+        for (variant, auth_from, client_id, hide_saas) in cases {
+            let url = build_authorize_url(variant, &identity, "mach", 12345, "trace-1", "challenge-1");
+            assert!(
+                url.starts_with(&format!(
+                    "{}{AUTHORIZE_PATH}",
+                    endpoints_for(variant).console_base
+                )),
+                "{variant:?} 的授权页基址漂了: {url}"
+            );
+            let query = url.split_once('?').expect("授权 URL 必须带查询串").1;
+            let params = parse_query(query);
+
+            let expected: [(&str, &str); 22] = [
+                ("login_version", "1"),
+                ("auth_from", auth_from),
+                ("login_channel", "native_ide"),
+                ("plugin_version", "2.3.83560"),
+                ("auth_type", "local"),
+                ("client_id", client_id),
+                ("redirect", "0"),
+                ("login_trace_id", "trace-1"),
+                ("auth_callback_url", "http://127.0.0.1:12345/authorize"),
+                ("machine_id", "mach"),
+                ("device_id", "dev"),
+                ("x_device_id", "dev"),
+                ("x_machine_id", "mach"),
+                ("x_device_brand", hostname.as_str()),
+                ("x_device_type", "windows"),
+                ("x_os_version", "Windows"),
+                ("x_env", ""),
+                ("x_app_version", "3.3.100"),
+                ("x_app_type", "stable"),
+                ("code_challenge", "challenge-1"),
+                ("code_challenge_method", "S256"),
+                ("channel_name", "common"),
+            ];
+            for (key, value) in expected {
+                assert_eq!(
+                    params.get(key).map(String::as_str),
+                    Some(value),
+                    "{variant:?} 的参数 {key} 不匹配；完整 URL={url}"
+                );
+            }
+            // SOLO 线多一个从属参数 `hide_saas_login`（客户端：`auth_from==="solo"` 时追加）。
+            if hide_saas {
+                assert_eq!(
+                    params.get("hide_saas_login").map(String::as_str),
+                    Some("true"),
+                    "{variant:?} 缺 hide_saas_login（solo 线必须带）: {url}"
+                );
+                assert!(
+                    url.ends_with("&hide_saas_login=true"),
+                    "hide_saas_login 必须追加在**最末**（与客户端拼串顺序一致）: {url}"
+                );
+            } else {
+                assert!(
+                    !url.contains("hide_saas_login"),
+                    "{variant:?} 不该带 hide_saas_login（那是 solo 线专属）: {url}"
+                );
+            }
             assert_eq!(
-                params.get(key).map(String::as_str),
-                Some(value),
-                "参数 {key} 不匹配；完整 URL={url}"
+                params.len(),
+                if hide_saas { 23 } else { 22 },
+                "{variant:?} 参数个数不对（多一个少一个都会让授权页行为改变）: {:?}",
+                params.keys().collect::<Vec<_>>()
+            );
+
+            // 回调地址必须**编码**：不编码时 `http://` 里的 `:` `/` 会让上层解析错位。
+            assert!(
+                url.contains("auth_callback_url=http%3A%2F%2F127.0.0.1%3A12345%2Fauthorize"),
+                "回调地址未编码: {url}"
+            );
+            assert!(!url.contains("auth_callback_url=http://"));
+            // `x_env=` 必须保留这一对（空值也要出现）。
+            assert!(url.contains("&x_env=&"), "x_env 空参数对丢失: {url}");
+        }
+    }
+
+    /// ★★ 交换请求体的 `ClientID` 必须与授权 URL 用的**同一把钥匙**。
+    ///
+    /// 两处若各取各的（一处按产品线、一处写死），等于拿 A 线的钥匙去兑 B 线签发的
+    /// AuthCode —— 上游只会拒绝，且错误信息不会指向这个根因。
+    #[test]
+    fn exchange_client_id_matches_authorize_url_key() {
+        for variant in [TraeVariant::TraeWork, TraeVariant::Trae, TraeVariant::Global] {
+            let url = build_authorize_url(
+                variant,
+                &synthetic_identity(),
+                "m",
+                1,
+                "t",
+                "c",
+            );
+            let params = parse_query(url.split_once('?').unwrap().1);
+            let url_key = params.get("client_id").expect("授权 URL 必须带 client_id");
+            assert_eq!(
+                url_key.as_str(),
+                oauth_client().client_id_for(variant.oauth_line()),
+                "{variant:?}：授权 URL 的 client_id 与「按产品线取值」的入口不一致"
             );
         }
-        assert_eq!(
-            params.len(),
-            22,
-            "参数个数必须是 22（多一个少一个都会让授权页行为改变）: {:?}",
-            params.keys().collect::<Vec<_>>()
-        );
+    }
 
-        // 回调地址必须**编码**：不编码时 `http://` 里的 `:` `/` 会让上层解析错位。
-        assert!(
-            url.contains("auth_callback_url=http%3A%2F%2F127.0.0.1%3A12345%2Fauthorize"),
-            "回调地址未编码: {url}"
+    /// ★★ 授权页的**两个轴**不能混为一谈（本轮两个缺陷的判别式）。
+    ///
+    /// - **区域轴**决定**域**：`TraeWork`(CN) 与 `Global`(国际) 的域必须不同；
+    /// - **产品线轴**决定 `auth_from` / `client_id`：`TraeWork` 与 `Global` 同属
+    ///   SOLO 线 ⇒ 这两项**必须相同**；`Trae` 属 TRAE 线 ⇒ **必须不同**。
+    ///
+    /// 混轴的两种写法都曾真实发生过：域写死（区域轴漏了）、钥匙写死（产品线轴漏了）。
+    #[test]
+    fn authorize_url_splits_by_the_right_axis() {
+        let url_of = |variant| {
+            build_authorize_url(variant, &synthetic_identity(), "m", 1, "t", "c")
+        };
+        let key_of = |variant| {
+            let url = url_of(variant);
+            parse_query(url.split_once('?').unwrap().1)
+                .remove("client_id")
+                .expect("client_id 必须存在")
+        };
+
+        // 区域轴：域必须分家。
+        assert_ne!(
+            endpoints_for(TraeVariant::TraeWork).console_base,
+            endpoints_for(TraeVariant::Global).console_base,
+            "区域轴漏了：两条区域的授权页域撞了"
         );
-        assert!(!url.contains("auth_callback_url=http://"));
-        // `x_env=` 必须保留这一对（空值也要出现）。
-        assert!(url.contains("&x_env=&"), "x_env 空参数对丢失: {url}");
+        // 产品线轴：同线的两个区域取值必须相同，跨线必须不同。
+        assert_eq!(
+            key_of(TraeVariant::TraeWork),
+            key_of(TraeVariant::Global),
+            "TraeWork 与 国际版同属 SOLO 线，client_id 必须相同"
+        );
+        assert_ne!(
+            key_of(TraeVariant::TraeWork),
+            key_of(TraeVariant::Trae),
+            "产品线轴漏了：SOLO 线与 TRAE 线的 client_id 撞了"
+        );
     }
 
     #[test]
     fn callback_path_matches_authorize_url() {
         // 构造与解析必须共用同一个路径常量，否则浏览器跳回来接不住。
-        let url = build_authorize_url(&synthetic_identity(), "m", 1, "t", "c");
+        let url = build_authorize_url(
+            TraeVariant::TraeWork,
+            &synthetic_identity(),
+            "m",
+            1,
+            "t",
+            "c",
+        );
         assert!(url.contains(&format!("%2F{}", CALLBACK_PATH.trim_start_matches('/'))));
+    }
+
+    /// ★★ 授权页**域**必须随区域走（2026-09-21 修的真实缺陷）。
+    ///
+    /// 缺陷形态：域写死成 `https://www.trae.cn/authorization` 这一个常量，
+    /// 而 URL 的**其余部分**（参数、设备身份、回调地址）全都随变体走 ⇒
+    /// 只有「域」这一项没分家，国际版登录打开的是**国内版**授权页。
+    /// 后果不是「报错」而是「静默走错账号体系」：用户在 CN 页面上登录，
+    /// 即使走完也不会把凭据回调回国际版客户端，表现是永久停在「认证中」，
+    /// 与「回调端口没监听」症状几乎一样 —— 极易被误判成端口/防火墙问题。
+    ///
+    /// 依据（**国际版客户端自述**，不是推断）：本机 `%LOCALAPPDATA%\Programs\TRAE SOLO`
+    /// （`packageType = SOLO_I18N`）的 `product.json` → `bootConfig.consoleHost
+    /// = "https://www.trae.ai"`；客户端 `out/main.js` 的 OAuth 构造段取
+    /// `loginHost = bootConfig.consoleHost` 后拼 `/authorization?login_version=1…`。
+    /// CN 侧同源：`TRAE SOLO CN` 与 `Trae CN` 的 `bootConfig.consoleHost`
+    /// 都是 `https://www.trae.cn`（本机实测）。
+    ///
+    /// ⚠️ 本用例只覆盖**区域轴**；**产品线轴**（`auth_from` / `client_id`）由
+    /// [`authorize_url_splits_by_the_right_axis`] 与
+    /// [`authorize_url_carries_all_native_ide_params`] 覆盖 —— 两个轴要分开断言，
+    /// 合成一条会让「哪一轴漏了」变得不可判读。
+    #[test]
+    fn 授权页域随区域分家() {
+        let work = build_authorize_url(
+            TraeVariant::TraeWork,
+            &synthetic_identity(),
+            "m",
+            1,
+            "t",
+            "c",
+        );
+        let global = build_authorize_url(
+            TraeVariant::Global,
+            &synthetic_identity(),
+            "m",
+            1,
+            "t",
+            "c",
+        );
+
+        assert!(
+            work.starts_with("https://www.trae.cn/authorization?"),
+            "国内版授权页域漂了: {work}"
+        );
+        assert!(
+            global.starts_with("https://www.trae.ai/authorization?"),
+            "国际版授权页域漂了（必须用国际版客户端自述的 consoleHost）: {global}"
+        );
+
+        // 反例护栏：国际版 URL 里**任何位置**都不得出现国内域。
+        // 只比前缀不够 —— 域可能出现在别处（例如某天有人把 console_base 塞进查询串）。
+        assert!(
+            !global.contains("trae.cn"),
+            "国际版授权 URL 里出现了国内域: {global}"
+        );
+        assert!(
+            !work.contains("trae.ai"),
+            "国内版授权 URL 里出现了国际域: {work}"
+        );
+
+        // 两个区域的 URL 必须**只**在域上不同：其余 22 参数逐字相同。
+        // 这条钉住「域分家」没有顺带改坏参数（参数是抓包固化值，改了就登录不上）。
+        let strip = |url: &str| url.split_once('?').unwrap().1.to_string();
+        assert_eq!(
+            strip(&work),
+            strip(&global),
+            "两个区域的授权 URL 除域之外还出现了差异（参数是固化值，不能按区域改）"
+        );
     }
 
     /// ★ 同源护栏（T4 验收 1b）：授权 URL 的 `device_id` / `x_device_id`
@@ -1565,7 +1922,14 @@ mod tests {
     #[test]
     fn authorize_url_device_id_is_same_source_as_identity() {
         let identity = identity_with_device_id("2292929806738024");
-        let url = build_authorize_url(&identity, "machine-xyz", 17388, "trace-1", "chal-1");
+        let url = build_authorize_url(
+            TraeVariant::TraeWork,
+            &identity,
+            "machine-xyz",
+            17388,
+            "trace-1",
+            "chal-1",
+        );
         let params = parse_query(url.split_once('?').unwrap().1);
 
         assert_eq!(
@@ -2587,6 +2951,30 @@ mod tests {
         .await;
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
 
+        // ★ 浏览器那一页必须是**渲染得出来的结果卡片**，而不是纯文本。
+        // 纯文本（`text/plain`）会被浏览器当正文渲染成左上角一行小字，
+        // 用户看不出这是登录流程的一部分还是页面坏了。
+        assert!(
+            response.contains("Content-Type: text/html; charset=utf-8"),
+            "回调结果页必须回 text/html，否则卡片布局不生效: {response}"
+        );
+        assert!(response.contains("<!DOCTYPE html>"), "{response}");
+        assert!(response.contains("登录成功"), "{response}");
+        // 落库区域必须写在页面上（持久化轴是区域，不是程序名）。
+        assert!(
+            response.contains("国内版"),
+            "结果页必须点明账号落在哪个区域库: {response}"
+        );
+        // ★ 结果页**不得**出现凭据（本链路不变式：回调响应体不含凭据）。
+        assert!(
+            !response.contains(&jwt),
+            "回调响应体泄漏了 JWT: {response}"
+        );
+        assert!(
+            !response.contains("authCodeInfo") && !response.contains("refreshToken"),
+            "回调响应体出现了凭据标记: {response}"
+        );
+
         // 必须在很短时间内进入终态（不是空等到 300 秒超时）。
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
@@ -2612,6 +3000,165 @@ mod tests {
         // 账号必须落进 **Trae Work** 的库。
         assert_eq!(account::entries_for(TraeVariant::TraeWork).len(), 1);
         assert!(account::entries_for(TraeVariant::Global).is_empty());
+    }
+
+    /// ★ 兑换失败时，浏览器那一页**不能说「登录成功」**。
+    ///
+    /// 这是本次改造修掉的真实缺陷形态：结果页原先在兑换**之前**就回掉了，
+    /// 于是只要回调带着凭据到达，页面一律显示「登录成功，可以关闭本页并返回应用」——
+    /// 哪怕紧随其后的 ExchangeToken 直接失败、账号根本没落库。
+    /// 用户此刻正盯着那一页，只会以为账号已经加好了。
+    ///
+    /// 反向验证：把结果页改回「兑换前先回成功页」，本用例的
+    /// `!response.contains("登录成功")` 必须失败。
+    #[tokio::test]
+    async fn failed_exchange_renders_failure_page_not_success_page() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let _gate = lock_the_callback_port();
+        let _env = temp_env();
+        // 三个交换变体全都会拿到这个 body：既无 Token 也无 RefreshToken ⇒ 全部失败。
+        let (mock_port, _captured) = mock_upstream(3, json!({"Result": {}}).to_string()).await;
+
+        let started = login_start_for(TraeVariant::TraeWork)
+            .await
+            .expect("发起登录不应失败");
+        let login_id = started["loginId"].as_str().unwrap().to_string();
+        let port = started["port"].as_u64().unwrap() as u16;
+        let uri = started["verificationUri"].as_str().unwrap();
+        let trace = parse_query(uri.split_once('?').unwrap().1)
+            .get("login_trace_id")
+            .cloned()
+            .expect("授权 URL 必须带 login_trace_id");
+
+        let target = format!(
+            "/authorize?code=ac-1&loginTraceID={trace}&host=http%3A%2F%2F127.0.0.1%3A{mock_port}"
+        );
+        let request =
+            format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("应能连上回调端口");
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(10),
+            stream.read_to_string(&mut response),
+        )
+        .await;
+
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(
+            response.contains("Content-Type: text/html; charset=utf-8"),
+            "{response}"
+        );
+        assert!(
+            response.contains("登录失败"),
+            "兑换失败必须渲染失败页: {response}"
+        );
+        assert!(
+            !response.contains("登录成功"),
+            "★ 兑换失败却在页面上说「登录成功」= 页面在骗用户: {response}"
+        );
+
+        // 会话同样必须收尾（页面与前端轮询两条路都要给出失败）。
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let polled = login_poll(&login_id);
+            if polled.get("done").and_then(|v| v.as_bool()) == Some(true) {
+                assert!(polled.get("error").is_some(), "{polled}");
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "兑换失败没有收尾: {polled}");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// ★ 成功页取名与落库区域：昵称 → userId → 占位，且区域按**持久化轴**取。
+    ///
+    /// 纯函数，不碰端口与 home（避免 lib 单测并行时的进程级环境串味）。
+    #[test]
+    fn success_page_prefers_name_then_user_id_and_uses_persistence_region() {        let named = success_page(
+            &json!({"name": "小明", "userId": "u-1"}),
+            TraeVariant::TraeWork,
+        );
+        assert!(named.contains("账号 [小明] 登录成功"), "{named}");
+        // TraeWork 的持久化区域是**国内版**（与 Trae 共用一本库）。
+        assert!(named.contains("国内版"), "{named}");
+
+        // 上游没给昵称时退回 userId —— 与前端 `result.name || result.userId` 同款。
+        let unnamed = success_page(&json!({"name": "", "userId": "u-1"}), TraeVariant::TraeWork);
+        assert!(unnamed.contains("账号 [u-1] 登录成功"), "{unnamed}");
+
+        let empty = success_page(&json!({}), TraeVariant::Global);
+        assert!(empty.contains("未知账号"), "{empty}");
+        assert!(empty.contains("国际版"), "{empty}");
+    }
+
+    /// ★★ `Content-Length` 必须是**字节数**，否则浏览器按声明长度**截断**结果页。
+    ///
+    /// 为什么必须单测：结果页正文全是中文（一个汉字 3 字节），写成字符数会让卡片
+    /// **只渲染一半**，而服务端一切正常。集成测试用 `read_to_string` 读到 EOF，
+    /// **抓不到长度声明错误**（连接关了，它不看 Content-Length）——只有真浏览器会暴露。
+    ///
+    /// 反向验证：把 `body.len()` 改成 `body.chars().count()`，本用例必须红。
+    #[test]
+    fn content_length_is_byte_count_not_char_count() {
+        let body = "账号 [小明] 登录成功";
+        let response = build_response("text/html; charset=utf-8", body, "GET");
+
+        let declared: usize = response
+            .lines()
+            .find_map(|line| line.strip_prefix("Content-Length: "))
+            .expect("响应必须带 Content-Length")
+            .trim()
+            .parse()
+            .expect("Content-Length 必须是数字");
+
+        assert_eq!(
+            declared,
+            body.as_bytes().len(),
+            "Content-Length 声明 {declared} 与正文字节数 {} 不符（写成字符数了？）",
+            body.as_bytes().len()
+        );
+        assert_ne!(
+            declared,
+            body.chars().count(),
+            "正文含多字节字符，字符数与字节数不该相等——本用例失去了鉴别力"
+        );
+        // 报文里正文必须完整（长度声明对了，正文被拼丢了同样白搭）。
+        assert!(response.ends_with(body), "{response}");
+    }
+
+    /// `OPTIONS` 预检：204、空正文、长度 0，且 CORS 头照旧。
+    #[test]
+    fn options_preflight_response_has_no_body() {
+        let response = build_response("text/html; charset=utf-8", "<html>不该出现</html>", "OPTIONS");
+        assert!(response.starts_with("HTTP/1.1 204 No Content"), "{response}");
+        assert!(response.contains("Content-Length: 0"), "{response}");
+        assert!(!response.contains("不该出现"), "204 不该带正文: {response}");
+        assert!(
+            response.to_ascii_lowercase().contains("access-control-allow-origin"),
+            "预检同样需要 CORS 头: {response}"
+        );
+    }
+
+    /// 结果页响应必须同时具备：`text/html`、`no-store`、CORS（探测与结果页共用组装）。
+    #[test]
+    fn html_response_declares_html_type_and_forbids_caching() {
+        let response = build_response("text/html; charset=utf-8", "<html></html>", "GET");
+        assert!(
+            response.contains("Content-Type: text/html; charset=utf-8"),
+            "{response}"
+        );
+        assert!(
+            response.to_ascii_lowercase().contains("cache-control: no-store"),
+            "结果页含账号昵称且 URL 一次性，不该被缓存: {response}"
+        );
+        assert!(
+            response.to_ascii_lowercase().contains("access-control-allow-origin"),
+            "{response}"
+        );
     }
 
     /// ★ `error=` 回调必须**立刻**收尾（且优先于探测判定）。

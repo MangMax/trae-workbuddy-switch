@@ -25,7 +25,7 @@ use crate::modules::trae::store;
 use crate::modules::trae::variant::TraeVariant;
 use crate::modules::trae::{
     device, TRAE_EXCHANGE_TOKEN_LEGACY_PATH, TRAE_EXCHANGE_TOKEN_PATH, TRAE_OAUTH_APP_ID,
-    TRAE_OAUTH_CLIENT_ID, TRAE_PAGE_PLATFORM_CODE,
+    TRAE_PAGE_PLATFORM_CODE,
 };
 
 /// 账号库中的一条账号记录（持久化形态，键名与参考实现一致）。
@@ -334,32 +334,18 @@ pub fn list_account_views_for(variant: TraeVariant) -> Vec<Value> {
     let device_map = device::load_map_for(variant);
     let remaining = crate::modules::trae::credits::load_remaining_for(variant);
     let cooldowns: CooldownsFile = store::read_json(&paths::cooldowns_file_for(variant));
-    let summary: crate::modules::trae::credits::CheckinSummary =
-        store::read_json(&paths::checkin_summary_file_for(variant));
 
-    // 摘要必须是「今天」的，否则昨天的签到结果会被展示成今天已签到。
-    let today = store::today();
-    let summary_is_today = summary
-        .time
-        .as_ref()
-        .map(|time| time.starts_with(&today))
-        .unwrap_or(false);
-    let checked_names: std::collections::HashSet<String> = if summary_is_today {
-        summary
-            .results
-            .iter()
-            .filter(|result| {
-                let ok = result.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
-                let action = result.get("action").and_then(|v| v.as_str()).unwrap_or("");
-                // 成功，或「已签到」这类非失败动作，都算今日已签到。
-                ok || (!action.is_empty() && action != "fail")
-            })
-            .filter_map(|result| result.get("name").and_then(|v| v.as_str()))
-            .map(|name| name.to_string())
-            .collect()
-    } else {
-        std::collections::HashSet::new()
-    };
+    // 「今日已签到」的**唯一来源**是当日台账（跨运行累积、按 userId 记），并兜上当日积分明细
+    // （升级当天台账还是空的，见 `credits::checked_in_today_for` 的两条理由）。
+    //
+    // 曾经这里读的是 `checkin_summary.json`（最近一次运行的结果）并按 `name` 匹配，
+    // 两个缺陷叠在一起：
+    //   ① 摘要每轮整体覆盖 ⇒ 上一轮签过、本轮因 `skip_checked_in` 未被处理的账号
+    //      会丢掉标记。实测：Jackey 已 claim 成功（`credits_history` 有 delta=150），
+    //      却因为随后一轮只处理了 JackDev 而显示「未签到」；
+    //   ② 用显示名做键 ⇒ 同名账号互相冒充。
+    let checked_user_ids: std::collections::HashSet<String> =
+        crate::modules::trae::credits::checked_in_today_for(variant);
 
     let credits_history = crate::modules::trae::credits::load_history_for(variant);
 
@@ -399,7 +385,7 @@ pub fn list_account_views_for(variant: TraeVariant) -> Vec<Value> {
                 remaining.credits.get(&uid).copied(),
                 remaining.expire_times.get(&uid).copied(),
                 cooldowns.cooldowns.get(&uid),
-                checked_names.contains(&account.name),
+                checked_user_ids.contains(&uid),
                 latest_credits,
             ))
         })
@@ -1097,12 +1083,12 @@ pub(crate) async fn exchange_token_for(
         .as_ref()
         .map(|credential| credential.device_id.clone());
 
-    let variants = build_refresh_variants(
-        variant,
-        TRAE_OAUTH_CLIENT_ID,
-        refresh_token,
-        credential.as_ref(),
-    );
+    // ★ `ClientID` 按**产品线**取（SOLO 与 TRAE 各有独立的一把钥匙，见
+    // `OAuthLine::default_client_id`）。它与授权 URL / AuthCode 交换用的是同一个
+    // 取值函数 —— 三处必须同源，否则等于拿 A 线的钥匙兑 B 线的 token。
+    let client_id = crate::modules::trae::oauth_client::oauth_client()
+        .client_id_for(variant.oauth_line());
+    let variants = build_refresh_variants(variant, client_id, refresh_token, credential.as_ref());
 
     let mut errors: Vec<String> = Vec::new();
     let mut last_error: Option<RefreshExchangeError> = None;
@@ -1749,6 +1735,87 @@ mod tests {
         assert_eq!(view.get("deviceIdMasked").unwrap().as_str(), Some("1234…2345"));
         // 无 JWT 时必须给出 unknown 而不是崩溃
         assert_eq!(view.get("jwtStatus").unwrap().as_str(), Some("unknown"));
+    }
+
+    /// ★ 回归：`checkedToday` 必须取自**当日台账**，不能取自「最近一次签到摘要」。
+    ///
+    /// 现场（2026-09-21 用户报障「多账号签到只有一个显示成功」）：
+    /// Jackey 15:03:57 claim 成功（`credits_history` 里确有 delta=150），
+    /// 紧接着 15:04:36 那一轮只处理了 JackDev（摘要被整体覆盖成只含 JackDev），
+    /// 旧实现按 `name` 匹配摘要 ⇒ Jackey 的徽章翻回「未签到」，
+    /// 且下一轮 `skip_checked_in` 会把已经签过的账号再探一遍。
+    #[test]
+    fn checked_today_comes_from_the_ledger_not_the_last_run_summary() {
+        let _env = crate::modules::trae::test_support::TempEnv::empty();
+        let variant = TraeVariant::default();
+        let jack_dev = "3604620555324748";
+        let jackey = "1189017012674171";
+
+        let mut file = load_accounts_for(variant);
+        file.accounts.push(raw(jack_dev, "JackDev"));
+        file.accounts.push(raw(jackey, "Jackey"));
+        save_accounts_for(variant, &file).expect("造账号库");
+
+        // 今天两个账号都签过 ⇒ 台账两条（跨运行累积）。
+        crate::modules::trae::credits::mark_checked_in_for(variant, jack_dev).unwrap();
+        crate::modules::trae::credits::mark_checked_in_for(variant, jackey).unwrap();
+        // 而「最近一次摘要」只含最后一轮处理过的 JackDev —— 旧实现唯一的数据源。
+        crate::modules::trae::credits::save_summary_for(
+            variant,
+            &crate::modules::trae::credits::CheckinSummary {
+                time: Some(store::now_iso()),
+                results: vec![json!({
+                    "name": "JackDev",
+                    "userId": jack_dev,
+                    "ok": true,
+                    "action": "skip_already",
+                })],
+                already: 1,
+                ..Default::default()
+            },
+        )
+        .expect("造摘要");
+
+        let views = list_account_views_for(variant);
+        let checked = |uid: &str| {
+            views
+                .iter()
+                .find(|view| view.get("userId").and_then(Value::as_str) == Some(uid))
+                .and_then(|view| view.get("checkedToday").and_then(Value::as_bool))
+                .unwrap_or(false)
+        };
+        assert!(checked(jack_dev), "JackDev 在台账里 ⇒ 已签到");
+        assert!(
+            checked(jackey),
+            "Jackey 今天已 claim 成功（摘要里没有它，但台账里有）⇒ 必须仍是已签到"
+        );
+    }
+
+    /// 台账按 `userId` 记 ⇒ **同名**账号不会互相冒充（旧实现按 `name` 匹配摘要）。
+    #[test]
+    fn checked_today_is_keyed_by_user_id_not_display_name() {
+        let _env = crate::modules::trae::test_support::TempEnv::empty();
+        let variant = TraeVariant::default();
+        let checked_uid = "1111111111111111";
+        let unchecked_uid = "2222222222222222";
+
+        let mut file = load_accounts_for(variant);
+        file.accounts.push(raw(checked_uid, "同名"));
+        file.accounts.push(raw(unchecked_uid, "同名"));
+        save_accounts_for(variant, &file).expect("造账号库");
+
+        crate::modules::trae::credits::mark_checked_in_for(variant, checked_uid).unwrap();
+
+        let views = list_account_views_for(variant);
+        let checked = |uid: &str| {
+            views
+                .iter()
+                .find(|view| view.get("userId").and_then(Value::as_str) == Some(uid))
+                .and_then(|view| view.get("checkedToday").and_then(Value::as_bool))
+                .unwrap_or(false)
+        };
+        assert!(checked(checked_uid), "签过的那个必须已签到");
+        assert!(!checked(unchecked_uid), "同名的另一个不得被冒充成已签到");
     }
 
     #[test]

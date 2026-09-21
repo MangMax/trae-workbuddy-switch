@@ -369,5 +369,12 @@ mod tests {
         assert_eq!(global.account_base, "https://grow-normal.trae.ai");
         assert_eq!(global.icube_base, "https://icube-normal.trae.ai");
         assert_ne!(global.account_base, cn.account_base);
+
+        // 授权页域（`bootConfig.consoleHost`）同样按区域分家 —— 它不是 API 域，
+        // 但漏了分家的后果更隐蔽：国际版用户在**国内**授权页上登录，
+        // 页面走完也不回调，症状与「回调端口没监听」几乎一样。
+        assert_eq!(cn.console_base, "https://www.trae.cn");
+        assert_eq!(global.console_base, "https://www.trae.ai");
+        assert_ne!(global.console_base, cn.console_base);
     }
 }

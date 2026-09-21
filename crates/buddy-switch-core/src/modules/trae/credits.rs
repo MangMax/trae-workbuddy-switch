@@ -472,6 +472,26 @@ pub struct CheckinSummary {
     pub warnings: Vec<String>,
 }
 
+/// 今日已签到台账（跨运行累积，按 `userId`）。
+///
+/// **为什么必须是独立的一份文件**：`CheckinSummary` 记录的是「**最近一次运行**
+/// 处理了哪些账号」，每轮整体覆盖。而「今日已签到」是**跨运行累积、按账号**的事实
+/// —— 打开 `skip_checked_in` 时，一轮只会处理「本轮还没签过的账号」，
+/// 用摘要兼作台账会让上一轮签过的账号在下一轮丢掉标记（徽章显示「未签到」，
+/// 且下一轮又把它重新探测一遍）。
+///
+/// 键必须是 `userId` 而不是显示名：显示名可重复、可修改，用它做键会让两个同名账号
+/// 互相冒充（曾经的实现正是按 `name` 匹配摘要）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CheckinLedger {
+    /// 台账归属日（本地时区 `YYYY-MM-DD`）。
+    #[serde(default)]
+    pub date: String,
+    /// 该日已签到的 `userId`（`claim_ok` 与 `skip_already` 都计入）。
+    #[serde(default)]
+    pub checked_in: Vec<String>,
+}
+
 // ---------------------------------------------------------------------------
 // 读写
 // ---------------------------------------------------------------------------
@@ -547,6 +567,69 @@ pub fn save_summary(summary: &CheckinSummary) -> Result<(), String> {
 /// 写入签到摘要（按变体分家）。
 pub fn save_summary_for(variant: TraeVariant, summary: &CheckinSummary) -> Result<(), String> {
     store::write_json(&paths::checkin_summary_file_for(variant), summary)
+}
+
+/// 读取今日已签到台账（默认变体，兼容壳）。
+pub fn load_ledger() -> CheckinLedger {
+    load_ledger_for(TraeVariant::default())
+}
+
+/// 读取今日已签到台账（按变体分家）。
+///
+/// **跨日即视为空**：台账只对当天有意义，日期不符时返回空台账。读路径**不写盘**
+/// （不产生副作用），下一次 [`mark_checked_in_for`] 会以新日期重建。
+/// 判据与 `list_account_views_for` 里「摘要必须是今天的」一致，都用 [`store::today`]。
+pub fn load_ledger_for(variant: TraeVariant) -> CheckinLedger {
+    let ledger: CheckinLedger = store::read_json(&paths::checkin_ledger_file_for(variant));
+    if ledger.date == store::today() {
+        ledger
+    } else {
+        CheckinLedger::default()
+    }
+}
+
+/// 记一笔「今日已签到」（默认变体，兼容壳）。
+pub fn mark_checked_in(user_id: &str) -> Result<(), String> {
+    mark_checked_in_for(TraeVariant::default(), user_id)
+}
+
+/// 记一笔「今日已签到」（按变体分家）。
+///
+/// 幂等（同账号重复标记不产生重复项）。**每次调用都重读整份台账**，而不是由调用方
+/// 持一份集合在收尾时统一落盘：这样「一轮签了 3 个账号」与「分 3 次调用」落盘结果
+/// 一致，中途失败时已成功的那几笔不会一起丢。
+pub fn mark_checked_in_for(variant: TraeVariant, user_id: &str) -> Result<(), String> {
+    let mut ledger = load_ledger_for(variant);
+    ledger.date = store::today();
+    if !ledger.checked_in.iter().any(|uid| uid == user_id) {
+        ledger.checked_in.push(user_id.to_string());
+    }
+    store::write_json(&paths::checkin_ledger_file_for(variant), &ledger)
+}
+
+/// 「今日已签到」的 `userId` 集合 = **台账 ∪ 当日积分明细**。
+///
+/// 台账是主来源（见 [`CheckinLedger`]）；并上 [`load_history_for`] 里的当日记录，理由有两条：
+///
+/// 1. **升级零回归**：台账是后加的文件，用户升级当天「今天已经签过」的账号不在台账里，
+///    只读台账会让它们的徽章在下一轮签到前错误地显示「未签到」——正是本次要修的那个症状；
+/// 2. **兜底**：进程若在 claim 成功之后、落账之前被杀，明细里那条记录仍能证明签过。
+///
+/// 之所以敢用明细当依据：它**只增不改**，且只有**成功**路径会写
+/// （`claim_ok` 写 `delta=credits`、`skip_already` 写 `delta=0`，见 `checkin::run_checkin`），
+/// 因此「今天有记录」等价于「今天签过」。失败路径只写冷却，不写明细。
+pub fn checked_in_today_for(variant: TraeVariant) -> std::collections::HashSet<String> {
+    let today = store::today();
+    let mut checked: std::collections::HashSet<String> = load_ledger_for(variant)
+        .checked_in
+        .into_iter()
+        .collect();
+    for record in load_history_for(variant).records {
+        if record.date == today {
+            checked.insert(record.user_id);
+        }
+    }
+    checked
 }
 
 /// 追加一条签到积分明细（默认变体，兼容壳）。
@@ -1257,5 +1340,73 @@ mod tests {
             market_client_id().trim_start_matches("VSCode "),
             TRAE_VSCODE_VERSION
         );
+    }
+
+    /// 台账：跨运行累积、幂等、跨日重置。
+    ///
+    /// 「跨运行累积」是本文件存在的**唯一理由**（摘要每轮被覆盖，见 `CheckinLedger`
+    /// 的文档）；「跨日重置」防止昨天的已签到被当成今天。
+    #[test]
+    fn checkin_ledger_accumulates_across_runs_and_resets_across_days() {
+        let _env = crate::modules::trae::test_support::TempEnv::with_device_fixture();
+        let variant = TraeVariant::default();
+
+        mark_checked_in_for(variant, "u1").unwrap();
+        mark_checked_in_for(variant, "u2").unwrap();
+        // 幂等：同一账号在同一轮里被标记两次（如 claim 成功后又补记）不产生重复项。
+        mark_checked_in_for(variant, "u1").unwrap();
+        assert_eq!(
+            load_ledger_for(variant).checked_in,
+            vec!["u1".to_string(), "u2".to_string()],
+            "台账必须跨调用累积且去重"
+        );
+
+        // 跨日：把落盘日期改成过去 ⇒ 读出来是空台账，且**读路径不写盘**。
+        let path = paths::checkin_ledger_file_for(variant);
+        let mut stale: CheckinLedger = store::read_json(&path);
+        stale.date = "2000-01-01".to_string();
+        store::write_json(&path, &stale).unwrap();
+        assert!(
+            load_ledger_for(variant).checked_in.is_empty(),
+            "过期台账不得参与判定"
+        );
+        let on_disk: CheckinLedger = store::read_json(&path);
+        assert_eq!(on_disk.date, "2000-01-01", "读路径不得顺手清盘");
+
+        // 再标记一次：以今天重建，且**不含**昨天的条目。
+        mark_checked_in_for(variant, "u3").unwrap();
+        let rebuilt = load_ledger_for(variant);
+        assert_eq!(rebuilt.date, store::today());
+        assert_eq!(rebuilt.checked_in, vec!["u3".to_string()]);
+    }
+
+    /// `checked_in_today_for` 必须把**当日积分明细**并进来 —— 升级当天台账还是空的，
+    /// 只读台账会让「今天已经签过」的账号错误地显示「未签到」（正是本次要修的症状）。
+    #[test]
+    fn checked_in_today_unions_ledger_with_today_history() {
+        let _env = crate::modules::trae::test_support::TempEnv::with_device_fixture();
+        let variant = TraeVariant::default();
+
+        // 只有明细（模拟升级前签过、台账还没建立）。
+        append_history_for(variant, "u-history", 150, 150).unwrap();
+        // 只有台账（模拟 claim 成功但预检没给出额度、明细因此没写）。
+        mark_checked_in_for(variant, "u-ledger").unwrap();
+        // 昨天的明细不得计入今天。
+        let mut history = load_history_for(variant);
+        history.records.push(CreditRecord {
+            date: "2000-01-01".into(),
+            user_id: "u-yesterday".into(),
+            credits: 100,
+            delta: 100,
+        });
+        store::write_json(&paths::credits_history_file_for(variant), &history).unwrap();
+
+        let checked = checked_in_today_for(variant);
+        assert!(
+            checked.contains("u-history"),
+            "当日明细里的账号必须算已签到（升级当天台账为空）"
+        );
+        assert!(checked.contains("u-ledger"), "台账里的账号必须算已签到");
+        assert!(!checked.contains("u-yesterday"), "昨天的明细不得算进今天");
     }
 }

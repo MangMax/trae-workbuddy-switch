@@ -100,6 +100,8 @@ pub mod jwt;
 pub mod logs;
 pub mod oauth;
 pub mod oauth_client;
+/// OAuth 回调结果页（浏览器里那一页的 HTML 渲染，见模块头）。
+pub mod oauth_result_page;
 pub mod paths;
 pub mod platform;
 pub mod profile;
@@ -161,11 +163,20 @@ pub const TRAE_EXCHANGE_TOKEN_PATH: &str = "/trae/api/v3/oauth/ExchangeToken";
 pub const TRAE_EXCHANGE_TOKEN_LEGACY_PATH: &str =
     "/cloudide/api/v3/trae/oauth/ExchangeToken";
 
-/// ExchangeToken 的公开 ClientID（抓包固化 2026-09-16，非机密）。
+/// **TRAE / IDE 产品线**的公开 ClientID（抓包固化 2026-09-16，非机密）。
 ///
-/// 旧值 `en1oxy7wnw8j9n` 会让授权页停在 billing status 后不回跳，已废弃。
-/// 出处：`reference/TraeWorkAssistant-main/src-tauri/src/commands/oauth.rs:22`。
-pub const TRAE_OAUTH_CLIENT_ID: &str = "ono9krqynydwx5";
+/// ⚠️ **这不是"唯一的 client_id"**：它只是 [`variant::OAuthLine::Trae`] 那条线的值。
+/// 另一条线（SOLO / TraeWork）用的是 `en1oxy7wnw8j9n` —— 客户端 `product.json` 的
+/// `iCubeApp.authConfig` 里两条线各有独立的一把钥匙，`auth_from` 也随线而变
+/// （`trae` / `solo`）。**按线取值的正确入口是
+/// [`oauth_client::OAuthClientConfig::client_id_for`]`(variant.oauth_line())`**。
+///
+/// 本常量是 [`variant::OAuthLine::default_client_id`] 的**具名别名**（单点定义在那边，
+/// 这里不再写第二份字面量）。参考实现把它标为「真实 Trae **IDE** 登录 URL 实证值」，
+/// 并记着「旧值 `en1oxy7wnw8j9n` 会让授权页停在 billing status 后不回跳」——
+/// 那条观察是在 **IDE** 语境下的，**不能**推广成「SOLO 线也不能用 SOLO 的值」。
+/// 出处：`reference/TraeWorkAssistant-main/src-tauri/src/commands/oauth.rs:20-23`。
+pub const TRAE_OAUTH_CLIENT_ID: &str = variant::OAuthLine::Trae.default_client_id();
 
 /// 授权页 `plugin_version` 参数（抓包固化 2026-09-16）。
 ///

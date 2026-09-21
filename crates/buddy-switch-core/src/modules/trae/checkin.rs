@@ -460,6 +460,9 @@ where
                 let _ = credits::append_history_for(variant, uid, credits_value, 0);
             }
             report.already += 1;
+            // 记台账：上游已经签过，也算「今日已签到」——下一轮 `skip_checked_in`
+            // 应当跳过它，而不是再探一次。
+            let _ = credits::mark_checked_in_for(variant, uid);
             on_event(&json!({
                 "type": "account",
                 "index": index + 1,
@@ -504,6 +507,10 @@ where
 
         if result.ok {
             credits::clear_cooldown_for(variant, uid).ok();
+            // 记台账（与积分是否已知无关）：`probe.credits` 缺失时不会写积分明细，
+            // 但「今天这个账号签过了」是确定的事实，必须落账，否则它会在下一轮
+            // 被 `skip_checked_in` 漏掉、重复发一次 claim。
+            credits::mark_checked_in_for(variant, uid).ok();
             // 预检返回的 credits 就是本次签到可得的额度，无需再次请求状态接口算差值。
             if let Some(credits_value) = probe.credits {
                 outcome.credits = Some(credits_value);
@@ -541,7 +548,10 @@ where
         report.results.push(outcome);
     }
 
-    // 落盘摘要（供账号视图判定「今日已签到」与设置页展示最近一次结果）。
+    // 落盘摘要（**仅**供设置页展示最近一次运行的结果）。
+    //
+    // ⚠️ 不要再用摘要去判定「今日已签到」：它每轮整体覆盖，只包含本轮处理过的账号。
+    // 那个判定由 `credits::checked_in_today_for`（台账 ∪ 当日积分明细）负责。
     let summary = credits::CheckinSummary {
         time: Some(store::now_iso()),
         results: report.results.iter().map(outcome_json).collect(),

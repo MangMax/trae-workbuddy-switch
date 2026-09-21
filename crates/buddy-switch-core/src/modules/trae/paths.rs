@@ -31,6 +31,7 @@
 //! ├── remaining_credits(.trae_cn).json # 剩余积分与到期时间缓存
 //! ├── account_cooldowns(.trae_cn).json # 签到错误冷却状态
 //! ├── checkin_summary(.trae_cn).json   # 最近一次签到摘要
+//! ├── checkin_ledger(.trae_cn).json    # 今日已签到台账（跨运行累积，按 userId）
 //! ├── api_pool.json                    # API 网关账号池配置（按变体分目录，见下）
 //! ├── profiles/<user_id>/              # 登录态快照（精准复制的 9 类核心文件）
 //! └── logs/                            # app / checkin / switcher / proxy 日志
@@ -365,6 +366,25 @@ pub fn checkin_summary_file_for(variant: TraeVariant) -> PathBuf {
     scoped_file("checkin_summary.json", variant)
 }
 
+/// 今日已签到台账文件（默认变体，兼容壳）。
+pub fn checkin_ledger_file() -> PathBuf {
+    checkin_ledger_file_for(TraeVariant::default())
+}
+
+/// 今日已签到台账文件（按变体分家）。
+///
+/// **与 [`checkin_summary_file_for`] 是两份不同的文件，不要合并**：
+/// - `checkin_summary` 是「**最近一次运行**的结果」，每轮整体覆盖，供界面展示；
+/// - `checkin_ledger` 是「**今天哪些账号已经签到了**」，跨运行累积、按 `userId` 记，
+///   供 `skip_checked_in` 与账号卡的「已签到」徽章判定。
+///
+/// 曾经用前者兼作后者的数据源（按 `name` 匹配），后果是：一轮只处理部分账号时
+/// 摘要被覆盖 ⇒ 上一轮签过的账号**丢掉**已签到标记，徽章显示错、下一轮还会重复
+/// 探测同一个账号。见 [`super::credits::CheckinLedger`]。
+pub fn checkin_ledger_file_for(variant: TraeVariant) -> PathBuf {
+    scoped_file("checkin_ledger.json", variant)
+}
+
 /// API 网关账号池配置文件。
 ///
 /// **刻意不分变体**：网关是单一进程、单一监听端口（7864），一次只能服务一个账号池。
@@ -616,7 +636,18 @@ mod tests {
     /// 后果是「Trae CN 的签到把账号灌进 Trae Work 的库」这类静默污染。
     #[test]
     fn 两条产品线的数据文件互不相同() {
+        // 同 [`Self::两个区域的数据文件互不相同`]：下面每一对都各自**独立**读取进程级
+        // `BUDDY_SWITCH_HOME`，并发用例中途换 home 会让两侧取到不同根目录 ⇒ 整段持 env 锁。
+        let _lock = crate::modules::config::env_lock();
+
         let work = TraeVariant::TraeWork;
+        // ⚠️ 这里刻意是 **Global** 而不是 `Trae`：账号库/签到等**数据文件按区域分家**，同一区域内
+        //   两条程序（TraeWork / TraeCode）**刻意共用同一套账号**
+        //   （`scoped_file(name, variant)` → `variant.region()`，见本文件顶部「为什么账号库按区域
+        //   分家而不是按程序分家」）。⇒ 若把这里改成 `TraeVariant::Trae`，本用例会**立刻红**
+        //   （左右同为 `checkin_accounts.json`）—— 那不是缺陷，是设计。
+        //   TODO(口径): 本用例名与文档仍写「两条产品线 / 右边是 Trae」，与代码和实际语义不符，
+        //   见 2026-09-21 日志；改名/改写前**别**动这个 `Global`。
         let cn = TraeVariant::Global;
 
         // 逐个函数族对拍：左边是 TraeWork，右边是 Trae。
@@ -859,6 +890,14 @@ mod tests {
     /// 灌进国内版的库」这类静默污染（两套账号体系互不相通，混库后必然对不上）。
     #[test]
     fn 两个区域的数据文件互不相同() {
+        // 本用例要断言「同一函数族返回的路径彼此一致」，而它们各自**独立**读取
+        // 进程级的 `BUDDY_SWITCH_HOME`。lib 单测在**同一进程里并行跑**，若有并发用例
+        // 在中途换掉 home，同一条 `assert_eq!` 的两侧就会取到不同根目录
+        // （现场：左侧真实 home、右侧 Temp home ⇒ 单跑必绿、全量才红的假失败）。
+        // 与 `trae_files_do_not_collide_with_workbuddy_files` 同法：持 env 锁，
+        // 让本用例与所有改 home 的测试互斥。
+        let _lock = crate::modules::config::env_lock();
+
         let cn = TraeRegion::Cn;
         let global = TraeRegion::Global;
         let pairs: [(&str, PathBuf, PathBuf); 9] = [
