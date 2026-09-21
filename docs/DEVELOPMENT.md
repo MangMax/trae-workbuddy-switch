@@ -26,14 +26,26 @@ npm run build:app:release  # 构建 release .app + 签名更新包
 
 ### npm 版（webui）发布
 
-1. 编译 server 二进制并上传 GitHub Release（`.github/workflows/build.yml` 自动执行）
-2. 先 `sh scripts/gen-platform-packages.sh <版本>` 生成 5 个平台包（`buddy-switch-<platform>-<arch>`），把对应二进制放进各包 `bin/` 后逐个 `npm publish`
-3. `cd npm && npm publish`（主包名 `buddy-switch`，`postinstall` 从已安装的平台包复制二进制）
+主包与平台分包统一在 **`@nextagentx` scope** 下：主包 `@nextagentx/buddy-switch`，
+平台包 `@nextagentx/buddy-switch-<platform>-<arch>`（**目录名不带 scope**，
+仍是 `npm/platform/buddy-switch-<tag>`，`build.yml` 的 `PKG_DIR` 与生成脚本都按目录名拼路径）。
+安装后的**命令名仍是 `buddy-switch`**（`bin` 字段决定，与包名无关）。
 
-> ⚠️ **发布前先确认包名可用**：截至 2026-09-21，`buddy-switch` 在 npm 上**已被他人占用**
-> （`0.1.2`，描述 "Customize your Claude Code buddy pet"，维护者 `zjding`），直接 `npm publish` 会 403，
-> 而 `npm i -g buddy-switch` 会装上别人的包。需要用别的名字（例如 scope 包）或保留旧名
-> `workbuddy-switch`（该名字下的 `0.1.x` 是本项目此前的发布）。
+1. 编译 server 二进制并上传 GitHub Release（`.github/workflows/build.yml` 自动执行）
+2. 先 `sh scripts/gen-platform-packages.sh <版本>` 生成 5 个平台包，把对应二进制放进各包 `bin/` 后逐个 `npm publish --access public`
+3. `cd npm && npm publish --access public`（主包，`postinstall` 从已安装的平台包复制二进制）
+
+> ⚠️ **发布前提**：npm 账号必须拥有 **`nextagentx` 这个 scope**（用户名即为 `nextagentx`，
+> 或在该账号下创建同名 organization）。scope 不属于自己时 `npm publish` 会 403，
+> 且 `@nextagentx/*` 是别人无法代持的命名空间。
+>
+> 另外：`buddy-switch`（不带 scope）这个包名**在 npm 上已被他人占用**，所以不能再退回无 scope 命名；
+> 本项目此前的发布用的是 `workbuddy-switch`。
+> scoped 包必须带 `--access public`，否则会以私有包发布（私有包需要付费账号）。
+>
+> `npm/package.json` 的 `optionalDependencies` 目前列了 4 个平台（darwin-arm64 / darwin-x64 /
+> win32-x64 / linux-x64），与 CI 矩阵一致；`npm/platform/buddy-switch-linux-arm64/` 这个目录
+> **尚未接入**（既不在依赖里，CI 也不构建它），别误以为 linux-arm64 已可用。
 
 ### 在线演示（GitHub Pages）部署前提
 

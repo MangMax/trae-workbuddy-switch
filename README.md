@@ -19,8 +19,8 @@
 | **webui（浏览器）** | 从源码构建，见 [webui 形态](#webui-形态源码构建) | 与桌面 App 同一份前端产物，走本地 HTTP 通道 |
 | **在线演示** | [GitHub Pages](https://nextagentx.github.io/trae-workbuddy-switch/) | 只读演示；账号、积分与请求记录均为虚构数据，所有业务操作已禁用 |
 
-> **暂未提供 npm 安装**：本项目目前不通过 npm 分发，`npm i -g …` 装不到它。
-> 需要 webui 形态请按下方[从源码构建](#webui-形态源码构建)；将来发布后会在这里补上安装命令。
+> **暂未提供 npm 安装**：npm 包 `@nextagentx/buddy-switch` 尚未发布，`npm i -g …` 还装不到它。
+> 需要 webui 形态请按下方[从源码构建](#webui-形态源码构建)；发布后会在这里补上安装命令。
 
 
 ## 两个产品分区
@@ -293,7 +293,7 @@ crates/
   buddy-switch-server/   # HTTP server + CLI（axum API + rust-embed 内嵌前端）
 src-tauri/               # 桌面宿主（Tauri command 薄包装 + 托盘）
 src/                     # 前端：components / pages / lib（api.ts 双通道：Tauri invoke 或 HTTP fetch）
-npm/                     # npm 包（**尚未发布**）：主包 + 5 个平台分包，二进制走平台包
+npm/                     # npm 包（**尚未发布**）：主包 @nextagentx/buddy-switch + 5 个平台分包
 ```
 
 ## 支持这个项目

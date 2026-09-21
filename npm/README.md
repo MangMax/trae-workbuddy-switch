@@ -5,13 +5,13 @@
 > 桌面 App（Tauri）请从 [GitHub Releases](https://github.com/NextAgentX/trae-workbuddy-switch/releases/latest) 下载安装包。
 > 在线只读演示：<https://nextagentx.github.io/trae-workbuddy-switch/>
 
-> **本包尚未发布到 npm**：下面的安装命令现在还不可用，需要 webui 形态请先按仓库 README 从源码构建。
+> **本包（`@nextagentx/buddy-switch`）尚未发布到 npm**：下面的安装命令现在还不可用，需要 webui 形态请先按仓库 README 从源码构建。
 > 发布后再以本页命令为准。
 
 ## 安装与运行
 
 ```bash
-npm i -g buddy-switch
+npm i -g @nextagentx/buddy-switch
 
 buddy-switch              # 启动本地服务 + 自动打开浏览器
 buddy-switch serve        # 只起服务，不开浏览器（--port 指定端口）
@@ -19,7 +19,7 @@ buddy-switch status       # 终端查看当前账号
 buddy-switch version      # 版本号
 ```
 
-默认监听 `127.0.0.1:57890`。二进制以「平台分包」形式发布（`buddy-switch-<platform>-<arch>`），
+默认监听 `127.0.0.1:57890`。二进制以「平台分包」形式发布（`@nextagentx/buddy-switch-<platform>-<arch>`），
 主包把它声明为 `optionalDependencies`，安装时 npm 自动装好，`postinstall` 只负责把二进制复制到 `bin/`——
 因此**不依赖 GitHub，国内镜像（npmmirror）也能稳定安装**。
 
