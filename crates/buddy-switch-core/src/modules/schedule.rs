@@ -49,6 +49,17 @@ macro_rules! define_schedule_tasks {
                 }
             }
 
+            /// 按稳定标识解析任务；未知标识返回 `None`。
+            ///
+            /// 与 [`ScheduleTask::as_str`] 由**同一份声明**生成，二者不可能漂移；供
+            /// 「立即执行」这类按名派发的入口使用（不要把标识另抄一份字面量去 match）。
+            pub fn parse(label: &str) -> Option<ScheduleTask> {
+                match label {
+                    $( $label => Some(ScheduleTask::$variant), )+
+                    _ => None,
+                }
+            }
+
             /// 该任务是否在配置中被显式启用。
             pub fn enabled(self, cfg: &ScheduleConfig) -> bool {
                 match self {
@@ -665,5 +676,30 @@ mod tests {
             vec!["checkin", "travel", "activity", "keepalive", "school", "cat"],
             "all() 必须恰好包含全部六类且顺序稳定"
         );
+    }
+
+    /// `parse` 必须与 `as_str` **逐类可逆**，且未知标识返回 `None`。
+    ///
+    /// 该断言可证伪：若宏里某类任务的标签字面量被写错（`as_str` 与 `parse` 用的是同一个
+    /// 字面量，所以真正的风险是「新增了任务但漏登记」或「未知串被当成某类」），
+    /// 第一类断言会红；把 `parse` 改成「未知串回落到某类」会让第二类断言红。
+    #[test]
+    fn parse_is_the_inverse_of_as_str_and_rejects_unknown() {
+        for task in ScheduleTask::all() {
+            assert_eq!(
+                ScheduleTask::parse(task.as_str()),
+                Some(task),
+                "parse 必须能还原自己的标识: {}",
+                task.as_str()
+            );
+        }
+        // 未知标识（含大小写差异与空串）一律 None，绝不静默回落到某一类。
+        for unknown in ["", "Checkin", "CHECKIN", "activity-report", "signin"] {
+            assert_eq!(
+                ScheduleTask::parse(unknown),
+                None,
+                "未知标识必须被拒绝: {unknown}"
+            );
+        }
     }
 }

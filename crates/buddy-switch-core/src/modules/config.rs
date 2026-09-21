@@ -402,12 +402,15 @@ pub fn clear_codebuddy_cn_app_cache() {
 // 签到配置 / 日志（对照 server.py load/save_checkin_config / load/save/add_checkin_log）
 // ---------------------------------------------------------------------------
 
-/// 默认签到配置。旧时间窗口字段仅为配置文件兼容保留，调度不再读取。
+/// 默认签到配置。
+///
+/// 调度时点一律由 `schedule_config.json` 的小时表决定（`modules::scheduler`），本配置只管
+/// 「是否启用 / 保活天数 / 懒刷新间隔」。**旧的时间窗口字段 `start_hour` / `end_hour` 已删除**：
+/// 它们没有任何读取方（纯死字段），留着会让「改它就能改签到时间」的错觉一直存在；老配置文件
+/// 里残留的这两个键会在下次保存时被自然丢弃（合并从默认值出发，只透传白名单内的键）。
 pub fn default_checkin_config() -> Value {
     json!({
         "enabled": true,
-        "start_hour": 6,
-        "end_hour": 12,
         "keepalive_days": 0,
         "lazy_refresh_hours": 24,
     })
@@ -421,12 +424,7 @@ fn merge_checkin_config(input: &Value) -> Value {
     if let Some(enabled) = map.get("enabled").and_then(Value::as_bool) {
         merged["enabled"] = json!(enabled);
     }
-    for key in [
-        "start_hour",
-        "end_hour",
-        "keepalive_days",
-        "lazy_refresh_hours",
-    ] {
+    for key in ["keepalive_days", "lazy_refresh_hours"] {
         if let Some(value) = map.get(key).and_then(Value::as_i64) {
             merged[key] = json!(value);
         }
@@ -1056,12 +1054,28 @@ mod tests {
             .timestamp_millis()
     }
 
+    /// 签到配置**不得**再含 `start_hour` / `end_hour`：它们没有任何读取方（调度只认
+    /// `schedule_config` 的小时表），留着等于给用户一个「改它就能改签到时间」的假控件。
+    ///
+    /// 可证伪性：把任一个键加回 [`default_checkin_config`] 或 [`merge_checkin_config`]
+    /// 的白名单，本用例即变红。
     #[test]
-    fn auto_checkin_defaults_enabled_and_preserves_legacy_fields() {
+    fn auto_checkin_config_carries_no_dead_time_window_fields() {
         let cfg = default_checkin_config();
         assert_eq!(cfg.get("enabled").and_then(Value::as_bool), Some(true));
-        assert_eq!(cfg.get("start_hour").and_then(Value::as_i64), Some(6));
-        assert_eq!(cfg.get("end_hour").and_then(Value::as_i64), Some(12));
+        assert!(
+            cfg.get("start_hour").is_none(),
+            "start_hour 是死字段，不应再出现在默认签到配置里"
+        );
+        assert!(
+            cfg.get("end_hour").is_none(),
+            "end_hour 是死字段，不应再出现在默认签到配置里"
+        );
+        // 老配置文件里残留的这两个键也不得被透传回存盘结果（否则死字段复活）。
+        let merged = merge_checkin_config(&json!({ "start_hour": 3, "end_hour": 4 }));
+        assert!(merged.get("start_hour").is_none(), "start_hour 不得再被透传");
+        assert!(merged.get("end_hour").is_none(), "end_hour 不得再被透传");
+        assert_eq!(merged.get("enabled").and_then(Value::as_bool), Some(true));
     }
 
     #[test]

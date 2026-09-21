@@ -14,68 +14,20 @@ mod trae_gateway_host;
 use serde_json::json;
 
 use buddy_switch_core::modules::{
-    account, activity, auth_file, cat, checkin, config, process, refresh, region::Region, rotate,
-    schedule, school, travel, update,
+    account, auth_file, config, process, rotate, schedule, scheduler, update,
 };
 
 fn default_port() -> u16 {
     57890
 }
 
-/// 执行某一类定时任务（到点后派发）。CN / Global 的 region 隔离在此收敛：
-/// 签到 / 旅行 / 开学季 / 夜猫子只对 CN 执行；活跃上报 CN 与 Global 都执行；
-/// 保活按 region 独立标志。
-async fn run_scheduled_task(task: schedule::ScheduleTask) {
-    match task {
-        schedule::ScheduleTask::Checkin => {
-            let _ = checkin::run_checkin_cycle_for(Region::Cn, checkin::CheckinCycleMode::PeriodicRecovery)
-                .await;
-        }
-        schedule::ScheduleTask::Travel => {
-            // 一趟派出 + 一趟领奖闭环。
-            let _ = travel::run_travel_cycle().await;
-            let _ = travel::run_travel_claim_cycle().await;
-        }
-        schedule::ScheduleTask::Activity => {
-            for region in Region::all() {
-                let _ = activity::run_activity_cycle_for(region).await;
-            }
-        }
-        schedule::ScheduleTask::Keepalive => {
-            for region in Region::all() {
-                let _ = refresh::run_keepalive_cycle_for(region).await;
-            }
-        }
-        schedule::ScheduleTask::School => {
-            let _ = school::run_school_cycle_for(Region::Cn).await;
-        }
-        schedule::ScheduleTask::Cat => {
-            let _ = cat::run_cat_cycle_for(Region::Cn).await;
-        }
-    }
-}
-
-/// 为某一类任务起一个独立排程循环：每轮重新计算**自己的** `next_fire` 并 sleep 到该时刻，
-/// 不用统一 tick 轮询。六类各自独立开关、独立时点；同一整点上的多类任务因各占一个
-/// tokio task 而天然并行、互不阻塞。
+/// 为某一类任务起一个独立排程循环。
+///
+/// 排程语义（重读配置 → 算 `next_fire` → sleep 到点 → 派发）全部在
+/// [`scheduler::schedule_loop`] 里，**桌面端与服务端共用同一份**：此前它只写在本文件，
+/// 桌面端另有一套写死周期的循环，两边行为漂移且桌面端的排程配置完全不生效。
 fn spawn_scheduled_task(task: schedule::ScheduleTask) {
-    tokio::spawn(async move {
-        loop {
-            let cfg = schedule::load_schedule_config();
-            let now = config::now_ms();
-            let at = schedule::next_fire(task.hours(&cfg), now);
-            let wait_ms = match at {
-                Some(at) => (at - now).max(0) as u64,
-                // 任务被禁用（hours 为空）：1 分钟后重查配置，避免无谓空转。
-                None => 60_000,
-            };
-            tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
-            if at.is_none() {
-                continue;
-            }
-            run_scheduled_task(task).await;
-        }
-    });
+    tokio::spawn(scheduler::schedule_loop(task));
 }
 
 /// 后台任务的注册表条目：**「有哪些后台任务」的唯一事实来源**。
@@ -88,7 +40,8 @@ fn spawn_scheduled_task(task: schedule::ScheduleTask) {
 /// （见 `tests::background_task_registry_includes_credits_refresh`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BackgroundTask {
-    /// 启动维护：整理历史签到日志 + 对 CN 做一次启动即核验。
+    /// 启动补跑：整理历史签到日志 + 签到核验 / 旅行派出领取 / 保活各跑一轮
+    /// （受各自排程开关约束，关掉的任务一次都不跑）。
     StartupMaintenance,
     /// 自动轮换（按 `auto_rotate_config` 间隔；CodeBuddy CLI 为 CN 专有，保持 CN）。
     AutoRotate,
@@ -126,14 +79,11 @@ fn spawn_background_loops() {
 /// 按注册表条目派生对应的后台循环。
 fn spawn_background_task(task: BackgroundTask) {
     match task {
-        // 启动：整理历史签到日志 + 对 CN 做一次启动即核验。
+        // 启动：整理历史签到日志 + 补跑一轮（签到核验 / 旅行派出领取 / 保活），
+        // 各类是否补跑受自己的排程开关约束。与桌面端共用 core::scheduler 的同一份语义。
         BackgroundTask::StartupMaintenance => {
             tokio::spawn(async move {
-                if let Err(error) = config::compact_checkin_logs() {
-                    eprintln!("[签到] 历史日志整理失败: {error}");
-                }
-                // 启动即核验一次（CN）；Global 无签到体系，跳过。
-                let _ = checkin::run_checkin_cycle_for(Region::Cn, checkin::CheckinCycleMode::StartupVerify).await;
+                scheduler::run_startup_maintenance().await;
             });
         }
         // 自动轮换：按配置间隔执行。

@@ -15,81 +15,80 @@ pub(crate) fn is_screenshot_demo() -> bool {
     std::env::var(SCREENSHOT_DEMO_ENV).as_deref() == Ok("1")
 }
 
-/// 后台循环：自动签到启动即核验、每 30 分钟补签（**CN 与 Global 都执行**）；
-/// 自动轮换每 30 秒检查（CodeBuddy CLI 为 CN 专有）；每天一次保活（**两版都执行**）。
+/// 桌面端后台任务：**唯一事实来源**。
+///
+/// ⚠️ 回归背景（本表存在的原因）：此前 `spawn_background_loops` 直接写死四个循环
+/// （签到 30 分钟 / 旅行 30 分钟 / 领取 15 分钟 / 保活每天一次），**完全没有排程**，
+/// 于是设置页「定时任务排程」的六类开关与六份小时表在桌面端全部空转——「活跃地图」
+/// 从未执行过一次。改成注册表后，「增删后台任务」是数据变化，且有测试守住
+/// （见 `tests::background_tasks_cover_all_scheduled_tasks`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackgroundTask {
+    /// 启动补跑：整理历史签到日志 + 签到核验 / 旅行派出领取 / 保活各跑一轮
+    /// （**受各自排程开关约束**，关掉的任务一次都不跑）。
+    StartupMaintenance,
+    /// 自动轮换（按 `auto_rotate_config` 间隔；CodeBuddy CLI 为 CN 专有）。
+    AutoRotate,
+    /// 六类积分定时任务之一（按 `schedule_config` 的小时表，各自独立排程）。
+    Scheduled(modules::schedule::ScheduleTask),
+}
+
+/// 后台任务注册表：**登记即执行**——不要在本表之外直接 `spawn` 后台循环。
+fn background_tasks() -> Vec<BackgroundTask> {
+    let mut tasks = vec![BackgroundTask::StartupMaintenance, BackgroundTask::AutoRotate];
+    tasks.extend(
+        modules::schedule::ScheduleTask::all()
+            .into_iter()
+            .map(BackgroundTask::Scheduled),
+    );
+    tasks
+}
+
+/// 启动全部后台任务（以 [`background_tasks`] 为唯一事实来源）。
 fn spawn_background_loops() {
-    tauri::async_runtime::spawn(async move {
-        if let Err(error) = modules::config::compact_checkin_logs() {
-            eprintln!("[签到] 历史日志整理失败: {error}");
-        }
-        // 两个 region 各自独立执行：Global 无对应上游接口时 run_checkin_cycle_for
-        // 返回结构化 unsupported（独立降级），不会拖垮 CN。
-        for region in modules::region::Region::all() {
-            let _ = modules::checkin::run_checkin_cycle_for(
-                region,
-                modules::checkin::CheckinCycleMode::StartupVerify,
-            )
-            .await;
-        }
-        loop {
-            tokio::time::sleep(modules::checkin::CHECKIN_RECOVERY_INTERVAL).await;
-            for region in modules::region::Region::all() {
-                let _ = modules::checkin::run_checkin_cycle_for(
-                    region,
-                    modules::checkin::CheckinCycleMode::PeriodicRecovery,
-                )
-                .await;
-            }
-        }
-    });
+    for task in background_tasks() {
+        spawn_background_task(task);
+    }
+}
 
-    // 派猫猫旅行：启动即派发，之后周期性补派（并重试 no-buddy / 瞬时错误）。
-    tauri::async_runtime::spawn(async move {
-        let _ = modules::travel::run_travel_cycle().await;
-        loop {
-            tokio::time::sleep(modules::travel::TRAVEL_RETRY_INTERVAL).await;
-            let _ = modules::travel::run_travel_cycle().await;
+/// 按注册表条目派生对应的后台循环。
+fn spawn_background_task(task: BackgroundTask) {
+    match task {
+        // 启动补跑：排程小时表之外的「今天该做但还没做」的一次性动作。
+        // 语义与服务端 `buddy-switch-server` 完全一致（共用 core::scheduler）。
+        BackgroundTask::StartupMaintenance => {
+            tauri::async_runtime::spawn(async move {
+                modules::scheduler::run_startup_maintenance().await;
+            });
         }
-    });
-
-    // 旅行领取：启动立刻查一轮（避免重启后空等 15 分钟漏领），之后按周期检查。
-    tauri::async_runtime::spawn(async move {
-        let _ = modules::travel::run_travel_claim_cycle().await;
-        loop {
-            tokio::time::sleep(modules::travel::TRAVEL_CLAIM_INTERVAL).await;
-            let _ = modules::travel::run_travel_claim_cycle().await;
-        }
-    });
-
-    tauri::async_runtime::spawn(async move {
-        let mut last_keepalive_day = String::new();
-        let mut last_rotate_at: i64 = 0;
-        loop {
-            // 自动轮换（CodeBuddy CLI）：按配置间隔执行
-            let rotate_cfg = modules::config::load_auto_rotate_config();
-            if rotate_cfg.get("enabled").and_then(|v| v.as_bool()) == Some(true) {
-                let interval_minutes = rotate_cfg
-                    .get("check_interval_minutes")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(5)
-                    .max(1);
-                let now = modules::config::now_ms();
-                if now - last_rotate_at >= interval_minutes * 60_000 {
-                    last_rotate_at = now;
-                    let _ = modules::rotate::run_rotate_cycle().await;
+        // 自动轮换（CodeBuddy CLI）：按配置间隔执行。
+        BackgroundTask::AutoRotate => {
+            tauri::async_runtime::spawn(async move {
+                let mut last_rotate_at: i64 = 0;
+                loop {
+                    let rotate_cfg = modules::config::load_auto_rotate_config();
+                    if rotate_cfg.get("enabled").and_then(|v| v.as_bool()) == Some(true) {
+                        let interval_minutes = rotate_cfg
+                            .get("check_interval_minutes")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(5)
+                            .max(1);
+                        let now = modules::config::now_ms();
+                        if now - last_rotate_at >= interval_minutes * 60_000 {
+                            last_rotate_at = now;
+                            let _ = modules::rotate::run_rotate_cycle().await;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_secs(30)).await;
                 }
-            }
-            let today = modules::checkin::date_str(None);
-            if today != last_keepalive_day {
-                last_keepalive_day = today;
-                // 保活对 CN 与 Global 都执行（各自 per-region 变体，互不污染）。
-                for region in modules::region::Region::all() {
-                    let _ = modules::refresh::run_keepalive_cycle_for(region).await;
-                }
-            }
-            tokio::time::sleep(Duration::from_secs(30)).await;
+            });
         }
-    });
+        // 六类定时任务各自独立排程：每类一个循环，按自己的小时表 sleep 到点。
+        // 排程语义在 core::scheduler 里，桌面端与服务端共用，**不在此处另写一份**。
+        BackgroundTask::Scheduled(task) => {
+            tauri::async_runtime::spawn(modules::scheduler::schedule_loop(task));
+        }
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -191,6 +190,7 @@ pub fn run() {
             commands::save_auto_travel_config,
             commands::get_schedule_config,
             commands::save_schedule_config,
+            commands::run_schedule_task,
             commands::refresh_account_token,
             commands::get_auto_rotate_config,
             commands::save_auto_rotate_config,
@@ -245,6 +245,7 @@ pub fn run() {
             commands::trae_refresh_jwt,
             commands::trae_clear_cooldown,
             commands::trae_switch_account,
+            commands::trae_merge_legacy_regions,
             commands::trae_save_login,
             commands::trae_backup_profile,
             commands::trae_restore_profile,
@@ -255,7 +256,12 @@ pub fn run() {
             commands::save_trae_gateway_config,
             commands::trae_gateway_status,
             commands::get_trae_gateway_models,
-            commands::regenerate_trae_api_key,
+            // 多 Key 管理（含归属产品线）+ 打开数据目录（替代旧的单 Key regenerate）。
+            commands::list_trae_api_keys,
+            commands::create_trae_api_key,
+            commands::revoke_trae_api_key,
+            commands::delete_trae_api_key,
+            commands::open_trae_data_dir,
             commands::get_trae_gateway_logs,
             commands::clear_trae_gateway_logs,
         ])
@@ -266,4 +272,36 @@ pub fn run() {
         #[cfg(desktop)]
         tray::on_run_event(event);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 护栏：六类定时任务**必须**全部登记在桌面端后台任务表里。
+    ///
+    /// 回归背景：排程循环此前只存在于 `buddy-switch-server` 二进制，桌面端只有四个写死
+    /// 周期的循环，于是设置页「定时任务排程」的全部控件在桌面端空转——最典型的是
+    /// 「活跃地图」从未执行，用户在官网对照连登热力图发现始终没点亮。
+    ///
+    /// 可证伪性：从 [`background_tasks`] 移除任一 `Scheduled`（或整段六类循环）会让本用例变红。
+    #[test]
+    fn background_tasks_cover_all_scheduled_tasks() {
+        let tasks = background_tasks();
+        for task in modules::schedule::ScheduleTask::all() {
+            assert!(
+                tasks.contains(&BackgroundTask::Scheduled(task)),
+                "桌面端后台任务表缺少定时任务「{}」——它在此进程里永远不会执行",
+                task.as_str()
+            );
+        }
+        assert!(
+            tasks.contains(&BackgroundTask::StartupMaintenance),
+            "注册表缺少启动补跑任务"
+        );
+        assert!(
+            tasks.contains(&BackgroundTask::AutoRotate),
+            "注册表缺少自动轮换任务"
+        );
+    }
 }

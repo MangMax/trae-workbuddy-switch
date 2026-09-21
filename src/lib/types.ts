@@ -184,9 +184,6 @@ export interface MigrateResult {
 
 export interface CheckinConfig {
   enabled: boolean;
-  /** Legacy persisted fields; accepted by the backend but ignored by scheduling. */
-  start_hour?: number;
-  end_hour?: number;
   keepalive_days: number;
   lazy_refresh_hours: number;
 }
@@ -250,6 +247,25 @@ export interface ScheduleConfig {
   cat_enabled: boolean;
   /** 活跃上报每账号每天的对话次数（后端将 0 / 负数归一为 1）。 */
   activity_report_count: number;
+}
+
+/**
+ * 「立即执行」某一类定时任务的结果（`POST /api/schedule/run`）。
+ *
+ * 形状随任务而异：签到 / 活跃上报 / 保活按 region 逐段返回；旅行返回派出与领取两段；
+ * 开学季 / 夜猫子只返回单段结果。各段即业务模块自身的返回，原样透传便于定位到具体账号。
+ */
+export interface ScheduleRunResult {
+  /** 被执行的任务标识（与 `SCHEDULE_TASKS` 的 key 一致）。 */
+  task: string;
+  /** 按 region 逐段的结果（签到 / 活跃上报 / 保活）。 */
+  regions?: Array<Record<string, unknown>>;
+  /** 旅行派出一段的结果。 */
+  dispatched?: Record<string, unknown>;
+  /** 旅行领取一段的结果。 */
+  claimed?: Record<string, unknown>;
+  /** 单段结果（开学季 / 夜猫子）。 */
+  result?: Record<string, unknown>;
 }
 
 export interface AutoRotateConfig {
@@ -544,7 +560,6 @@ export interface GatewayConfig {
   bind_addr: string;
   port: number;
   allow_non_loopback: boolean;
-  dual_port: boolean;
   log_keep: number;
   log_bodies: boolean;
   per_key_rate_limit?: number | null;

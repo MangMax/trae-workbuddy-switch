@@ -185,6 +185,7 @@ fn api_routes() -> Router {
         .route("/api/trae/credits/refresh", post(api_trae_refresh_credits))
         .route("/api/trae/refresh-jwt", post(api_trae_refresh_jwt))
         .route("/api/trae/cooldown/clear", post(api_trae_clear_cooldown))
+        .route("/api/trae/legacy-merge", post(api_trae_legacy_merge))
         .route("/api/trae/profiles", get(api_trae_profiles))
         .route("/api/trae/login/save", post(api_trae_save_login))
         .route("/api/trae/profiles/backup", post(api_trae_backup_profile))
@@ -1466,6 +1467,16 @@ async fn api_trae_import_accounts(Json(body): Json<Value>) -> Response {
         Ok(Ok(value)) => json_ok(value),
         Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
         Err(error) => json_err(format!("导入账号失败: {error}"), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// POST /api/trae/legacy-merge —— 旧产品线账号库并入国内版区域账号库（幂等）。
+///
+/// 无请求体（无参数）：合并的输入是磁盘上的旧库文件，输出是合并报告。
+async fn api_trae_legacy_merge() -> Response {
+    match trae::handlers::merge_legacy_regions() {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
     }
 }
 
@@ -2906,7 +2917,7 @@ mod parse_trae_variant_tests {
             parse_trae_variant(Some("trae_work")),
             TraeVariant::TraeWork
         );
-        assert_eq!(parse_trae_variant(Some("trae_cn")), TraeVariant::TraeCn);
+        assert_eq!(parse_trae_variant(Some("trae_cn")), TraeVariant::Trae);
     }
 
     #[test]
@@ -2916,7 +2927,7 @@ mod parse_trae_variant_tests {
             parse_trae_variant(Some("TRAE_WORK")),
             TraeVariant::TraeWork
         );
-        assert_eq!(parse_trae_variant(Some(" Trae CN ")), TraeVariant::TraeCn);
+        assert_eq!(parse_trae_variant(Some(" Trae CN ")), TraeVariant::Trae);
     }
 
     #[test]

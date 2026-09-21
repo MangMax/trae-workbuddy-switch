@@ -1,5 +1,16 @@
 import { useEffect, useState } from "react";
-import { ArrowUpCircle, CircleCheck, ExternalLink, FolderOpen, Loader2, Plus, RefreshCw, Save, X } from "lucide-react";
+import {
+  ArrowUpCircle,
+  CircleCheck,
+  ExternalLink,
+  FolderOpen,
+  Loader2,
+  Play,
+  Plus,
+  RefreshCw,
+  Save,
+  X,
+} from "lucide-react";
 import { toast } from "sonner";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -25,6 +36,7 @@ import type {
   RotateLog,
   RotateStatus,
   ScheduleConfig,
+  ScheduleRunResult,
   UpdateInfo,
 } from "@/lib/types";
 import { GITHUB_RELEASE_URL, GITHUB_REPOSITORY_URL, openReleaseUrl } from "@/lib/update";
@@ -1058,6 +1070,7 @@ function GatewaySettingsCard() {
         </SettingsFieldRow>
 
         <SettingsFieldRow
+          className="border-b-0"
           label="记录请求正文"
           description="含隐私风险；默认关闭，仅记录时间/模型/状态码等元数据"
           htmlFor="gw-bodies"
@@ -1069,22 +1082,6 @@ function GatewaySettingsCard() {
             disabled={saving}
             onCheckedChange={(checked) => void persist({ log_bodies: checked })}
             aria-label="记录请求正文"
-          />
-        </SettingsFieldRow>
-
-        <SettingsFieldRow
-          className="border-b-0"
-          label="按 region 独立端口模式"
-          description="为国内版与国际版分别监听独立端口（可选）"
-          htmlFor="gw-dual"
-          operational
-        >
-          <Switch
-            id="gw-dual"
-            checked={config.dual_port}
-            disabled={saving}
-            onCheckedChange={(checked) => void persist({ dual_port: checked })}
-            aria-label="按 region 独立端口模式"
           />
         </SettingsFieldRow>
       </CardContent>
@@ -1219,10 +1216,39 @@ function HoursEditor({
   );
 }
 
+/**
+ * 把「立即执行」的返回压成一句可读摘要。
+ *
+ * 活跃地图单独处理：它要回答的正是「官网连登到底点亮了没」，故回报上报条数与连登天数
+ * （`reported` 与 `streakDays` 由后端逐账号返回）。
+ */
+function summarizeScheduleRun(task: ScheduleTaskDef, res: ScheduleRunResult): string {
+  if (task.key !== "activity") return "已执行";
+  let reported = 0;
+  let streak: number | null = null;
+  for (const region of res.regions ?? []) {
+    const accounts = Array.isArray(region.accounts)
+      ? (region.accounts as Record<string, unknown>[])
+      : [];
+    for (const account of accounts) {
+      reported += Number(account.reported ?? 0);
+      const days = Number(account.streakDays);
+      if (Number.isFinite(days) && days > 0) {
+        streak = streak === null ? days : Math.max(streak, days);
+      }
+    }
+  }
+  return streak === null
+    ? `已上报 ${reported} 条（未读到连登天数）`
+    : `已上报 ${reported} 条，当前连登 ${streak} 天`;
+}
+
 /** 定时任务排程配置：六类任务各自独立开关与小时表 + 活跃上报次数。 */
 function ScheduleCard() {
   const [cfg, setCfg] = useState<ScheduleConfig | null>(null);
   const [saving, setSaving] = useState(false);
+  /** 正在立即执行的任务 key（null 表示空闲）；一次只跑一类，避免并发打到同一批账号。 */
+  const [running, setRunning] = useState<string | null>(null);
   const [msg, setMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
 
   useEffect(() => {
@@ -1268,6 +1294,20 @@ function ScheduleCard() {
     return null;
   }
 
+  /** 立即执行某一类任务：不等排程到点，用于保存配置后当场自证是否生效。 */
+  async function runNow(task: ScheduleTaskDef) {
+    setRunning(task.key);
+    setMsg(null);
+    try {
+      const res = await api.runScheduleTask(task.key);
+      setMsg({ type: "ok", text: `「${task.label}」${summarizeScheduleRun(task, res)}` });
+    } catch (e) {
+      setMsg({ type: "err", text: api.asError(e) });
+    } finally {
+      setRunning(null);
+    }
+  }
+
   async function save() {
     if (!cfg) return;
     const invalid = validate(cfg);
@@ -1294,6 +1334,7 @@ function ScheduleCard() {
       <CardContent className="space-y-0 p-0">
         <p className="border-b border-border/60 bg-muted/25 px-4 py-3 text-xs leading-5 text-muted-foreground sm:px-5">
           六类任务各自独立开关与小时表，到点由调度器触发。小时使用 24 小时制本地时间，可配置多个小时点。
+          改完可用「立即执行」当场跑一轮验证，无需等到下一个整点。
         </p>
 
         {cfg ? (
@@ -1315,6 +1356,19 @@ function ScheduleCard() {
                       {task.label}
                     </Label>
                     <p className="mt-0.5 text-xs leading-4 text-muted-foreground/75">{task.description}</p>
+                    <DemoAction>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="ghost"
+                        className="mt-2 h-7 px-2 text-xs"
+                        disabled={running !== null}
+                        onClick={() => runNow(task)}
+                      >
+                        {running === task.key ? <Loader2 className="animate-spin" /> : <Play />}
+                        立即执行
+                      </Button>
+                    </DemoAction>
                   </div>
                 </div>
                 <HoursEditor

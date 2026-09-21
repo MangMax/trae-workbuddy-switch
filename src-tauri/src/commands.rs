@@ -851,7 +851,7 @@ mod parse_trae_variant_tests {
             parse_trae_variant(Some("trae_work")),
             TraeVariant::TraeWork
         );
-        assert_eq!(parse_trae_variant(Some("trae_cn")), TraeVariant::TraeCn);
+        assert_eq!(parse_trae_variant(Some("trae_cn")), TraeVariant::Trae);
     }
 
     #[test]
@@ -861,7 +861,7 @@ mod parse_trae_variant_tests {
             parse_trae_variant(Some("TRAE_WORK")),
             TraeVariant::TraeWork
         );
-        assert_eq!(parse_trae_variant(Some(" Trae CN ")), TraeVariant::TraeCn);
+        assert_eq!(parse_trae_variant(Some(" Trae CN ")), TraeVariant::Trae);
     }
 
     #[test]
@@ -1083,6 +1083,19 @@ pub fn clear_gateway_logs() -> Value {
 // 文件 IO / 子进程类操作一律走 `spawn_blocking`：Tauri 的异步命令运行在共享
 // 运行时上，在其中做同步磁盘遍历（快照目录递归统计、9 类文件复制）会阻塞
 // 同一个运行时上的其他命令与事件派发。`core` 侧的 `get_status` 已有同样的处理。
+
+/// POST /api/trae/legacy-merge —— 旧产品线账号库并入国内版区域账号库。
+///
+/// **幂等**：无旧库或已并完时返回 `changed: false`。前端在账号页加载时调一次即可。
+///
+/// async + spawn_blocking：读写 JSON 账号库并做一次目录扫描，属文件 IO，
+/// 不宜占用 Tauri 主线程（同本文件头部「文件 IO 一律走 spawn_blocking」的约定）。
+#[tauri::command]
+pub async fn trae_merge_legacy_regions() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(trae::handlers::merge_legacy_regions)
+        .await
+        .map_err(|error| format!("合并旧产品线账号库失败: {error}"))?
+}
 
 /// GET /api/trae/env —— Trae 客户端安装/运行/数据目录状态。
 ///

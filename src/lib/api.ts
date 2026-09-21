@@ -69,6 +69,7 @@ import type {
   TraeSettings,
   TraeSwitchOutcome,
   TraeTokenScope,
+  TraeLegacyMergeReport,
   TraeTokenStatistics,
   TraeVariantId,
   TraeVariantsStatus,
@@ -224,6 +225,7 @@ const ROUTES: Record<string, Route> = {
   trae_refresh_credits: { method: "POST", path: "/api/trae/credits/refresh" },
   trae_refresh_jwt: { method: "POST", path: "/api/trae/refresh-jwt" },
   trae_clear_cooldown: { method: "POST", path: "/api/trae/cooldown/clear" },
+  trae_merge_legacy_regions: { method: "POST", path: "/api/trae/legacy-merge" },
   trae_switch_account: { method: "POST", path: "/api/trae/switch" },
   trae_save_login: { method: "POST", path: "/api/trae/login/save" },
   trae_backup_profile: { method: "POST", path: "/api/trae/profiles/backup" },
@@ -1065,6 +1067,17 @@ export function traeClearCooldown(
   variant?: TraeVariantId | null,
 ): Promise<{ scope: "single" | "all"; userId?: string; cleared?: number }> {
   return call("trae_clear_cooldown", { userId: userId ?? null, variant: variant ?? null });
+}
+
+/**
+ * 把旧「产品线」账号库并入**国内版**区域账号库（幂等）。
+ *
+ * 无参数：输入是磁盘上的旧库文件，输出是合并报告。**无旧库或已并完时 `changed`
+ * 为 false**，因此页面加载时调一次是安全且廉价的。合并前后端会先把目标库
+ * 备份到 `trae/backups/region-merge/<utc>/`，路径随 `backup` 回传。
+ */
+export function traeMergeLegacyRegions(): Promise<TraeLegacyMergeReport> {
+  return call("trae_merge_legacy_regions");
 }
 
 /**
