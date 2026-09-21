@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   ArrowDownToLine,
@@ -38,6 +38,7 @@ import type {
   TraeUnsupported,
 } from "@/lib/trae-types";
 import { cn } from "@/lib/utils";
+import { useCachedResource } from "@/lib/use-cached-resource";
 
 /** 统计窗口选项。`0` 表示全部历史（后端把 `<= 0` 视为不限）。 */
 const RANGES = [
@@ -162,28 +163,28 @@ function StatMetric({
  * 按模型 × 按天的堆叠柱 + 调用次数折线（源 `modelDaily`）、`unsupported` 置灰卡。
  */
 export default function TraeTokenStatsPage() {
-  const [stats, setStats] = useState<TraeTokenStatistics | null>(null);
   const [days, setDays] = useState<string>("30");
   const [scope, setScope] = useState<TraeTokenScope>("all");
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
 
-  const load = useCallback(async (range: string, scopeValue: TraeTokenScope) => {
-    setLoading(true);
-    setError(null);
-    try {
-      const data = await api.getTraeTokenStatistics(Number.parseInt(range, 10), scopeValue);
-      setStats(data);
-    } catch (e) {
-      setError(api.asError(e));
-    } finally {
-      setLoading(false);
-    }
-  }, []);
+  /**
+   * 键里**必须**带上 `days` 与 `scope`：两者都会改变结果，漏在键外就会出现
+   * 「换了天数、图还是旧的」。键相同即结果相同，这是缓存层的唯一契约。
+   */
+  const load = useCallback(
+    () => api.getTraeTokenStatistics(Number.parseInt(days, 10), scope),
+    [days, scope],
+  );
 
-  useEffect(() => {
-    void load(days, scope);
-  }, [load, days, scope]);
+  /**
+   * 统计结果走快照缓存：切到 WorkBuddy 再切回来时不再闪骨架、不再重跑一次统计。
+   * 页面上的「刷新」按钮走 `refresh()`（强制重取），所以手动刷新依然立刻生效。
+   */
+  const {
+    data: stats,
+    loading,
+    error,
+    refresh,
+  } = useCachedResource<TraeTokenStatistics>(`trae:token-stats:${days}:${scope}`, load);
 
   const summary = stats?.summary;
   const daily = useMemo(
@@ -222,7 +223,7 @@ export default function TraeTokenStatsPage() {
           <AlertDescription className="flex flex-col gap-3">
             <span>{error}</span>
             <div>
-              <Button variant="outline" size="sm" onClick={() => void load(days, scope)}>
+              <Button variant="outline" size="sm" onClick={() => void refresh()}>
                 <RefreshCw />
                 重试
               </Button>
@@ -248,7 +249,7 @@ export default function TraeTokenStatsPage() {
           {/* 产品线切换器：Trae 分区的每个页面都可切，位置固定在页头右侧动作区。 */}
           <TraeVariantSwitch />
           <DemoAction>
-            <Button variant="outline" size="sm" disabled={loading} onClick={() => void load(days, scope)}>
+            <Button variant="outline" size="sm" disabled={loading} onClick={() => void refresh()}>
               {loading ? <Loader2 className="animate-spin" /> : <RefreshCw />}
               刷新
             </Button>

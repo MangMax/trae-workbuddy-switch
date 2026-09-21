@@ -63,11 +63,31 @@ import type {
   TraeVariantStatus,
 } from "@/lib/trae-types";
 import { cn } from "@/lib/utils";
+import { useCachedResource } from "@/lib/use-cached-resource";
 import { useCompactMode } from "@/lib/use-compact-mode";
 import { useTraeVariant } from "@/lib/use-trae-variant";
 
 /** 未分组在过滤器里的哨兵值（`Select` 不接受空字符串作为 value）。 */
 const UNGROUPED = "__ungrouped__";
+
+/**
+ * 账号页的快照。
+ *
+ * 这些数据**必须一起**缓存：卡片上的程序切换按钮要同时用到账号、程序位与各区域
+ * 登录态，分开缓存会让「账号已是新的、按钮还是旧的」这种不一致有缝可钻。
+ *
+ * 缓存键里带 `variant`（产品线），所以切到另一条线绝不会渲染出上一条线的数据。
+ */
+interface AccountsSnapshot {
+  overview: TraeAccountsOverview;
+  env: TraeEnvStatus;
+  credits: TraeCreditsOverview;
+  checkin: TraeCheckinStatus;
+  /** 本机全部产品线的环境状态（并排视角），账号卡片与状态条共用。 */
+  variantStatuses: TraeVariantStatus[];
+  /** 每条产品线各自的当前登录账号（`profiles.currentAccount`）。 */
+  logins: TraeVariantLogins;
+}
 
 /**
  * 「账号管理」页（Trae 分区）。
@@ -95,8 +115,6 @@ const UNGROUPED = "__ungrouped__";
  * - 没有自动旅行（Trae 侧不存在该客户端）。
  */
 export default function TraeAccountsPage() {
-  const [overview, setOverview] = useState<TraeAccountsOverview | null>(null);
-  const [env, setEnv] = useState<TraeEnvStatus | null>(null);
   /**
    * 当前正在管理的**产品线变体**，由侧栏分区决定（URL `?line=`）。
    *
@@ -108,8 +126,60 @@ export default function TraeAccountsPage() {
    * 「该线的安装/运行状态」。两者分工不同，不要混为一谈。
    */
   const [variant] = useTraeVariant();
-  const [credits, setCredits] = useState<TraeCreditsOverview | null>(null);
-  const [checkin, setCheckin] = useState<TraeCheckinStatus | null>(null);
+
+  /**
+   * 一次取齐本页快照。四份分家数据全部按**当前选中的产品线**读取，与侧栏分区同源。
+   * `env` 仍然单独取：它是「单一视角」的环境快照，用于展示该线的安装/运行状态。
+   *
+   * `statuses` 与「各线当前账号」则是**跨产品线**的：卡片上的程序切换按钮条
+   * （对应 WorkBuddy 卡片的 WorkBuddy / CodeBuddy IDE / CLI 三枚按钮）必须知道
+   * 「本机装了哪几条线、每条线当前挂的是哪个账号」，缺一条就渲染不出那一枚按钮。
+   */
+  const loadSnapshot = useCallback(async (): Promise<AccountsSnapshot> => {
+    const [accountData, envData, creditData, checkinData, statuses] = await Promise.all([
+      api.getTraeAccounts(variant),
+      api.getTraeEnv(),
+      api.getTraeCredits(variant),
+      api.getTraeCheckinStatus(variant),
+      loadTraeVariantStatuses(),
+    ]);
+    // 登录态读取依赖刚拿到的产品线清单（要遍历它逐条读），故串在探测之后。
+    // 它自己逐条容错：某条线读不到只记 `null`，不会把整页拖成错误态。
+    const currentLogins = await loadTraeVariantLogins(statuses);
+    return {
+      overview: accountData,
+      env: envData,
+      credits: creditData,
+      checkin: checkinData,
+      variantStatuses: statuses,
+      logins: currentLogins,
+    };
+  }, [variant]);
+
+  /**
+   * 快照缓存（`stores/resources.ts`）。
+   *
+   * 数据持有权从组件搬到 store，是为了**跨挂载存活**：侧栏切到 WorkBuddy 再切回来时
+   * 页面组件会卸载重建，数据留在 store 里 ⇒ 重挂载立刻渲染真数据、不再闪骨架。
+   * `loadAll` 是「强制重取并等待」，变更操作（签到 / 切换 / 删除 / 导入）之后必须调它。
+   */
+  const {
+    data: snapshot,
+    loading,
+    error,
+    refresh: loadAll,
+  } = useCachedResource<AccountsSnapshot>(`trae:accounts:${variant}`, loadSnapshot);
+
+  /**
+   * 签到跳过策略存在设置里，与设置页**共用同一把键** `trae:settings`：
+   * 两个页面本来就都读同一份 `get_trae_settings`，共用键之后「设置页改完、账号页
+   * 立刻是新的」在结构上成立，而不是靠各自重取去撞。
+   */
+  const { data: settings, patch: patchSettings } = useCachedResource<TraeSettings>(
+    "trae:settings",
+    api.getTraeSettings,
+  );
+
   /**
    * 本机全部 Trae 产品线的环境状态（并排视角），与状态条、卡片共用同一份。
    *
@@ -121,7 +191,11 @@ export default function TraeAccountsPage() {
    * 用占位起步、加载完成后替换，形态与 WorkBuddy 的 region Tabs 一致
    * （后者也是先渲染两枚 Tab，再逐区填状态）。
    */
-  const [variantStatuses, setVariantStatuses] = useState<TraeVariantStatus[]>(TRAE_VARIANT_FALLBACK);
+  const overview = snapshot?.overview ?? null;
+  const env = snapshot?.env ?? null;
+  const credits = snapshot?.credits ?? null;
+  const checkin = snapshot?.checkin ?? null;
+  const variantStatuses = snapshot?.variantStatuses ?? TRAE_VARIANT_FALLBACK;
   /**
    * 每条产品线各自的当前登录账号（`profiles.currentAccount`）。
    *
@@ -129,10 +203,8 @@ export default function TraeAccountsPage() {
    * 同一个 Trae 账号完全可以同时是 Trae Work 的当前账号、却不是 Trae CN 的。
    * 只拿当前线的值会让另一枚按钮永远显示成「未启用」——那是谎报，不是简化。
    */
-  const [logins, setLogins] = useState<TraeVariantLogins>({});
-  const [settings, setSettings] = useState<TraeSettings | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const logins = snapshot?.logins ?? {};
+
   const [busy, setBusy] = useState<string | null>(null);
   const [autoCheckinSaving, setAutoCheckinSaving] = useState(false);
   const [oauthOpen, setOauthOpen] = useState(false);
@@ -163,46 +235,6 @@ export default function TraeAccountsPage() {
    * 一次性取齐、同一次渲染下发，不一致在结构上就不可能出现 —— 修订号随之取消，
    * 它要解决的问题已经不存在了。
    */
-
-  const loadAll = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      // 四份分家数据全部按**当前选中的产品线**读取，与侧栏分区同源。
-      // `env` 仍然单独取：它是「单一视角」的环境快照，用于展示该线的安装/运行状态。
-      //
-      // `statuses` 与「各线当前账号」则是**跨产品线**的：卡片上的程序切换按钮条
-      // （对应 WorkBuddy 卡片的 WorkBuddy / CodeBuddy IDE / CLI 三枚按钮）必须知道
-      // 「本机装了哪几条线、每条线当前挂的是哪个账号」，缺一条就渲染不出那一枚按钮。
-      const [accountData, envData, creditData, checkinData, settingsData, statuses] =
-        await Promise.all([
-          api.getTraeAccounts(variant),
-          api.getTraeEnv(),
-          api.getTraeCredits(variant),
-          api.getTraeCheckinStatus(variant),
-          api.getTraeSettings(),
-          loadTraeVariantStatuses(),
-        ]);
-      // 登录态读取依赖刚拿到的产品线清单（要遍历它逐条读），故串在探测之后。
-      // 它自己逐条容错：某条线读不到只记 `null`，不会把整页拖成错误态。
-      const currentLogins = await loadTraeVariantLogins(statuses);
-      setOverview(accountData);
-      setEnv(envData);
-      setCredits(creditData);
-      setCheckin(checkinData);
-      setSettings(settingsData);
-      setVariantStatuses(statuses);
-      setLogins(currentLogins);
-    } catch (e) {
-      setError(api.asError(e));
-    } finally {
-      setLoading(false);
-    }
-  }, [variant]);
-
-  useEffect(() => {
-    void loadAll();
-  }, [loadAll]);
 
   /**
    * 一次性把旧「产品线」账号库并入国内版区域账号库（幂等）。
@@ -267,12 +299,25 @@ export default function TraeAccountsPage() {
   }, []);
 
   /** 统一的动作执行：加忙标记、成功提示、失败提示、随后刷新聚合数据。 */
-  async function run<T>(key: string, label: string, action: () => Promise<T>, after?: (result: T) => void) {
+  async function run<T>(
+    key: string,
+    label: string,
+    action: () => Promise<T>,
+    after?: (result: T) => void,
+    /**
+     * 自定义成功文案；返回 `null` 表示用默认的「{label}完成」。
+     *
+     * 用途：有些操作「成功」与「什么都没做」都算成功（如全部签到遇到
+     * 「今日已全部签过」），统一报「完成」会让用户以为刚签了一遍。
+     */
+    successMessage?: (result: T) => string | null,
+  ) {
     setBusy(key);
     try {
       const result = await action();
       after?.(result);
-      toast.success(`${label}完成`);
+      const custom = successMessage?.(result);
+      toast.success(custom ?? `${label}完成`);
       await loadAll();
     } catch (e) {
       toast.error(`${label}失败`, { description: api.asError(e) });
@@ -292,12 +337,15 @@ export default function TraeAccountsPage() {
   async function onSkipCheckedChange(enabled: boolean) {
     if (!settings || autoCheckinSaving) return;
     const previous = settings;
-    setSettings({ ...settings, checkinSkipChecked: enabled });
+    // 乐观更新写进**快照缓存**而不是组件 state：这个值现在归 `trae:settings` 那把键
+    // 所有，写回本地 state 会让「设置页/账号页读到同一份」在结构上不再成立。
+    patchSettings(() => ({ ...previous, checkinSkipChecked: enabled }));
     setAutoCheckinSaving(true);
     try {
-      setSettings(await api.saveTraeSettings({ checkinSkipChecked: enabled }));
+      const saved = await api.saveTraeSettings({ checkinSkipChecked: enabled });
+      patchSettings(() => saved);
     } catch (e) {
-      setSettings(previous);
+      patchSettings(() => previous);
       toast.error("设置保存失败", { description: api.asError(e) });
     } finally {
       setAutoCheckinSaving(false);
@@ -332,6 +380,9 @@ export default function TraeAccountsPage() {
         return result;
       },
       (result) => setReport(result),
+      // 「跳过今日已签到」打开时，一轮只处理**本轮还没签过的**账号：全都签过时
+      // `total` 为 0，报「签到并刷新积分完成」会让人以为刚签了一遍。
+      (result) => (result.total === 0 ? "没有需要签到的账号" : null),
     );
   }
 
@@ -831,6 +882,13 @@ export default function TraeAccountsPage() {
             {!report && progress?.type === "account" && (
               <div className="px-5 py-2.5 text-sm text-muted-foreground">
                 {progress.name}：{progress.status === "success" ? "成功" : progress.status === "already" ? "已签到" : "失败"}
+              </div>
+            )}
+            {/* 空队列要说明白「为什么一条都没有」，否则看着像功能坏了 ——
+                打开「跳过今日已签到」后这是最常见的一种正常结果。 */}
+            {report && report.results.length === 0 && (
+              <div className="px-5 py-2.5 text-sm text-muted-foreground">
+                本轮没有需要签到的账号（今日已签到、冷却中或凭据过期）。
               </div>
             )}
           </div>

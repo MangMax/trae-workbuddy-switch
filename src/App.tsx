@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ComponentType } from "react";
+import { useEffect, useMemo, useRef, useState, type ComponentType } from "react";
 import { BrowserRouter, HashRouter, Navigate, NavLink, Outlet, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import { ArrowUp, MessagesSquare, Server, Settings, Sparkles, User } from "lucide-react";
 
@@ -23,6 +23,9 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Toaster } from "@/components/ui/sonner";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { demoModeEnabled, pagesDemoHostingEnabled } from "@/lib/demo-mode";
+import { TRAE_VARIANTS_KEY, loadTraeVariantStatuses } from "@/lib/trae-variant-status";
+import type { TraeVariantStatus } from "@/lib/trae-types";
+import { useCachedResource } from "@/lib/use-cached-resource";
 import { useTraeVariant } from "@/lib/use-trae-variant";
 import { useCreditAutoRefresh } from "@/lib/use-credit-auto-refresh";
 import { useWorkbuddyStatusRefresh } from "@/lib/use-workbuddy-status-refresh";
@@ -143,33 +146,33 @@ function navLinkClass({ isActive }: { isActive: boolean }): string {
  * **返回两条线各自的运行状态**（而不是单一的 true/false）：
  * 侧栏底部那颗圆点跟随**当前选中的那条线**，若只探测「Trae 是否在运行」，
  * 在「Trae Work 已关闭、Trae CN 在运行」时就会显示错误的绿灯。
+ *
+ * ## 走快照缓存的两个理由
+ *
+ * 1. **不让圆点在每次切换时先灰一下再变绿**：不缓存的话，切回 Trae 分区的那一帧
+ *    状态是空的，圆点会闪一次「未运行」。
+ * 2. **`freshMs` 给 60 秒**：这颗圆点是**装饰性**的（真实状态在 Trae 页面的状态条
+ *    上），不值得每次切换都重探一次；窗口之外照旧后台重校验，每分钟也仍有一次定时刷新。
+ *
+ * 键在「不在 Trae 分区」时置为 `null`（不缓存、不探测），避免在 WorkBuddy 分区下白跑。
  */
 function useTraeVariantRunning(active: boolean): Record<string, boolean> {
-  const [running, setRunning] = useState<Record<string, boolean>>({});
+  const { data, refresh } = useCachedResource<TraeVariantStatus[]>(
+    active ? TRAE_VARIANTS_KEY : null,
+    loadTraeVariantStatuses,
+    { freshMs: 60 * 1000 },
+  );
 
   useEffect(() => {
     if (!active) return;
-    let disposed = false;
-    const load = async () => {
-      try {
-        const result = await api.getTraeVariants();
-        if (disposed) return;
-        setRunning(
-          Object.fromEntries((result.variants ?? []).map((item) => [item.variant, item.running])),
-        );
-      } catch {
-        if (!disposed) setRunning({});
-      }
-    };
-    void load();
-    const timer = window.setInterval(() => void load(), 60 * 1000);
-    return () => {
-      disposed = true;
-      window.clearInterval(timer);
-    };
-  }, [active]);
+    const timer = window.setInterval(() => void refresh(), 60 * 1000);
+    return () => window.clearInterval(timer);
+  }, [active, refresh]);
 
-  return running;
+  return useMemo(
+    () => Object.fromEntries((data ?? []).map((item) => [item.variant, item.running])),
+    [data],
+  );
 }
 
 /** 侧栏顶部的产品切换：下方的导航与主区域页面都跟随它。 */

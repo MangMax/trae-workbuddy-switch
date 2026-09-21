@@ -67,6 +67,15 @@ export const TRAE_VARIANT_FALLBACK: TraeVariantStatus[] = [
 export type TraeVariantLogins = Partial<Record<TraeVariantId, string | null>>;
 
 /**
+ * 「全部区域的环境状态」在快照缓存里的键。
+ *
+ * **只此一份**：侧栏那颗运行状态圆点与账号页都要用这份探测结果，
+ * 各自写一遍字符串字面量迟早漂移成两把不同的键（症状是「缓存命中不了、
+ * 每次切换都重新探测」，而且不会有任何报错）。
+ */
+export const TRAE_VARIANTS_KEY = "trae:variants";
+
+/**
  * 读取**全部区域**的环境状态（并排视角）。
  *
  * 返回**永不为空**：探测命令不可用（演示模式、后端未起来）或返回空列表时，

@@ -56,6 +56,7 @@ import type {
   TraeVariantId,
 } from "@/lib/trae-types";
 import { cn } from "@/lib/utils";
+import { useCachedResource } from "@/lib/use-cached-resource";
 
 // ---------------------------------------------------------------------------
 // 板块骨架：与 WorkBuddy 的 SettingsPage 共用同一实现
@@ -112,40 +113,40 @@ function RuntimeLogsSection() {
   const [keywordDraft, setKeywordDraft] = useState("");
   const [keyword, setKeyword] = useState("");
   const [autoRefresh, setAutoRefresh] = useState(true);
-  const [data, setData] = useState<TraeLogsResponse | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
 
-  const load = useCallback(async () => {
-    setError(null);
-    try {
-      const result = await api.getTraeLogs({
+  /**
+   * 键里带上四个筛选条件（含变体）：任何一个变了都是**另一份**结果，
+   * 漏在键外就会出现「换了日期、列表还是旧的」。
+   */
+  const load = useCallback(
+    () =>
+      api.getTraeLogs({
         kind,
         date: date === "all" ? undefined : date,
         keyword: keyword || undefined,
         variant,
-      });
-      setData(result);
-    } catch (e) {
-      setError(api.asError(e));
-    } finally {
-      setLoading(false);
-    }
-  }, [kind, date, keyword, variant]);
+      }),
+    [kind, date, keyword, variant],
+  );
 
-  useEffect(() => {
-    setLoading(true);
-    void load();
-  }, [load]);
+  const {
+    data,
+    loading,
+    error,
+    refresh,
+  } = useCachedResource<TraeLogsResponse>(
+    `trae:logs:${variant}:${kind}:${date}:${keyword}`,
+    load,
+  );
 
   // 自动刷新只在「没有未提交的输入」时跑：否则用户正在输入关键字，
   // 每次刷新都会把列表换成旧条件的结果，看起来像在抖。
   const dirty = keywordDraft !== keyword;
   useEffect(() => {
     if (!autoRefresh || dirty) return;
-    const timer = setInterval(() => void load(), 2000);
+    const timer = setInterval(() => void refresh(), 2000);
     return () => clearInterval(timer);
-  }, [autoRefresh, dirty, load]);
+  }, [autoRefresh, dirty, refresh]);
 
   const entries = data?.entries ?? [];
   const counts = data?.counts;
@@ -259,7 +260,7 @@ function RuntimeLogsSection() {
               <Download />
               导出 CSV
             </Button>
-            <Button variant="outline" size="sm" disabled={loading} onClick={() => void load()}>
+            <Button variant="outline" size="sm" disabled={loading} onClick={() => void refresh()}>
               {loading ? <Loader2 className="animate-spin" /> : <RefreshCw />}
               刷新
             </Button>
@@ -387,37 +388,40 @@ function statusTone(status: number): string {
  * 提供状态码筛选、关键字搜索、逐条详情抽屉与清空。
  */
 function GatewayLogsSection() {
-  const [logs, setLogs] = useState<TraeGatewayLogEntry[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
   const [statusFilter, setStatusFilter] = useState<string>("all");
   const [keyword, setKeyword] = useState("");
   const [detail, setDetail] = useState<TraeGatewayLogEntry | null>(null);
   const [clearing, setClearing] = useState(false);
+  /**
+   * 「清空日志」失败的文案。
+   *
+   * 读侧的错误归快照缓存所有（`error` 只读），而清空是**动作**、它的失败没有快照
+   * 可挂，因此单独一个本地状态。两者共用同一个提示位，与改造前的表现一致。
+   */
+  const [actionError, setActionError] = useState<string | null>(null);
 
-  const load = useCallback(async () => {
-    setError(null);
-    try {
-      setLogs(normalizeTraeGatewayLogs(await api.getTraeGatewayLogs()));
-    } catch (e) {
-      setError(api.asError(e));
-    } finally {
-      setLoading(false);
-    }
-  }, []);
+  /** 日志已在加载器里归一化：消费方拿到的一定是数组，不必各自兜底。 */
+  const load = useCallback(async () => normalizeTraeGatewayLogs(await api.getTraeGatewayLogs()), []);
 
-  useEffect(() => {
-    void load();
-  }, [load]);
+  const {
+    data,
+    loading,
+    error,
+    refresh,
+    patch,
+  } = useCachedResource<TraeGatewayLogEntry[]>("trae:gateway-logs", load);
+  const logs = data ?? [];
+  const failure = error ?? actionError;
 
   const clear = async () => {
     setClearing(true);
     try {
       await api.clearTraeGatewayLogs();
-      setLogs([]);
+      setActionError(null);
+      patch(() => []);
       toast.success("日志已清空");
     } catch (e) {
-      setError(api.asError(e));
+      setActionError(api.asError(e));
     } finally {
       setClearing(false);
     }
@@ -471,7 +475,7 @@ function GatewayLogsSection() {
               className="h-8 pl-8"
             />
           </div>
-          <Button variant="outline" size="sm" disabled={loading} onClick={() => void load()}>
+          <Button variant="outline" size="sm" disabled={loading} onClick={() => void refresh()}>
             {loading ? <Loader2 className="animate-spin" /> : <RefreshCw />}
             刷新
           </Button>
@@ -495,12 +499,12 @@ function GatewayLogsSection() {
         </p>
       </div>
 
-      {error && (
+      {failure && (
         <div className="px-4 pb-4 sm:px-5">
           <Alert variant="destructive">
             <AlertTriangle />
             <AlertTitle>读取网关日志失败</AlertTitle>
-            <AlertDescription>{error}</AlertDescription>
+            <AlertDescription>{failure}</AlertDescription>
           </Alert>
         </div>
       )}
@@ -832,6 +836,18 @@ function ProfilesSection({
 // ---------------------------------------------------------------------------
 
 /**
+ * 设置页除「设置项」之外的只读快照。
+ *
+ * 设置项本身不在这里：它与账号页的「跳过今日已签到」开关是同一份
+ * `get_trae_settings`，因此单独一把键 `trae:settings`、两个页面共用。
+ */
+interface SettingsPageSnapshot {
+  env: TraeEnvStatus;
+  capabilities: TraeCapabilities;
+  profiles: TraeProfilesOverview;
+}
+
+/**
  * 「设置」页（Trae 分区）。
  *
  * 板块顺序与 WorkBuddy 设置页同构（外观 → 客户端 → 端口与网络 → 策略 → 高级）。
@@ -841,51 +857,53 @@ function ProfilesSection({
 export default function TraeSettingsPage() {
   // 快照按产品线分家（`paths::profiles_dir_for`），故这里也必须带上变体。
   const [variant] = useTraeVariant();
-  const [settings, setSettings] = useState<TraeSettings | null>(null);
-  const [env, setEnv] = useState<TraeEnvStatus | null>(null);
-  const [capabilities, setCapabilities] = useState<TraeCapabilities | null>(null);
-  const [profiles, setProfiles] = useState<TraeProfilesOverview | null>(null);
-  const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [resetOpen, setResetOpen] = useState(false);
   const [resetBusy, setResetBusy] = useState(false);
   const [resetReport, setResetReport] = useState<TraeDeviceResetReport | null>(null);
 
-  const load = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const [settingsData, envData, capabilityData, profileData] = await Promise.all([
-        api.getTraeSettings(),
-        api.getTraeEnv(),
-        api.getTraeCapabilities(),
-        api.getTraeProfiles(variant),
-      ]);
-      setSettings(settingsData);
-      setEnv(envData);
-      setCapabilities(capabilityData);
-      setProfiles(profileData);
-    } catch (e) {
-      setError(api.asError(e));
-    } finally {
-      setLoading(false);
-    }
+  /**
+   * 设置页除「设置项」之外的只读快照。
+   *
+   * 设置项**不在这里**：它与账号页的「跳过今日已签到」开关是同一份
+   * `get_trae_settings`，因此单独一把键 `trae:settings`、两个页面共用 ——
+   * 一处改完，另一处下次挂载拿到的就是新值。
+   */
+  const loadSnapshot = useCallback(async (): Promise<SettingsPageSnapshot> => {
+    const [envData, capabilityData, profileData] = await Promise.all([
+      api.getTraeEnv(),
+      api.getTraeCapabilities(),
+      api.getTraeProfiles(variant),
+    ]);
+    return { env: envData, capabilities: capabilityData, profiles: profileData };
   }, [variant]);
 
-  useEffect(() => {
-    void load();
-  }, [load]);
+  const {
+    data: pageSnapshot,
+    loading,
+    error,
+    refresh: load,
+  } = useCachedResource<SettingsPageSnapshot>(`trae:settings-page:${variant}`, loadSnapshot);
+
+  /** 设置项本身：与账号页共用 `trae:settings`，写入一律走 `patchSettings`（乐观更新）。 */
+  const { data: settings, patch: patchSettings } = useCachedResource<TraeSettings>(
+    "trae:settings",
+    api.getTraeSettings,
+  );
+
+  const env = pageSnapshot?.env ?? null;
+  const capabilities = pageSnapshot?.capabilities ?? null;
+  const profiles = pageSnapshot?.profiles ?? null;
 
   async function patch(next: Partial<TraeSettings>) {
     if (!settings) return;
     setSaving(true);
     // 乐观更新：设置项是单值开关/输入，本地先落再回读，避免每次拖动开关都等一轮往返。
-    setSettings({ ...settings, ...next });
+    patchSettings((prev) => ({ ...prev, ...next }));
     try {
       const saved = await api.saveTraeSettings(next);
-      setSettings(saved);
+      patchSettings(() => saved);
     } catch (e) {
       toast.error("保存失败", { description: api.asError(e) });
       await load();
@@ -1013,7 +1031,7 @@ export default function TraeSettingsPage() {
                 id="trae-path"
                 className="h-8 sm:w-80"
                 value={settings?.traePath ?? ""}
-                onChange={(event) => setSettings((prev) => (prev ? { ...prev, traePath: event.target.value } : prev))}
+                onChange={(event) => patchSettings((prev) => ({ ...prev, traePath: event.target.value }))}
                 placeholder={env?.path ?? "留空则自动探测常见安装位置"}
               />
               <Button
@@ -1044,7 +1062,7 @@ export default function TraeSettingsPage() {
               inputMode="numeric"
               value={settings?.proxyPort ?? ""}
               onChange={(event) =>
-                setSettings((prev) => (prev ? { ...prev, proxyPort: Number(event.target.value) || 0 } : prev))
+                patchSettings((prev) => ({ ...prev, proxyPort: Number(event.target.value) || 0 }))
               }
               onBlur={() => void patch({ proxyPort: settings?.proxyPort ?? 8899 })}
             />
@@ -1060,7 +1078,7 @@ export default function TraeSettingsPage() {
               inputMode="numeric"
               value={settings?.apiPort ?? ""}
               onChange={(event) =>
-                setSettings((prev) => (prev ? { ...prev, apiPort: Number(event.target.value) || 0 } : prev))
+                patchSettings((prev) => ({ ...prev, apiPort: Number(event.target.value) || 0 }))
               }
               onBlur={() => void patch({ apiPort: settings?.apiPort ?? 7864 })}
             />
@@ -1075,7 +1093,7 @@ export default function TraeSettingsPage() {
               className="h-8 w-full font-mono text-xs sm:w-80"
               value={settings?.proxyDomains ?? ""}
               onChange={(event) =>
-                setSettings((prev) => (prev ? { ...prev, proxyDomains: event.target.value } : prev))
+                patchSettings((prev) => ({ ...prev, proxyDomains: event.target.value }))
               }
               onBlur={() => void patch({ proxyDomains: settings?.proxyDomains ?? "" })}
             />
@@ -1119,7 +1137,7 @@ export default function TraeSettingsPage() {
               inputMode="numeric"
               value={settings?.retry ?? 1}
               onChange={(event) =>
-                setSettings((prev) => (prev ? { ...prev, retry: Number(event.target.value) || 0 } : prev))
+                patchSettings((prev) => ({ ...prev, retry: Number(event.target.value) || 0 }))
               }
               onBlur={() => void patch({ retry: settings?.retry ?? 1 })}
             />
@@ -1135,9 +1153,7 @@ export default function TraeSettingsPage() {
               inputMode="numeric"
               value={settings?.logRetentionDays ?? 30}
               onChange={(event) =>
-                setSettings((prev) =>
-                  prev ? { ...prev, logRetentionDays: Number(event.target.value) || 0 } : prev,
-                )
+                patchSettings((prev) => ({ ...prev, logRetentionDays: Number(event.target.value) || 0 }))
               }
               onBlur={() => void patch({ logRetentionDays: settings?.logRetentionDays ?? 30 })}
             />

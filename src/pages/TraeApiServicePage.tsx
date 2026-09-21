@@ -35,10 +35,27 @@ import {
 } from "@/lib/trae-gateway";
 import type { TraeGatewayConfig, TraeGatewayLogEntry, TraeGatewayModel, TraeGatewayStatus } from "@/lib/trae-types";
 import { cn } from "@/lib/utils";
+import { useCachedResource } from "@/lib/use-cached-resource";
 import { useTraeVariant } from "@/lib/use-trae-variant";
 
 const LOOPBACK = "127.0.0.1";
 const LAN = "0.0.0.0";
+
+/**
+ * 本页快照：网关配置 / 监听状态 / 模型清单 / 请求日志。
+ *
+ * 四者一起缓存：它们在同一次 `Promise.all` 里取、也一起被保存与清空操作改写，
+ * 拆开缓存只会让「配置已保存、状态还是旧的」这种中间态有缝可钻。
+ *
+ * `status` 允许为 `null`（尚未取到），`config` 用默认值兜底 —— 快照还没回来时
+ * 表单也还没渲染，因此默认值只服务于类型完整，不会先显示假端口再跳一下。
+ */
+interface ApiServiceSnapshot {
+  config: TraeGatewayConfig;
+  status: TraeGatewayStatus | null;
+  models: TraeGatewayModel[];
+  logs: TraeGatewayLogEntry[];
+}
 
 /**
  * 「API 服务」页（Trae 分区）。
@@ -64,54 +81,72 @@ const LAN = "0.0.0.0";
 export default function TraeApiServicePage() {
   /** 当前产品线：决定读哪个账号池（`trae_gateway_status(variant)`）与归属列默认值。 */
   const [variant] = useTraeVariant();
-  const [config, setConfig] = useState<TraeGatewayConfig>(DEFAULT_TRAE_GATEWAY_CONFIG);
-  const [status, setStatus] = useState<TraeGatewayStatus | null>(null);
-  const [models, setModels] = useState<TraeGatewayModel[]>([]);
-  const [logs, setLogs] = useState<TraeGatewayLogEntry[]>([]);
-  const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [clearing, setClearing] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [portDraft, setPortDraft] = useState(String(DEFAULT_TRAE_GATEWAY_CONFIG.port));
   const [riskOpen, setRiskOpen] = useState(false);
   const [openingDir, setOpeningDir] = useState(false);
 
-  const loadAll = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const [configRaw, statusRaw, modelsRaw, logsRaw] = await Promise.all([
-        api.getTraeGatewayConfig(),
-        api.getTraeGatewayStatus(variant),
-        api.getTraeGatewayModels(),
-        api.getTraeGatewayLogs(),
-      ]);
-      const nextConfig = normalizeTraeGatewayConfig(configRaw);
-      setConfig(nextConfig);
-      setPortDraft(String(nextConfig.port));
-      setStatus(normalizeTraeGatewayStatus(statusRaw));
-      setModels(readModels(modelsRaw));
-      setLogs(normalizeTraeGatewayLogs(logsRaw));
-    } catch (e) {
-      setError(api.asError(e));
-    } finally {
-      setLoading(false);
-    }
+  const loadSnapshot = useCallback(async (): Promise<ApiServiceSnapshot> => {
+    const [configRaw, statusRaw, modelsRaw, logsRaw] = await Promise.all([
+      api.getTraeGatewayConfig(),
+      api.getTraeGatewayStatus(variant),
+      api.getTraeGatewayModels(),
+      api.getTraeGatewayLogs(),
+    ]);
+    return {
+      config: normalizeTraeGatewayConfig(configRaw),
+      status: normalizeTraeGatewayStatus(statusRaw),
+      models: readModels(modelsRaw),
+      logs: normalizeTraeGatewayLogs(logsRaw),
+    };
   }, [variant]);
 
+  /**
+   * 快照缓存：切到 WorkBuddy 再切回来时不再闪骨架。变更操作（保存配置、清空日志）
+   * 走 `patch` 就地改写快照，而不是写组件 state —— 值归缓存所有，两处写迟早分歧。
+   */
+  const {
+    data: snapshot,
+    loading,
+    error,
+    refresh: loadAll,
+    patch,
+  } = useCachedResource<ApiServiceSnapshot>(`trae:api-service:${variant}`, loadSnapshot);
+
+  const config = snapshot?.config ?? DEFAULT_TRAE_GATEWAY_CONFIG;
+  const status = snapshot?.status ?? null;
+  const models = snapshot?.models ?? [];
+  const logs = snapshot?.logs ?? [];
+
+  /**
+   * 端口输入框的草稿值。
+   *
+   * 与 `config.port` 同步的时机是「`config.port` 本身变了」：加载完成、保存成功后
+   * 都会变，而用户打字期间 `config.port` 不动，所以输入不会被打断。
+   * 初值直接取当前配置，因此**带着缓存重挂载时不会先显示默认端口再跳一下**。
+   */
+  const [portDraft, setPortDraft] = useState(() => String(config.port));
   useEffect(() => {
-    void loadAll();
-  }, [loadAll]);
+    setPortDraft(String(config.port));
+  }, [config.port]);
+
+  /** 就地改写快照（保留其余字段）。 */
+  const patchSnapshot = useCallback(
+    (next: Partial<ApiServiceSnapshot>) => {
+      patch((current) => ({ ...current, ...next }));
+    },
+    [patch],
+  );
 
   async function persist(next: Partial<TraeGatewayConfig>) {
     const merged = { ...config, ...next };
     setSaving(true);
     try {
       await api.saveTraeGatewayConfig(toTraeGatewayConfigRaw(merged));
-      setConfig(merged);
-      // 保存会启动/重启监听，状态与日志都要重读（仍按当前产品线）。
+      patchSnapshot({ config: merged });
+      // 保存会启动/重启监听，状态要重读（仍按当前产品线）。
       const statusRaw = await api.getTraeGatewayStatus(variant);
-      setStatus(normalizeTraeGatewayStatus(statusRaw));
+      patchSnapshot({ status: normalizeTraeGatewayStatus(statusRaw) });
       toast.success(merged.enabled ? "网关已保存并启动" : "网关已保存（未启用监听）");
     } catch (e) {
       toast.error("保存失败", { description: api.asError(e) });
@@ -149,7 +184,7 @@ export default function TraeApiServicePage() {
     setClearing(true);
     try {
       await api.clearTraeGatewayLogs();
-      setLogs([]);
+      patchSnapshot({ logs: [] });
       toast.success("日志已清空");
     } catch (e) {
       toast.error("清空失败", { description: api.asError(e) });

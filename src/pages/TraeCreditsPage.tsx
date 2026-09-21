@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import {
   AlertTriangle,
   CalendarDays,
@@ -24,6 +24,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import * as api from "@/lib/api";
 import type { TraeAccountsOverview, TraeCreditsOverview } from "@/lib/trae-types";
 import { cn } from "@/lib/utils";
+import { useCachedResource } from "@/lib/use-cached-resource";
 import { useTraeVariant } from "@/lib/use-trae-variant";
 
 /** 趋势图展示的天数（含今日）。 */
@@ -101,34 +102,36 @@ function StatMetric({
 export default function TraeCreditsPage() {
   /** 当前产品线（由侧栏分区 / URL `?line=` 决定），决定读哪份积分与账号数据。 */
   const [variant] = useTraeVariant();
-  const [credits, setCredits] = useState<TraeCreditsOverview | null>(null);
-  const [overview, setOverview] = useState<TraeAccountsOverview | null>(null);
-  const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
-  const [error, setError] = useState<string | null>(null);
 
-  const loadAll = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      // 积分与账号两份数据都按**当前选中的产品线**读：它们的分家文件不同，
-      // 混读会让「积分趋势」是 Trae CN 的、而「账号列表」是 Trae Work 的。
+  /**
+   * 积分与账号两份数据都按**当前选中的产品线**读：它们的分家文件不同，
+   * 混读会让「积分趋势」是 Trae CN 的、而「账号列表」是 Trae Work 的。
+   *
+   * 两者放在**同一个快照**里：账号名与分组来自账号视图，积分缓存只存 uid，
+   * 展示必须回表取名字 —— 拆成两个快照就会出现「积分已刷新、名字还是旧的」这种
+   * 中间态。
+   */
+  const loadSnapshot = useCallback(
+    async (): Promise<{ credits: TraeCreditsOverview; overview: TraeAccountsOverview }> => {
       const [creditData, accountData] = await Promise.all([
         api.getTraeCredits(variant),
         api.getTraeAccounts(variant),
       ]);
-      setCredits(creditData);
-      setOverview(accountData);
-    } catch (e) {
-      setError(api.asError(e));
-    } finally {
-      setLoading(false);
-    }
-  }, [variant]);
+      return { credits: creditData, overview: accountData };
+    },
+    [variant],
+  );
 
-  useEffect(() => {
-    void loadAll();
-  }, [loadAll]);
+  const {
+    data: snapshot,
+    loading,
+    error,
+    refresh: loadAll,
+  } = useCachedResource(`trae:credits:${variant}`, loadSnapshot);
+
+  const credits = snapshot?.credits ?? null;
+  const overview = snapshot?.overview ?? null;
 
   const accounts = overview?.accounts ?? [];
   const groups = overview?.groups ?? [];
