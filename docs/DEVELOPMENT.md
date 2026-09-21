@@ -30,6 +30,23 @@ npm run build:app:release  # 构建 release .app + 签名更新包
 2. 先 `sh scripts/gen-platform-packages.sh <版本>` 生成 5 个平台包（`buddy-switch-<platform>-<arch>`），把对应二进制放进各包 `bin/` 后逐个 `npm publish`
 3. `cd npm && npm publish`（主包名 `buddy-switch`，`postinstall` 从已安装的平台包复制二进制）
 
+> ⚠️ **发布前先确认包名可用**：截至 2026-09-21，`buddy-switch` 在 npm 上**已被他人占用**
+> （`0.1.2`，描述 "Customize your Claude Code buddy pet"，维护者 `zjding`），直接 `npm publish` 会 403，
+> 而 `npm i -g buddy-switch` 会装上别人的包。需要用别的名字（例如 scope 包）或保留旧名
+> `workbuddy-switch`（该名字下的 `0.1.x` 是本项目此前的发布）。
+
+### 在线演示（GitHub Pages）部署前提
+
+`.github/workflows/pages.yml` 在每次 push 到 `main` 时构建只读演示并部署。
+**首次部署前必须先手动启用 Pages**：仓库 Settings → Pages → Source 选 **GitHub Actions**。
+
+未启用时该工作流会**恰好失败在 `Configure Pages` 这一步**（前面的 `npm ci` 与
+`npm run build:demo` 都是通过的，容易误判成构建坏了），并且此后每次 push 都会留一条红的 run。
+
+> **不要试图用 `enablement: true` 绕过这一步**：`actions/configure-pages` 的文档明确要求该选项
+> 使用 `GITHUB_TOKEN` **以外**的 token（PAT 的 `repo` scope，或 GitHub App 的
+> `administration:write` + `pages:write`），加了不但仍然失败，还会平白引入一个密钥依赖。
+
 ## 目录结构
 
 ```
