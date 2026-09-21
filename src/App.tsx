@@ -16,6 +16,7 @@ import TraeCreditsPage from "@/pages/TraeCreditsPage";
 import TraeSettingsPage from "@/pages/TraeSettingsPage";
 import TraeTokenStatsPage from "@/pages/TraeTokenStatsPage";
 import { StatusDot, AppIconMark, TraeVariantMark, WorkBuddyMark } from "@/components/product-marks";
+import { DonateButton } from "@/components/donate-dialog";
 import { UpdateInstallDialog } from "@/components/update-install-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -242,8 +243,8 @@ function ProductSwitch({
           value="trae"
           className="h-7 w-full min-w-0 gap-1.5 rounded-lg px-1.5 text-xs font-medium data-[state=active]:bg-primary/15 data-[state=active]:shadow-none"
         >
-          {/* 两个产品的图标各自如实呈现；TraeWork 用**不带角标**的基础款，
-              因为这里不再区分区域与程序位（都在页面内部选）。 */}
+          {/* 两个产品的图标各自如实呈现；Trae 分区用 TraeWork 的图标
+              （这里不区分区域与程序位，都在页面内部选）。 */}
           <TraeVariantMark variant="trae_work" size={15} />
           <span className="truncate">{PRODUCT_LABEL.trae}</span>
         </TabsTrigger>
@@ -255,9 +256,13 @@ function ProductSwitch({
 /**
  * 侧栏底部的应用信息。
  *
- * 这里展示的是**本应用**（BuddySwitch）的名称与版本，而不是所管理客户端的版本：
+ * 这里展示的是**本应用**（Buddy Switch）的版本，而不是所管理客户端的版本：
  * `status.version` 来自 `update::APP_VERSION`，此前挂在「WorkBuddy」名下会让人
  * 误以为它是 WorkBuddy 客户端的版本号。状态圆点跟随当前选中的产品。
+ *
+ * **只负责内容**：底部区块的边框、外边距与水平内边距归 `Layout` 里的那个
+ * `<section>`——同一块里还要放打赏入口（见 `DonateButton`），而它在 webui 下
+ * **仍然显示**（版本行则不显示），把容器留在 `Layout` 才能只写一处。
  */
 function AppFooter({
   product,
@@ -296,40 +301,39 @@ function AppFooter({
 
   return (
     <>
-      <section className="mt-auto border-t border-sidebar-border px-2 pt-3 text-xs">
-        <div className="flex items-center gap-2 text-[13px] text-sidebar-foreground">
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <span className="inline-flex">
-                <StatusDot on={running} />
-              </span>
-            </TooltipTrigger>
-            <TooltipContent side="top">{running ? `${label} 运行中` : `${label} 未运行`}</TooltipContent>
-          </Tooltip>
-          <span className="min-w-0 flex-1 truncate">BuddySwitch</span>
-          <div className="flex shrink-0 items-center gap-1.5">
-            {/* 版本用更小的字号：侧栏只有 220px，「BuddySwitch」比原来的「WorkBuddy」长，
-                同字号下会把名称挤成省略号（有更新按钮时尤其明显）。 */}
-            <span className="shrink-0 text-[11px] tabular-nums text-sidebar-foreground/50">v{version || "?"}</span>
-            {hasUpdate && (
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    type="button"
-                    size="icon"
-                    className="size-5 rounded-full p-0"
-                    aria-label="更新"
-                    onClick={() => setDialogOpen(true)}
-                  >
-                    <ArrowUp className="size-3" strokeWidth={2.5} aria-hidden="true" />
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent side="top">更新</TooltipContent>
-              </Tooltip>
-            )}
-          </div>
+      <div className="flex items-center gap-2 text-[13px] text-sidebar-foreground">
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <span className="inline-flex">
+              <StatusDot on={running} />
+            </span>
+          </TooltipTrigger>
+          <TooltipContent side="top">{running ? `${label} 运行中` : `${label} 未运行`}</TooltipContent>
+        </Tooltip>
+        <span className="min-w-0 flex-1 truncate">版本</span>
+        <div className="flex shrink-0 items-center gap-1.5">
+          {/* 这里固定显示「版本」二字而非产品名：产品名已在侧栏顶部 Tab 与标题栏出现，
+              重复一遍反而挤占了版本号的位置。版本号用更小字号并保持 tabular-nums，
+              让数字在版本号变化时纵向对齐、不跳动。 */}
+          <span className="shrink-0 text-[11px] tabular-nums text-sidebar-foreground/50">v{version || "?"}</span>
+          {hasUpdate && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  type="button"
+                  size="icon"
+                  className="size-5 rounded-full p-0"
+                  aria-label="更新"
+                  onClick={() => setDialogOpen(true)}
+                >
+                  <ArrowUp className="size-3" strokeWidth={2.5} aria-hidden="true" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="top">更新</TooltipContent>
+            </Tooltip>
+          )}
         </div>
-      </section>
+      </div>
       <UpdateInstallDialog
         open={dialogOpen}
         onOpenChange={setDialogOpen}
@@ -412,7 +416,7 @@ function Layout() {
                 fontWeight: 640,
               }}
             >
-              WorkBuddy Switch
+              Buddy Switch
             </div>
             {demoModeEnabled && (
               <Badge variant="secondary" className="mt-1 h-5 border-0 px-1.5 text-[10px] text-sidebar-foreground/60 shadow-none">
@@ -436,9 +440,15 @@ function Layout() {
           ))}
         </nav>
 
-        {api.isWebui() && !demoModeEnabled ? null : (
-          <AppFooter product={product} running={running} version={appVersion} />
-        )}
+        {/* 侧栏底部区块：打赏入口在**版本号上方**。
+            打赏在 webui 下**也显示**（版本行不显示），因此容器放在这里、
+            由两个子项共用边框与内边距，而不是塞进 `AppFooter`。 */}
+        <section className="mt-auto flex flex-col gap-2.5 border-t border-sidebar-border px-2 pt-3 text-xs">
+          <DonateButton />
+          {api.isWebui() && !demoModeEnabled ? null : (
+            <AppFooter product={product} running={running} version={appVersion} />
+          )}
+        </section>
       </aside>
       <main
         className={cn(

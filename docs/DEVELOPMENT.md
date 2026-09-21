@@ -27,7 +27,8 @@ npm run build:app:release  # 构建 release .app + 签名更新包
 ### npm 版（webui）发布
 
 1. 编译 server 二进制并上传 GitHub Release（`.github/workflows/build.yml` 自动执行）
-2. `cd npm && npm publish`（包名 `workbuddy-switch`，postinstall 按平台从 Release 下载二进制）
+2. 先 `sh scripts/gen-platform-packages.sh <版本>` 生成 5 个平台包（`buddy-switch-<platform>-<arch>`），把对应二进制放进各包 `bin/` 后逐个 `npm publish`
+3. `cd npm && npm publish`（主包名 `buddy-switch`，`postinstall` 从已安装的平台包复制二进制）
 
 ## 目录结构
 
