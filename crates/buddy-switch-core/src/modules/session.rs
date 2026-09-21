@@ -244,17 +244,30 @@ pub fn copy_session_to_user(
     copy_session_to_user_for(Region::Cn, cid, source_uid, target_uid)
 }
 
-/// 按 region 把 source_uid 的一个会话复制为 target_uid 的新会话（路径 B：生成新 id）。
-///
-/// **去重**：若该源会话此前已复制给同一目标账号且副本仍在，则不重复复制，
-/// 直接返回既有副本（`deduplicated: true`）。见 [`ledger_hit_for`]。
+/// 按 region（同一版本内）把 source_uid 的一个会话复制为 target_uid 的新会话（路径 B）。
 pub fn copy_session_to_user_for(
     region: Region,
     cid: &str,
     source_uid: &str,
     target_uid: &str,
 ) -> Result<Value, String> {
-    if let Some(existing) = ledger_hit_for(region, source_uid, target_uid, cid) {
+    copy_session_to_user_cross(region, region, cid, source_uid, target_uid)
+}
+
+/// 跨版本复制：正文与元数据**读自 `source_region`**，副本与云端映射**写入 `target_region`**。
+///
+/// **去重**：若该源会话此前已复制给同一目标账号且副本仍在，则不重复复制，
+/// 直接返回既有副本（`deduplicated: true`）。见 [`ledger_hit_for`]。
+pub fn copy_session_to_user_cross(
+    source_region: Region,
+    target_region: Region,
+    cid: &str,
+    source_uid: &str,
+    target_uid: &str,
+) -> Result<Value, String> {
+    if let Some(existing) =
+        ledger_hit_for(source_region, target_region, source_uid, target_uid, cid)
+    {
         return Ok(json!({
             "id": cid,
             "newId": existing,
@@ -266,7 +279,7 @@ pub fn copy_session_to_user_for(
     }
 
     let new_cid = uuid::Uuid::new_v4().to_string();
-    let db = workbuddy_db_path_for(region);
+    let db = workbuddy_db_path_for(source_region);
     if let Some(conn) = open_db(&db, true) {
         let cwd: Option<String> = conn
             .query_row(
@@ -280,10 +293,13 @@ pub fn copy_session_to_user_for(
         }
     }
 
-    // 1) 复制正文 jsonl：{projects}/{ws}/{cid}.jsonl → {projects}/{ws}/{new_cid}.jsonl
+    // 1) 复制正文 jsonl：源 projects 下 {ws}/{cid}.jsonl → 目标 projects 下同位置 {new_cid}.jsonl
     let mut jsonl_copied = false;
-    if let Some(src_jsonl) = find_project_jsonl_for(region, cid) {
-        let dst_jsonl = src_jsonl.with_file_name(format!("{new_cid}.jsonl"));
+    if let Some(src_jsonl) = find_project_jsonl_for(source_region, cid) {
+        let dst_jsonl = target_jsonl_path_for(source_region, target_region, &src_jsonl, &new_cid);
+        if let Some(parent) = dst_jsonl.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         if let Ok(text) = std::fs::read_to_string(&src_jsonl) {
             let text = text.replace(cid, &new_cid); // 替换 sessionId 等旧 id 引用
             if std::fs::write(&dst_jsonl, text).is_ok() {
@@ -292,16 +308,30 @@ pub fn copy_session_to_user_for(
         }
     }
 
-    // 2) 备份 db（复制前），再 INSERT 新 sessions 行
+    // 2) 备份目标 db（复制前），再把源行复制为新 id 插进目标库
     let backup_root = backup_dir().join("sessions").join(utc_iso());
-    backup_workbuddy_db(region, &backup_root);
-    insert_session_copy(&db, &new_cid, cid, source_uid, target_uid)?;
+    backup_workbuddy_db(target_region, &backup_root);
+    insert_session_copy(
+        &workbuddy_db_path_for(source_region),
+        &workbuddy_db_path_for(target_region),
+        &new_cid,
+        cid,
+        source_uid,
+        target_uid,
+    )?;
 
     // 3) 注册云端映射：新会话归属目标账号（msg_channel=convmsg:{target_uid}）
-    let mapping_written = register_edge_sync_mapping_for(region, &new_cid, target_uid);
+    let mapping_written = register_edge_sync_mapping_for(target_region, &new_cid, target_uid);
 
     // 4) 登记去重账本：下次复制同一源会话时直接跳过
-    let ledger_written = record_copy_ledger(region, source_uid, target_uid, cid, &new_cid);
+    let ledger_written = record_copy_ledger(
+        source_region,
+        target_region,
+        source_uid,
+        target_uid,
+        cid,
+        &new_cid,
+    );
 
     Ok(json!({
         "id": cid,
@@ -314,67 +344,133 @@ pub fn copy_session_to_user_for(
     }))
 }
 
-/// 在 workbuddy.db 中把源会话行复制为新 id（动态列，覆盖 id/user_id/时间戳）。
+/// 会话正文副本的落点：保持「相对 projects 目录的子路径」不变，换到目标版本目录下。
 ///
-/// db 不存在或 sessions 表不存在时静默成功（对应 Python 版跳过）。源行不存在则无操作。
+/// 同版本时结果与原实现完全一致（同一 workspace 目录、只换文件名）；
+/// 跨版本时把正文搬到 `target_region` 的 projects，否则副本写进源版本目录、
+/// 目标版本的 WorkBuddy 根本看不到它。
+fn target_jsonl_path_for(
+    source_region: Region,
+    target_region: Region,
+    src_jsonl: &Path,
+    new_cid: &str,
+) -> PathBuf {
+    let source_projects = session_data_dir(source_region).join("projects");
+    let target_projects = session_data_dir(target_region).join("projects");
+    let in_target = match src_jsonl.strip_prefix(&source_projects) {
+        Ok(rel) => target_projects.join(rel),
+        Err(_) => target_projects,
+    };
+    in_target.with_file_name(format!("{new_cid}.jsonl"))
+}
+
+/// 表的列名清单（按 PRAGMA 顺序）；表不存在时为空。
+fn table_columns(conn: &Connection, table: &str) -> Vec<String> {
+    let Ok(mut stmt) = conn.prepare(&format!("PRAGMA table_info({table})")) else {
+        return Vec::new();
+    };
+    let Ok(iter) = stmt.query_map([], |row| row.get::<_, String>(1)) else {
+        return Vec::new();
+    };
+    iter.flatten().collect()
+}
+
+/// 读出源会话行的列名与值；顺带做 Claw 判定。
+///
+/// 源库不存在 / 无 sessions 表 / 无此行 → `Ok(None)`（对照 Python 版静默跳过）。
+fn read_session_row(
+    src_db_path: &Path,
+    cid: &str,
+    source_uid: &str,
+) -> Result<Option<(Vec<String>, Vec<rusqlite::types::Value>)>, String> {
+    if !src_db_path.is_file() {
+        return Ok(None);
+    }
+    let Some(conn) = open_db(src_db_path, true) else {
+        return Ok(None);
+    };
+    if !table_exists(&conn, "sessions") {
+        return Ok(None);
+    }
+    let mut stmt = conn
+        .prepare("SELECT * FROM sessions WHERE id = ?1 AND user_id = ?2")
+        .map_err(|e| e.to_string())?;
+    let cols: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+    let mut rows = stmt
+        .query(rusqlite::params![cid, source_uid])
+        .map_err(|e| e.to_string())?;
+    let Some(row) = rows.next().map_err(|e| e.to_string())? else {
+        return Ok(None);
+    };
+    let mut vals: Vec<rusqlite::types::Value> = Vec::with_capacity(cols.len());
+    for (i, col) in cols.iter().enumerate() {
+        let v = row
+            .get::<_, rusqlite::types::Value>(i)
+            .unwrap_or(rusqlite::types::Value::Null);
+        if col == "cwd" {
+            if let rusqlite::types::Value::Text(ref path) = v {
+                if is_claw_workspace(path) {
+                    return Err("Claw 工作区绑定当前账号渠道，不支持复制".into());
+                }
+            }
+        }
+        vals.push(v);
+    }
+    Ok(Some((cols, vals)))
+}
+
+/// 把源会话行复制为新 id 写入目标库（动态列，覆盖 id/user_id/时间戳）。
+///
+/// 源与目标可以是两个版本的 db。目标库缺某一列时**丢弃该列**而不是整条失败 ——
+/// 两版 schema 高度同源但允许有差异，丢弃比让整次复制失败更接近用户预期。
 fn insert_session_copy(
-    db_path: &Path,
+    src_db_path: &Path,
+    dst_db_path: &Path,
     new_cid: &str,
     cid: &str,
     source_uid: &str,
     target_uid: &str,
 ) -> Result<(), String> {
-    if !db_path.is_file() {
+    let Some((cols, vals)) = read_session_row(src_db_path, cid, source_uid)? else {
+        return Ok(());
+    };
+    if !dst_db_path.is_file() {
         return Ok(());
     }
-    let Some(conn) = open_db(db_path, false) else {
+    let Some(conn) = open_db(dst_db_path, false) else {
         return Ok(());
     };
     if !table_exists(&conn, "sessions") {
         return Ok(());
     }
-    let mut src_stmt = conn
-        .prepare("SELECT * FROM sessions WHERE id = ?1 AND user_id = ?2")
-        .map_err(|e| e.to_string())?;
-    let cols: Vec<String> = src_stmt
-        .column_names()
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    let mut rows = src_stmt
-        .query(rusqlite::params![cid, source_uid])
-        .map_err(|e| e.to_string())?;
-    if let Ok(Some(row)) = rows.next() {
-        let mut vals: Vec<rusqlite::types::Value> = Vec::with_capacity(cols.len());
-        for (i, col) in cols.iter().enumerate() {
-            let v = row
-                .get::<_, rusqlite::types::Value>(i)
-                .unwrap_or(rusqlite::types::Value::Null);
-            if col == "cwd" {
-                if let rusqlite::types::Value::Text(ref path) = v {
-                    if is_claw_workspace(path) {
-                        return Err("Claw 工作区绑定当前账号渠道，不支持复制".into());
-                    }
-                }
-            }
-            match col.as_str() {
-                "id" => vals.push(rusqlite::types::Value::Text(new_cid.to_string())),
-                "user_id" => vals.push(rusqlite::types::Value::Text(target_uid.to_string())),
-                "created_at" | "updated_at" => vals.push(rusqlite::types::Value::Integer(now_ms())),
-                "deleted_at" => vals.push(rusqlite::types::Value::Null),
-                _ => vals.push(v),
-            }
-        }
-        drop(rows);
-        drop(src_stmt);
+    let dst_cols = table_columns(&conn, "sessions");
 
-        let placeholders = cols.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
-        let colnames = cols.join(", ");
-        let sql = format!("INSERT OR REPLACE INTO sessions ({colnames}) VALUES ({placeholders})");
-        let params: Vec<&rusqlite::types::Value> = vals.iter().collect();
-        conn.execute(&sql, rusqlite::params_from_iter(params))
-            .map_err(|e| e.to_string())?;
+    let mut insert_cols: Vec<&str> = Vec::with_capacity(cols.len());
+    let mut insert_vals: Vec<rusqlite::types::Value> = Vec::with_capacity(cols.len());
+    for (col, v) in cols.iter().zip(vals) {
+        if !dst_cols.iter().any(|c| c == col) {
+            continue;
+        }
+        let v = match col.as_str() {
+            "id" => rusqlite::types::Value::Text(new_cid.to_string()),
+            "user_id" => rusqlite::types::Value::Text(target_uid.to_string()),
+            "created_at" | "updated_at" => rusqlite::types::Value::Integer(now_ms()),
+            "deleted_at" => rusqlite::types::Value::Null,
+            _ => v,
+        };
+        insert_cols.push(col.as_str());
+        insert_vals.push(v);
     }
+    if insert_cols.is_empty() {
+        return Ok(());
+    }
+
+    let placeholders = insert_cols.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+    let colnames = insert_cols.join(", ");
+    let sql = format!("INSERT OR REPLACE INTO sessions ({colnames}) VALUES ({placeholders})");
+    let params: Vec<&rusqlite::types::Value> = insert_vals.iter().collect();
+    conn.execute(&sql, rusqlite::params_from_iter(params))
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -442,6 +538,26 @@ fn copy_ledger_key(source_uid: &str, target_uid: &str, source_cid: &str) -> Stri
     format!("{source_uid}{LEDGER_SEP}{target_uid}{LEDGER_SEP}{source_cid}")
 }
 
+/// 跨版本复制的账本键：在三元键前加**源 region** 前缀。
+///
+/// 同版本刻意保持原键 —— 否则既有账本全部失配，老用户会被判成「没复制过」而重复复制；
+/// 跨版本必须加前缀 —— 否则「CN 的 uid-a 复制给 X」与「Global 的 uid-a 复制给 X」
+/// 会共用一条登记，其中一侧被错误跳过。
+fn copy_ledger_key_for(
+    source_region: Region,
+    target_region: Region,
+    source_uid: &str,
+    target_uid: &str,
+    source_cid: &str,
+) -> String {
+    let base = copy_ledger_key(source_uid, target_uid, source_cid);
+    if source_region == target_region {
+        base
+    } else {
+        format!("{}{LEDGER_SEP}{base}", source_region.as_str())
+    }
+}
+
 /// 读取复制账本；文件缺失 / 损坏 / 结构不符时返回空表（视为无登记）。
 fn load_copy_ledger_at(path: &Path) -> serde_json::Map<String, Value> {
     let Ok(text) = std::fs::read_to_string(path) else {
@@ -495,49 +611,66 @@ fn session_exists_for(region: Region, cid: &str, uid: &str) -> bool {
 /// 「仍存活」= 副本会话行仍在目标账号名下（未被用户删除）。
 /// 用户删除副本后允许重新复制，避免账本变成永久性阻断。
 fn ledger_hit_for(
-    region: Region,
+    source_region: Region,
+    target_region: Region,
     source_uid: &str,
     target_uid: &str,
     source_cid: &str,
 ) -> Option<String> {
-    let ledger = load_copy_ledger(region);
+    let ledger = load_copy_ledger(target_region);
     let new_cid = ledger
-        .get(&copy_ledger_key(source_uid, target_uid, source_cid))?
+        .get(&copy_ledger_key_for(
+            source_region,
+            target_region,
+            source_uid,
+            target_uid,
+            source_cid,
+        ))?
         .as_str()?
         .trim()
         .to_string();
     if new_cid.is_empty() {
         return None;
     }
-    session_exists_for(region, &new_cid, target_uid).then_some(new_cid)
+    session_exists_for(target_region, &new_cid, target_uid).then_some(new_cid)
 }
 
 /// 在账本中登记一次成功的复制。写入路径可被单测重定向（见 [`resolve_ledger_path`]）。
 fn record_copy_ledger_at(
-    region: Region,
+    source_region: Region,
+    target_region: Region,
     override_path: Option<&Path>,
     source_uid: &str,
     target_uid: &str,
     source_cid: &str,
     new_cid: &str,
 ) -> bool {
-    let path = resolve_ledger_path(region, override_path);
+    let path = resolve_ledger_path(target_region, override_path);
     let mut ledger = load_copy_ledger_at(&path);
     ledger.insert(
-        copy_ledger_key(source_uid, target_uid, source_cid),
+        copy_ledger_key_for(source_region, target_region, source_uid, target_uid, source_cid),
         Value::String(new_cid.to_string()),
     );
     save_copy_ledger_at(&path, &ledger)
 }
 
 fn record_copy_ledger(
-    region: Region,
+    source_region: Region,
+    target_region: Region,
     source_uid: &str,
     target_uid: &str,
     source_cid: &str,
     new_cid: &str,
 ) -> bool {
-    record_copy_ledger_at(region, None, source_uid, target_uid, source_cid, new_cid)
+    record_copy_ledger_at(
+        source_region,
+        target_region,
+        None,
+        source_uid,
+        target_uid,
+        source_cid,
+        new_cid,
+    )
 }
 
 /// 切换前把勾选的会话复制到目标账号（CN，路径 B）。返回复制报告。
@@ -545,9 +678,22 @@ pub fn copy_sessions_for_switch(target_acc: &Value, session_ids: &[String]) -> O
     copy_sessions_for_switch_for(Region::Cn, target_acc, session_ids)
 }
 
-/// 按 region 切换前把勾选的会话复制到目标账号（路径 B）。返回复制报告。
+/// 按 region（同一版本内）切换前把勾选的会话复制到目标账号（路径 B）。返回复制报告。
 pub fn copy_sessions_for_switch_for(
     region: Region,
+    target_acc: &Value,
+    session_ids: &[String],
+) -> Option<Value> {
+    copy_sessions_for_switch_cross(region, region, target_acc, session_ids)
+}
+
+/// 跨版本：把 `source_region` 当前登录账号的勾选会话复制到 `target_region` 的目标账号。
+///
+/// 源 uid 取自**源版本**的认证文件 —— 这正是跨版本的关键：沿用目标版本去取，
+/// 取到的是目标版本自己的登录账号，会把「另一个账号」的会话搬过去。
+pub fn copy_sessions_for_switch_cross(
+    source_region: Region,
+    target_region: Region,
     target_acc: &Value,
     session_ids: &[String],
 ) -> Option<Value> {
@@ -559,21 +705,30 @@ pub fn copy_sessions_for_switch_for(
     if target_uid.is_empty() {
         return None;
     }
-    let source_uid = current_user_uid_for(region)?;
-    if source_uid == target_uid {
+    let source_uid = current_user_uid_for(source_region)?;
+    // 同版本同 uid = 自我复制，无意义；跨版本 uid 同文不算（两版 uid 不同源）。
+    if source_region == target_region && source_uid == target_uid {
         return None;
     }
 
     let mut report = json!({
         "sourceUid": source_uid,
         "targetUid": target_uid,
+        "sourceRegion": source_region.as_str(),
+        "targetRegion": target_region.as_str(),
         "copied": [],
     });
     let mut errors: Vec<Value> = Vec::new();
     // 命中账本的源会话：不重复复制，单独归类以便 UI 明确告知「已存在，跳过」
     let mut skipped: Vec<Value> = Vec::new();
     for cid in session_ids {
-        match copy_session_to_user_for(region, cid, &source_uid, &target_uid) {
+        match copy_session_to_user_cross(
+            source_region,
+            target_region,
+            cid,
+            &source_uid,
+            &target_uid,
+        ) {
             Ok(r) if r.get("deduplicated").and_then(Value::as_bool) == Some(true) => {
                 skipped.push(r);
             }
@@ -680,7 +835,7 @@ mod tests {
         )
         .unwrap();
 
-        insert_session_copy(&db, "new-uuid-1", "src-1", "uid-a", "uid-b").unwrap();
+        insert_session_copy(&db, &db, "new-uuid-1", "src-1", "uid-a", "uid-b").unwrap();
 
         let (id, user_id, title, deleted_at): (String, String, String, Option<i64>) = conn
             .query_row(
@@ -713,7 +868,7 @@ mod tests {
             "CREATE TABLE sessions (id TEXT PRIMARY KEY, user_id TEXT, title TEXT, created_at INTEGER, updated_at INTEGER, deleted_at INTEGER);",
         )
         .unwrap();
-        insert_session_copy(&db, "new-1", "missing", "uid-a", "uid-b").unwrap();
+        insert_session_copy(&db, &db, "new-1", "missing", "uid-a", "uid-b").unwrap();
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
             .unwrap();
@@ -724,7 +879,58 @@ mod tests {
     fn insert_session_copy_missing_db_is_ok() {
         let db = temp_db("missing");
         // 不创建文件
-        assert!(insert_session_copy(&db, "new-1", "src-1", "a", "b").is_ok());
+        assert!(insert_session_copy(&db, &db, "new-1", "src-1", "a", "b").is_ok());
+    }
+
+    /// 跨库复制：源行只出现在源库，副本只出现在目标库。
+    ///
+    /// 这是跨版本复制的核心断言 —— 若实现仍把「读」和「写」绑在同一个 db 上，
+    /// 要么副本没进目标库（用户看不到），要么源库被写脏。
+    #[test]
+    fn insert_session_copy_across_databases() {
+        let src_db = temp_db("xsrc");
+        let dst_db = temp_db("xdst");
+        for db in [&src_db, &dst_db] {
+            let conn = Connection::open(db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    title TEXT,
+                    created_at INTEGER,
+                    updated_at INTEGER,
+                    deleted_at INTEGER
+                 );",
+            )
+            .unwrap();
+        }
+        Connection::open(&src_db)
+            .unwrap()
+            .execute(
+                "INSERT INTO sessions (id, user_id, title, created_at, updated_at, deleted_at)
+                 VALUES ('src-1', 'uid-a', '跨版本标题', 1000, 2000, NULL)",
+                [],
+            )
+            .unwrap();
+
+        insert_session_copy(&src_db, &dst_db, "new-1", "src-1", "uid-a", "uid-b").unwrap();
+
+        let dst = Connection::open(&dst_db).unwrap();
+        let (title, user_id): (String, String) = dst
+            .query_row(
+                "SELECT title, user_id FROM sessions WHERE id = 'new-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(title, "跨版本标题");
+        assert_eq!(user_id, "uid-b", "副本必须归属目标账号");
+
+        let src_rows: i64 = Connection::open(&src_db)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(src_rows, 1, "源库不得被写入");
     }
 
     #[test]
@@ -811,6 +1017,56 @@ mod tests {
         );
     }
 
+    /// 跨版本账本键必须带源 region 前缀，同版本必须保持原键。
+    ///
+    /// 两个方向都要钉住：加前缀是为了「CN 的 uid-a」与「Global 的 uid-a」不共用登记；
+    /// 同版本不加是为了既有账本不失配（否则老用户会被判成没复制过而重复复制）。
+    #[test]
+    fn cross_region_ledger_key_is_namespaced_by_source_region() {
+        let same = copy_ledger_key_for(Region::Cn, Region::Cn, "uid-a", "uid-b", "cid-1");
+        let cross = copy_ledger_key_for(Region::Cn, Region::Global, "uid-a", "uid-b", "cid-1");
+        let reverse = copy_ledger_key_for(Region::Global, Region::Cn, "uid-a", "uid-b", "cid-1");
+
+        assert_eq!(same, copy_ledger_key("uid-a", "uid-b", "cid-1"), "同版本键不得变");
+        assert_ne!(same, cross, "跨版本必须与同版本区分");
+        assert_ne!(cross, reverse, "方向不同必须是不同条目");
+        assert!(cross.starts_with("cn\u{1f}"), "前缀应为源 region: {cross}");
+        assert!(reverse.starts_with("global\u{1f}"), "前缀应为源 region: {reverse}");
+    }
+
+    /// 会话正文副本必须落在**目标**版本的 projects 下。
+    ///
+    /// 若沿用源目录，副本会写进源版本目录，目标版本的 WorkBuddy 根本看不到它 ——
+    /// 这正是「跨版本不支持」时期最隐蔽的失败形态（不报错，只是没搬过去）。
+    #[test]
+    fn cross_region_jsonl_copy_lands_in_target_region_projects() {
+        let src = session_data_dir(Region::Cn)
+            .join("projects")
+            .join("ws")
+            .join("cid-1.jsonl");
+
+        let same = target_jsonl_path_for(Region::Cn, Region::Cn, &src, "new-1");
+        assert_eq!(
+            same,
+            session_data_dir(Region::Cn)
+                .join("projects")
+                .join("ws")
+                .join("new-1.jsonl"),
+            "同版本必须原地换名，行为零变化"
+        );
+
+        let cross = target_jsonl_path_for(Region::Cn, Region::Global, &src, "new-1");
+        assert_eq!(
+            cross,
+            session_data_dir(Region::Global)
+                .join("projects")
+                .join("ws")
+                .join("new-1.jsonl"),
+            "跨版本必须换到目标版本目录"
+        );
+        assert_ne!(same, cross);
+    }
+
     /// 账本读写往返：写入后能读回，且未命中项返回 None。
     ///
     /// 全程只操作临时文件，**不得触碰真实 `~/.workbuddy` 账本**。
@@ -830,6 +1086,7 @@ mod tests {
         );
 
         assert!(record_copy_ledger_at(
+            region,
             region,
             Some(&path),
             "uid-a",
@@ -854,6 +1111,7 @@ mod tests {
 
         // 同一键再次登记应覆盖而不是新增条目。
         assert!(record_copy_ledger_at(
+            region,
             region,
             Some(&path),
             "uid-a",

@@ -35,6 +35,7 @@ import type {
   RotateLog,
   RotateStatus,
   ScheduleConfig,
+  ScheduleRunResult,
   Session,
   SwitchResult,
   TravelConfig,
@@ -46,6 +47,8 @@ import { screenshotDemoResponse } from "./screenshot-demo";
 import type {
   TraeAccount,
   TraeAccountsOverview,
+  TraeApiKeyCreated,
+  TraeApiKeyRecord,
   TraeCapabilities,
   TraeCheckinReport,
   TraeCheckinStatus,
@@ -65,6 +68,7 @@ import type {
   TraeProfilesOverview,
   TraeSettings,
   TraeSwitchOutcome,
+  TraeTokenScope,
   TraeTokenStatistics,
   TraeVariantId,
   TraeVariantsStatus,
@@ -94,7 +98,7 @@ const DEMO_READ_COMMANDS = new Set([
   "get_trae_checkin_status",
   "get_trae_credits", "get_trae_token_statistics", "get_trae_logs", "get_trae_profiles",
   "get_trae_settings", "get_trae_gateway_config", "trae_gateway_status",
-  "get_trae_gateway_models", "get_trae_gateway_logs",
+  "get_trae_gateway_models", "list_trae_api_keys", "get_trae_gateway_logs",
 ]);
 
 export function isDemoMode(): boolean {
@@ -160,6 +164,7 @@ const ROUTES: Record<string, Route> = {
   save_auto_rotate_config: { method: "POST", path: "/api/rotate/config" },
   get_schedule_config: { method: "GET", path: "/api/schedule/config" },
   save_schedule_config: { method: "POST", path: "/api/schedule/config" },
+  run_schedule_task: { method: "POST", path: "/api/schedule/run" },
   rotate_status: { method: "GET", path: "/api/rotate/status" },
   run_rotate: { method: "POST", path: "/api/rotate/run" },
   get_rotate_logs: { method: "GET", path: "/api/rotate/logs" },
@@ -230,7 +235,13 @@ const ROUTES: Record<string, Route> = {
   save_trae_gateway_config: { method: "POST", path: "/api/trae/gateway/config" },
   trae_gateway_status: { method: "GET", path: "/api/trae/gateway/status" },
   get_trae_gateway_models: { method: "GET", path: "/api/trae/gateway/models" },
-  regenerate_trae_api_key: { method: "POST", path: "/api/trae/gateway/key/regenerate" },
+  // 多 Key 管理（含归属产品线）：GET 列表 / POST 创建同一路径。
+  list_trae_api_keys: { method: "GET", path: "/api/trae/gateway/keys" },
+  create_trae_api_key: { method: "POST", path: "/api/trae/gateway/keys" },
+  revoke_trae_api_key: { method: "POST", path: "/api/trae/gateway/keys/revoke" },
+  delete_trae_api_key: { method: "POST", path: "/api/trae/gateway/keys/delete" },
+  // 打开 Trae 数据目录（非 Windows 返回结构化 Unsupported）。
+  open_trae_data_dir: { method: "POST", path: "/api/trae/open-data-dir" },
   get_trae_gateway_logs: { method: "GET", path: "/api/trae/gateway/logs" },
   clear_trae_gateway_logs: { method: "POST", path: "/api/trae/gateway/logs/clear" },
 };
@@ -390,6 +401,8 @@ export function switchAccount(args: {
   restart?: boolean;
   shareSessions?: boolean;
   copySessionIds?: string[];
+  /** 会话复制的**来源**版本；缺省与 `region` 相同（同版本内切换）。 */
+  sourceRegion?: Region;
 }): Promise<SwitchResult> {
   return call("switch_account", args as unknown as Record<string, unknown>);
 }
@@ -410,6 +423,7 @@ export function copySessions(
   targetAccountId: string,
   sessionIds: string[],
   region?: Region,
+  sourceRegion?: Region,
 ): Promise<{
   sourceUid: string;
   targetUid: string;
@@ -417,7 +431,12 @@ export function copySessions(
   skipped?: CopyResult[];
   errors?: { id: string; error: string }[];
 }> {
-  return call("copy_sessions", { targetAccountId, sessionIds, ...regionArg(region) });
+  return call("copy_sessions", {
+    targetAccountId,
+    sessionIds,
+    ...regionArg(region),
+    ...(sourceRegion ? { sourceRegion } : {}),
+  });
 }
 
 /**
@@ -433,13 +452,16 @@ export function migrateAccountData(
     memory?: boolean;
     connectors?: boolean;
     region?: Region;
+    /** 数据来源版本；缺省与 `region` 相同（同版本内迁移）。 */
+    sourceRegion?: Region;
   },
 ): Promise<MigrateResult> {
-  const { region, ...rest } = options ?? {};
+  const { region, sourceRegion, ...rest } = options ?? {};
   return call("migrate_account_data", {
     targetAccountId,
     ...rest,
     ...regionArg(region),
+    ...(sourceRegion ? { sourceRegion } : {}),
   });
 }
 
@@ -609,6 +631,11 @@ export function saveScheduleConfig(config: ScheduleConfig): Promise<ScheduleConf
   return call("save_schedule_config", {
     config: config as unknown as Record<string, unknown>,
   });
+}
+
+/** 立即执行某一类定时任务（不等排程到点），用于保存排程后当场自证是否生效。 */
+export function runScheduleTask(task: string): Promise<ScheduleRunResult> {
+  return call("run_schedule_task", { task });
 }
 
 export function getRotateStatus(): Promise<RotateStatus> {
@@ -806,10 +833,17 @@ export function getTraeCredits(variant?: TraeVariantId | null): Promise<TraeCred
  * Token 统计（聚合本机 Trae 网关请求日志）。
  *
  * `days` 为统计窗口天数；不传或传 `<= 0` 表示全部历史。
+ * `scope` 为**变体范围**筛选维度：`work` / `cn` / `unlabeled` / `all`（不传 = `all`）。
  * 只统计**经过本网关**的调用——直接在 Trae IDE 里对话不产生记录。
  */
-export function getTraeTokenStatistics(days?: number): Promise<TraeTokenStatistics> {
-  return call("get_trae_token_statistics", days === undefined ? undefined : { days });
+export function getTraeTokenStatistics(
+  days?: number,
+  scope?: TraeTokenScope,
+): Promise<TraeTokenStatistics> {
+  const args: Record<string, unknown> = {};
+  if (days !== undefined) args.days = days;
+  if (scope !== undefined) args.scope = scope;
+  return call("get_trae_token_statistics", Object.keys(args).length > 0 ? args : undefined);
 }
 
 /**
@@ -1115,9 +1149,14 @@ export function saveTraeGatewayConfig(config: TraeGatewayConfigRaw): Promise<unk
   return call("save_trae_gateway_config", { config });
 }
 
-/** 网关运行状态 + 账号池摘要 + 逐账号明细。 */
-export function getTraeGatewayStatus(): Promise<unknown> {
-  return call("trae_gateway_status");
+/**
+ * 网关运行状态 + 账号池摘要 + 逐账号明细。
+ *
+ * `variant` 决定看**哪条产品线的账号池**（池已按产品线分家）。缺省 = 默认变体，
+ * 键集合不变（`status_view` 的 `api_key_prefix` 等字段始终存在）。
+ */
+export function getTraeGatewayStatus(variant?: TraeVariantId | null): Promise<unknown> {
+  return call("trae_gateway_status", variantArgs(variant));
 }
 
 /** 对外暴露的模型清单（OpenAI `/v1/models` 形状）。 */
@@ -1125,9 +1164,40 @@ export function getTraeGatewayModels(): Promise<unknown> {
   return call("get_trae_gateway_models");
 }
 
-/** 重新生成 API Key：明文**仅此一次**返回。 */
-export function regenerateTraeApiKey(): Promise<{ ok: boolean; key?: string; prefix?: string }> {
-  return call("regenerate_trae_api_key");
+/** 多 Key 列表（含归属产品线；不含 hash 与明文）。 */
+export function listTraeApiKeys(): Promise<{ keys: TraeApiKeyRecord[] }> {
+  return call("list_trae_api_keys");
+}
+
+/**
+ * 新建 API Key：明文**仅此一次**返回（`{ok,key,record}`）。
+ *
+ * `variant` 决定该 Key 归属哪条产品线，缺省 = TraeWork（默认变体）。
+ */
+export function createTraeApiKey(
+  name: string,
+  variant?: TraeVariantId | null,
+): Promise<TraeApiKeyCreated> {
+  const args: Record<string, unknown> = { name };
+  if (variant) args.variant = variant;
+  return call("create_trae_api_key", args);
+}
+
+/** 吊销 API Key（置 `revokedAt`，不物理删除）。 */
+export function revokeTraeApiKey(id: string): Promise<{ ok: boolean }> {
+  return call("revoke_trae_api_key", { id });
+}
+
+/** 物理删除**已吊销**的 API Key（未吊销会被后端拒绝）。 */
+export function deleteTraeApiKey(id: string): Promise<{ ok: boolean }> {
+  return call("delete_trae_api_key", { id });
+}
+
+/** 打开 Trae 数据目录（非 Windows 返回结构化 `Unsupported`）。 */
+export function openTraeDataDir(
+  variant?: TraeVariantId | null,
+): Promise<{ ok?: boolean; path?: string }> {
+  return call("open_trae_data_dir", variantArgs(variant));
 }
 
 /** 最近 N 条网关请求日志（元数据）。 */

@@ -35,9 +35,33 @@ pub fn switch_account(
     )
 }
 
-/// 按 region 切换账号。
+/// 按 region 切换账号；会话复制的源版本与切换目标版本相同。
 pub fn switch_account_for(
     region: Region,
+    progress_fn: Option<&ProgressFn>,
+    account_id: &str,
+    restart: bool,
+    share_sessions: bool,
+    copy_session_ids: &[String],
+) -> Result<Value, String> {
+    switch_account_cross(
+        region,
+        region,
+        progress_fn,
+        account_id,
+        restart,
+        share_sessions,
+        copy_session_ids,
+    )
+}
+
+/// 跨版本切换：`source_region` 的当前登录账号是会话复制的**源**，`region` 是切换目标。
+///
+/// 只有会话复制关心源版本 —— 记忆与连接器迁移走 `migrate_account_data_cross`，
+/// 由调用方单独传源 region（见 [`crate::modules::migrate`]）。
+pub fn switch_account_cross(
+    region: Region,
+    source_region: Region,
     progress_fn: Option<&ProgressFn>,
     account_id: &str,
     restart: bool,
@@ -64,7 +88,12 @@ pub fn switch_account_for(
         // 只有重启场景才做会话操作（数据库在运行中不宜写入）
         if !copy_session_ids.is_empty() {
             progress("正在复制会话到目标账号…");
-            copy_report = session::copy_sessions_for_switch_for(region, &acc, copy_session_ids);
+            copy_report = session::copy_sessions_for_switch_cross(
+                source_region,
+                region,
+                &acc,
+                copy_session_ids,
+            );
         }
         if share_sessions {
             // 旧的「全体转移」兼容路径（默认关闭），Rust 版暂未实现

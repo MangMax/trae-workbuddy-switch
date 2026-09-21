@@ -48,13 +48,25 @@ impl MigrateScope {
     }
 }
 
-/// 按 region 把 `source_uid` 的 Memory / Connector 合并到 `target_uid`。
+/// 按 region 把 `source_uid` 的 Memory / Connector 合并到 `target_uid`（同一版本内）。
+pub fn migrate_account_data_for(
+    region: Region,
+    source_uid: &str,
+    target_uid: &str,
+    scope: MigrateScope,
+) -> Result<Value, String> {
+    migrate_account_data_cross(region, source_uid, region, target_uid, scope)
+}
+
+/// 跨版本迁移：把 `source_region` 下 `source_uid` 的 Memory / Connector
+/// 合并到 `target_region` 下 `target_uid`。
 ///
 /// 返回报告（形状与前端 `MigrateResult` 契约一致）：
 ///
 /// ```json
 /// {
 ///   "sourceUid": "…", "targetUid": "…",
+///   "sourceRegion": "cn", "targetRegion": "global",
 ///   "memory":     { "targetLines":0,"sourceLines":0,"appended":0,"skippedDuplicate":0,
 ///                   "changed":false,"backup":null },
 ///   "connectors": { "skipped":false,"addedKeys":0,"droppedDuplicateElements":0,
@@ -67,9 +79,10 @@ impl MigrateScope {
 /// 未改写或备份失败时为 `null`。**备份失败不阻断迁移**。
 ///
 /// 单项失败时该项为 `{ "error": "…" }`，另一项照常执行。
-pub fn migrate_account_data_for(
-    region: Region,
+pub fn migrate_account_data_cross(
+    source_region: Region,
     source_uid: &str,
+    target_region: Region,
     target_uid: &str,
     scope: MigrateScope,
 ) -> Result<Value, String> {
@@ -81,19 +94,27 @@ pub fn migrate_account_data_for(
     if target_uid.is_empty() {
         return Err("缺少目标账号 uid".to_string());
     }
-    if source_uid == target_uid {
+    // 只有同版本同 uid 才是自我覆盖；跨版本 uid 同文属巧合（两版 uid 不同源）。
+    if source_region == target_region && source_uid == target_uid {
         return Err("源账号与目标账号相同".to_string());
     }
 
     let mut report = json!({
         "sourceUid": source_uid,
         "targetUid": target_uid,
+        "sourceRegion": source_region.as_str(),
+        "targetRegion": target_region.as_str(),
     });
 
     let mut changed = false;
 
     if scope.memory {
-        match memory::merge_memory_files(region, source_uid, target_uid) {
+        match memory::merge_memory_files_cross(
+            source_region,
+            source_uid,
+            target_region,
+            target_uid,
+        ) {
             Ok(r) => {
                 changed |= r.changed();
                 report["memory"] = json!({
@@ -113,7 +134,12 @@ pub fn migrate_account_data_for(
     }
 
     if scope.connectors {
-        match connector::merge_connectors_for(region, source_uid, target_uid) {
+        match connector::merge_connectors_cross(
+            source_region,
+            source_uid,
+            target_region,
+            target_uid,
+        ) {
             Ok(r) => {
                 changed |= r.changed();
                 let files: Vec<Value> = r
@@ -227,6 +253,22 @@ mod tests {
         assert_eq!(report["connectors"]["skipped"], true);
         assert_eq!(report["connectors"]["changed"], false);
         assert_eq!(report["connectors"]["addedKeys"], 0);
+    }
+
+    /// 跨版本**不得**因 uid 同文被拒绝：两版 uid 不同源，同文只是巧合，
+    /// 且两侧是两个不同文件，不构成自我覆盖。
+    #[test]
+    fn cross_region_migration_allows_identical_uids() {
+        let report = migrate_account_data_cross(
+            Region::Cn,
+            "migrate-test-cross-same-uid",
+            Region::Global,
+            "migrate-test-cross-same-uid",
+            MigrateScope::default(),
+        )
+        .expect("跨版本同文 uid 应照常执行");
+        assert_eq!(report["sourceRegion"], "cn");
+        assert_eq!(report["targetRegion"], "global");
     }
 
     /// 只启用一个范围时，另一个范围不应出现在报告里（调用方据此判断是否执行过）。

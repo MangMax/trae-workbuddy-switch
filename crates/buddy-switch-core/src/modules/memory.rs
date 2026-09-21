@@ -241,7 +241,7 @@ pub fn merge_memory_text(
     (out, result)
 }
 
-/// 合并两个账号的 Memory 文件：读源 → 合并到目标 → 原子写回。
+/// 合并两个账号的 Memory 文件（同一版本内）：读源 → 合并到目标 → 原子写回。
 ///
 /// 源文件不存在 / 为空 → 不写入，返回 `changed() == false`。
 pub fn merge_memory_files(
@@ -249,10 +249,23 @@ pub fn merge_memory_files(
     source_uid: &str,
     target_uid: &str,
 ) -> Result<MemoryMergeResult, String> {
-    if source_uid.trim() == target_uid.trim() {
+    merge_memory_files_cross(region, source_uid, region, target_uid)
+}
+
+/// 跨版本合并：把 `source_region` 下源账号的记忆合并进 `target_region` 下目标账号。
+///
+/// 源与目标**版本不同**时不因 uid 字面相同而拒绝 —— 两版 uid 不同源，同文只是巧合，
+/// 两侧也是两个不同文件，不存在自我覆盖；**同版本且 uid 相同**才是真正的自我覆盖。
+pub fn merge_memory_files_cross(
+    source_region: Region,
+    source_uid: &str,
+    target_region: Region,
+    target_uid: &str,
+) -> Result<MemoryMergeResult, String> {
+    if source_region == target_region && source_uid.trim() == target_uid.trim() {
         return Err("源账号与目标账号相同".to_string());
     }
-    let source_path = memory_file_for(region, source_uid);
+    let source_path = memory_file_for(source_region, source_uid);
     if !source_path.is_file() {
         return Ok(MemoryMergeResult::default());
     }
@@ -262,7 +275,7 @@ pub fn merge_memory_files(
         return Ok(MemoryMergeResult::default());
     }
 
-    let target_path = memory_file_for(region, target_uid);
+    let target_path = memory_file_for(target_region, target_uid);
     let target = if target_path.is_file() {
         std::fs::read_to_string(&target_path)
             .map_err(|e| format!("读取目标记忆失败（{}）：{e}", target_path.display()))?

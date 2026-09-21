@@ -18,8 +18,8 @@ use serde_json::{json, Value};
 
 use buddy_switch_core::modules::{
     account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, config, credit_usage, credits, export_import,
-    migrate, oauth, process, refresh, region::Region, region::RegionFilter, rotate, schedule, session, switch,
-    token_stats, trae, travel, update,
+    migrate, oauth, process, refresh, region::Region, region::RegionFilter, rotate, schedule, scheduler,
+    session, switch, token_stats, trae, travel, update,
 };
 use buddy_switch_gateway::{GatewayConfig, GatewayStatusView};
 
@@ -122,6 +122,7 @@ fn api_routes() -> Router {
             "/api/schedule/config",
             get(api_schedule_config).post(api_save_schedule_config),
         )
+        .route("/api/schedule/run", post(api_run_schedule_task))
         .route("/api/rotate/status", get(api_rotate_status))
         .route("/api/rotate/run", post(api_rotate_run))
         .route("/api/rotate/logs", get(api_rotate_logs))
@@ -199,10 +200,21 @@ fn api_routes() -> Router {
         )
         .route("/api/trae/gateway/status", get(api_trae_gateway_status))
         .route("/api/trae/gateway/models", get(api_trae_gateway_models))
+        // 多 Key 管理（含归属产品线）：GET 列表 / POST 创建，同一路径两种方法。
         .route(
-            "/api/trae/gateway/key/regenerate",
-            post(api_trae_regenerate_api_key),
+            "/api/trae/gateway/keys",
+            get(api_trae_list_api_keys).post(api_trae_create_api_key),
         )
+        .route(
+            "/api/trae/gateway/keys/revoke",
+            post(api_trae_revoke_api_key),
+        )
+        .route(
+            "/api/trae/gateway/keys/delete",
+            post(api_trae_delete_api_key),
+        )
+        // 打开 Trae 数据目录（非 Windows 返回结构化 Unsupported）。
+        .route("/api/trae/open-data-dir", post(api_trae_open_data_dir))
         .route("/api/trae/gateway/logs", get(api_trae_gateway_logs))
         .route(
             "/api/trae/gateway/logs/clear",
@@ -550,6 +562,11 @@ async fn api_oauth_status(Json(body): Json<Value>) -> Response {
 
 async fn api_switch(Json(body): Json<Value>) -> Response {
     let region = parse_region(body.get("region").and_then(Value::as_str));
+    // 会话复制的**来源**版本；缺省与目标版本相同（同版本内切换，行为零变化）。
+    let source_region = match body.get("sourceRegion").and_then(Value::as_str) {
+        Some(v) => parse_region(Some(v)),
+        None => region,
+    };
     let account_id = body
         .get("accountId")
         .and_then(|v| v.as_str())
@@ -590,8 +607,9 @@ async fn api_switch(Json(body): Json<Value>) -> Response {
     });
 
     let result = tokio::task::spawn_blocking(move || {
-        switch::switch_account_for(
+        switch::switch_account_cross(
             region,
+            source_region,
             Some(&progress),
             &account_id,
             restart,
@@ -633,6 +651,11 @@ async fn api_sessions(RawQuery(query): RawQuery) -> Response {
 
 async fn api_copy_sessions(Json(body): Json<Value>) -> Response {
     let region = parse_region(body.get("region").and_then(Value::as_str));
+    // 会话来源版本；缺省与目标版本相同（同版本内复制，行为零变化）。
+    let source_region = match body.get("sourceRegion").and_then(Value::as_str) {
+        Some(v) => parse_region(Some(v)),
+        None => region,
+    };
     let target_account_id = body
         .get("targetAccountId")
         .and_then(|v| v.as_str())
@@ -653,7 +676,7 @@ async fn api_copy_sessions(Json(body): Json<Value>) -> Response {
     // copy_sessions_for_switch_for 已返回完整报告（sourceUid / targetUid / copied /
     // skipped? / errors?）。这里必须**原样透传**，不能再包一层 "copied" —— 否则
     // 响应会变成 {copied:{copied:[...]}}，与 Tauri 通道及前端 CopyResult[] 契约不一致。
-    match session::copy_sessions_for_switch_for(region, &target, &session_ids) {
+    match session::copy_sessions_for_switch_cross(source_region, region, &target, &session_ids) {
         Some(report) => json_ok(report),
         None => json_ok(json!({
             "sourceUid": Value::Null,
@@ -669,11 +692,16 @@ async fn api_copy_sessions(Json(body): Json<Value>) -> Response {
 
 /// POST /api/migrate/account —— 把源账号的 Memory / Connector 合并到目标账号（带去重）。
 ///
-/// 请求体：`{ sourceAccountId?, targetAccountId, memory?, connectors?, region? }`
-/// `sourceAccountId` 缺省时取当前登录账号。两个范围默认都启用。
+/// 请求体：`{ sourceAccountId?, targetAccountId, memory?, connectors?, region?, sourceRegion? }`
+/// `sourceAccountId` 缺省时取**来源版本**的当前登录账号。两个范围默认都启用。
 /// 只处理普通文件，不触碰 `workbuddy.db`，因此**无需关闭 WorkBuddy**。
 async fn api_migrate_account(Json(body): Json<Value>) -> Response {
     let region = parse_region(body.get("region").and_then(Value::as_str));
+    // 数据来源版本；缺省与目标版本相同（同版本内迁移，行为零变化）。
+    let source_region = match body.get("sourceRegion").and_then(Value::as_str) {
+        Some(v) => parse_region(Some(v)),
+        None => region,
+    };
     let target_account_id = body
         .get("targetAccountId")
         .and_then(|v| v.as_str())
@@ -717,9 +745,9 @@ async fn api_migrate_account(Json(body): Json<Value>) -> Response {
 
     // 源账号：显式指定则解析其 uid，否则退回「当前登录账号」。
     let source_uid = if source_account_id.is_empty() {
-        session::current_user_uid_for(region).unwrap_or_default()
+        session::current_user_uid_for(source_region).unwrap_or_default()
     } else {
-        match account::find_account_for(region, &source_account_id) {
+        match account::find_account_for(source_region, &source_account_id) {
             Some(acc) => acc
                 .get("uid")
                 .and_then(Value::as_str)
@@ -736,7 +764,13 @@ async fn api_migrate_account(Json(body): Json<Value>) -> Response {
         );
     }
 
-    match migrate::migrate_account_data_for(region, &source_uid, &target_uid, scope) {
+    match migrate::migrate_account_data_cross(
+        source_region,
+        &source_uid,
+        region,
+        &target_uid,
+        scope,
+    ) {
         Ok(v) => json_ok(v),
         Err(e) => json_err(e, StatusCode::BAD_REQUEST),
     }
@@ -934,6 +968,20 @@ async fn api_save_schedule_config(Json(body): Json<Value>) -> Response {
     match schedule::save_schedule_config(submitted) {
         Ok(cfg) => json_ok(schedule::schedule_to_value(&cfg)),
         Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/schedule/run —— **立即**执行某一类定时任务，不等排程到点。
+///
+/// 与桌面的 `run_schedule_task` 命令同源（共用 [`scheduler::run_scheduled_task`]）：排程按
+/// 整点触发，保存配置后无法当场自证是否生效，手动触发让改动立刻可验证。
+async fn api_run_schedule_task(Json(body): Json<Value>) -> Response {
+    let Some(task) = body.get("task").and_then(Value::as_str) else {
+        return json_err("缺少 task 字段".to_string(), StatusCode::BAD_REQUEST);
+    };
+    match schedule::ScheduleTask::parse(task) {
+        Some(task) => json_ok(scheduler::run_scheduled_task(task).await),
+        None => json_err(format!("未知定时任务: {task}"), StatusCode::BAD_REQUEST),
     }
 }
 
@@ -1160,10 +1208,15 @@ async fn api_trae_credits(RawQuery(query): RawQuery) -> Response {
     json_ok(trae::handlers::credits_overview_for(variant))
 }
 
-/// GET /api/trae/token-stats —— Token 统计（`days` 可选，缺省全部历史）。
+/// GET /api/trae/token-stats —— Token 统计（`days` / `scope` 可选）。
+///
+/// `scope` 为**变体范围**筛选维度：`work` / `cn` / `unlabeled` / `all`（缺省 `all`）。
 async fn api_trae_token_statistics(RawQuery(query): RawQuery) -> Response {
     let days = query_value(query.as_deref(), "days").and_then(|value| value.parse::<i64>().ok());
-    json_ok(trae::handlers::token_statistics(days))
+    let scope = query_value(query.as_deref(), "scope")
+        .map(|value| trae::token_stats::TraeTokenScope::parse(&value))
+        .unwrap_or_default();
+    json_ok(trae::handlers::token_statistics(days, scope))
 }
 
 /// GET /api/trae/logs —— 运行日志（`kind` / `date` / `keyword` / `limit` / `variant` 均可选）。
@@ -1604,14 +1657,17 @@ async fn api_save_trae_gateway_config(Json(body): Json<Value>) -> Response {
     }))
 }
 
-async fn api_trae_gateway_status() -> Response {
+async fn api_trae_gateway_status(RawQuery(query): RawQuery) -> Response {
     let (running, addr) = crate::trae_gateway_host::status().await;
+    // `variant` 决定看哪个账号池；缺失 / 未知 → 默认变体（键集合不变，见 status_view）。
+    let variant = parse_trae_variant(query_value(query.as_deref(), "variant").as_deref());
     json_ok(
         buddy_switch_gateway::trae::status_view(
             &crate::trae_gateway_host::shared_state(),
             running,
             addr,
             update::APP_VERSION,
+            variant,
         )
         .await,
     )
@@ -1621,19 +1677,72 @@ async fn api_trae_gateway_models() -> Response {
     json_ok(buddy_switch_gateway::trae::payload::models_response())
 }
 
-async fn api_trae_regenerate_api_key() -> Response {
-    let plaintext = match buddy_switch_gateway::trae::regenerate_api_key() {
-        Ok(plaintext) => plaintext,
-        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
-    };
-    // 共享状态缓存的是旧 Key，必须同步，否则旧 Key 在进程存活期内仍然可用（真事故）。
+/// GET /api/trae/gateway/keys —— 多 Key 列表（形状与 Tauri 命令逐字一致）。
+///
+/// **形状唯一来源**：直接调 gateway crate 的 `apikey::list_response`，
+/// 本层不拼装（`MEMORY.md §二`：`copy_sessions` 事故的直接对策）。
+async fn api_trae_list_api_keys() -> Response {
     let state = crate::trae_gateway_host::shared_state();
-    *state.api_key.write().await = plaintext.clone();
-    json_ok(json!({
-        "ok": true,
-        "key": plaintext,
-        "prefix": buddy_switch_gateway::trae::mask_api_key(&plaintext),
-    }))
+    json_ok(buddy_switch_gateway::trae::apikey::list_response(
+        &state.key_store,
+    ))
+}
+
+/// POST /api/trae/gateway/keys —— 新建 Key（`{name, variant}`）。
+///
+/// 明文仅此一次返回；`variant` 缺省 / 未知 → 默认变体（TraeWork）。
+async fn api_trae_create_api_key(Json(body): Json<Value>) -> Response {
+    let name = body
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("未命名 Key")
+        .to_string();
+    let variant = parse_trae_variant(body.get("variant").and_then(Value::as_str));
+    let state = crate::trae_gateway_host::shared_state();
+    json_ok(buddy_switch_gateway::trae::apikey::create_response(
+        &state.key_store,
+        name,
+        variant,
+    ))
+}
+
+/// POST /api/trae/gateway/keys/revoke —— 吊销 Key（`{id}`）。
+async fn api_trae_revoke_api_key(Json(body): Json<Value>) -> Response {
+    let id = body.get("id").and_then(Value::as_str).unwrap_or("").trim();
+    if id.is_empty() {
+        return json_err("缺少 id".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let state = crate::trae_gateway_host::shared_state();
+    match state.key_store.revoke(id) {
+        Ok(()) => json_ok(json!({ "ok": true })),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/trae/gateway/keys/delete —— 物理删除已吊销的 Key（`{id}`）。
+async fn api_trae_delete_api_key(Json(body): Json<Value>) -> Response {
+    let id = body.get("id").and_then(Value::as_str).unwrap_or("").trim();
+    if id.is_empty() {
+        return json_err("缺少 id".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let state = crate::trae_gateway_host::shared_state();
+    match state.key_store.delete(id) {
+        Ok(()) => json_ok(json!({ "ok": true })),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/trae/open-data-dir —— 打开 Trae 数据目录（`{variant?}`）。
+///
+/// 形状（`{ok,path}` 或结构化 `Unsupported`）由 `handlers::open_data_dir` 唯一产出。
+async fn api_trae_open_data_dir(Json(body): Json<Value>) -> Response {
+    let variant = parse_trae_variant(body.get("variant").and_then(Value::as_str));
+    match trae::handlers::open_data_dir(variant) {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
 }
 
 async fn api_trae_gateway_logs() -> Response {

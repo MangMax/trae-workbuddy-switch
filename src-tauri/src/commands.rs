@@ -394,11 +394,17 @@ pub async fn switch_account(
     restart: Option<bool>,
     share_sessions: Option<bool>,
     copy_session_ids: Option<Vec<String>>,
+    source_region: Option<String>,
 ) -> Result<Value, String> {
     if account_id.trim().is_empty() {
         return Err("缺少 accountId".to_string());
     }
     let region = parse_region(region.as_deref());
+    // 会话复制的来源版本；缺省与目标版本相同（同版本内切换，行为零变化）。
+    let source_region = match source_region.as_deref() {
+        Some(v) => parse_region(Some(v)),
+        None => region,
+    };
     let restart = restart.unwrap_or(true);
     let share_sessions = share_sessions.unwrap_or(false);
     let copy_ids = copy_session_ids.unwrap_or_default();
@@ -419,8 +425,9 @@ pub async fn switch_account(
         let _ = app.emit("switch-progress", json!({ "message": message }));
     });
     let result = tauri::async_runtime::spawn_blocking(move || {
-        switch::switch_account_for(
+        switch::switch_account_cross(
             region,
+            source_region,
             Some(&progress),
             &account_id,
             restart,
@@ -462,6 +469,7 @@ pub async fn copy_sessions(
     target_account_id: String,
     session_ids: Vec<String>,
     region: Option<String>,
+    source_region: Option<String>,
 ) -> Result<Value, String> {
     if target_account_id.trim().is_empty() {
         return Err("缺少 targetAccountId".to_string());
@@ -470,10 +478,14 @@ pub async fn copy_sessions(
         return Err("缺少 sessionIds".to_string());
     }
     let region = parse_region(region.as_deref());
+    let source_region = match source_region.as_deref() {
+        Some(v) => parse_region(Some(v)),
+        None => region,
+    };
     tauri::async_runtime::spawn_blocking(move || {
         let target =
             account::find_account_for(region, &target_account_id).ok_or("目标账号不存在")?;
-        Ok(session::copy_sessions_for_switch_for(region, &target, &session_ids)
+        Ok(session::copy_sessions_for_switch_cross(source_region, region, &target, &session_ids)
             .unwrap_or_else(|| json!({})))
     })
     .await
@@ -494,11 +506,16 @@ pub async fn migrate_account_data(
     memory: Option<bool>,
     connectors: Option<bool>,
     region: Option<String>,
+    source_region: Option<String>,
 ) -> Result<Value, String> {
     if target_account_id.trim().is_empty() {
         return Err("缺少 targetAccountId".to_string());
     }
     let region = parse_region(region.as_deref());
+    let source_region = match source_region.as_deref() {
+        Some(v) => parse_region(Some(v)),
+        None => region,
+    };
     let source_account_id = source_account_id.unwrap_or_default().trim().to_string();
 
     tauri::async_runtime::spawn_blocking(move || {
@@ -523,9 +540,9 @@ pub async fn migrate_account_data(
         }
 
         let source_uid = if source_account_id.is_empty() {
-            session::current_user_uid_for(region).unwrap_or_default()
+            session::current_user_uid_for(source_region).unwrap_or_default()
         } else {
-            let acc = account::find_account_for(region, &source_account_id)
+            let acc = account::find_account_for(source_region, &source_account_id)
                 .ok_or("源账号不存在")?;
             acc.get("uid")
                 .and_then(Value::as_str)
@@ -537,7 +554,13 @@ pub async fn migrate_account_data(
             return Err("无法确定源账号 uid（未登录或账号缺少 uid）".to_string());
         }
 
-        migrate::migrate_account_data_for(region, &source_uid, &target_uid, scope)
+        migrate::migrate_account_data_cross(
+            source_region,
+            &source_uid,
+            region,
+            &target_uid,
+            scope,
+        )
     })
     .await
     .map_err(|e| e.to_string())?
@@ -660,6 +683,21 @@ pub fn get_schedule_config() -> Value {
 pub fn save_schedule_config(config: Value) -> Result<Value, String> {
     let cfg = crate::modules::schedule::save_schedule_config(&config)?;
     Ok(crate::modules::schedule::schedule_to_value(&cfg))
+}
+
+/// POST /api/schedule/run —— **立即**执行某一类定时任务，不等排程到点。
+///
+/// 为什么需要：排程按整点触发，保存配置后无法当场自证是否生效（「活跃地图」这类要到
+/// 官网对照连登热力图才知道）。手动触发让配置改动立刻可验证——上报结果会带回每个账号
+/// 的 `reported` 与 `streakDays`。
+///
+/// `task` 取 [`schedule::ScheduleTask::as_str`] 的稳定标识；未知标识返回 Err。
+#[tauri::command]
+pub async fn run_schedule_task(task: String) -> Result<Value, String> {
+    let Some(task) = crate::modules::schedule::ScheduleTask::parse(&task) else {
+        return Err(format!("未知定时任务: {task}"));
+    };
+    Ok(crate::modules::scheduler::run_scheduled_task(task).await)
 }
 
 // ---------------------------------------------------------------------------
@@ -1099,9 +1137,14 @@ pub fn get_trae_credits(variant: Option<String>) -> Value {
 /// GET /api/trae/token-stats —— Token 统计（聚合本机网关请求日志）。
 ///
 /// `days` 为统计窗口天数；`None` / `<= 0` 表示全部历史。
+/// `scope` 为**变体范围**筛选维度：`work` / `cn` / `unlabeled` / `all`（缺省 `all`）。
 #[tauri::command]
-pub fn get_trae_token_statistics(days: Option<i64>) -> Value {
-    trae::handlers::token_statistics(days)
+pub fn get_trae_token_statistics(days: Option<i64>, scope: Option<String>) -> Value {
+    let scope = scope
+        .as_deref()
+        .map(trae::token_stats::TraeTokenScope::parse)
+        .unwrap_or_default();
+    trae::handlers::token_statistics(days, scope)
 }
 
 /// GET /api/trae/logs —— 运行日志（系统日志页的「运行日志」标签页）。
@@ -1390,8 +1433,10 @@ pub async fn trae_reset_device(variant: Option<String>) -> Result<Value, String>
 // ---------------------------------------------------------------------------
 //
 // 与 WorkBuddy 网关的管理命令**形状对齐**（get config / save config / status /
-// models / logs / clear logs），少一套多 Key 管理：Trae 侧只需要「一把钥匙」，
-// 它存在 `TraeSettings::apiKey`，由 `ensure_api_key()` 自动生成。
+// models / keys / logs / clear logs）。多 Key 管理（含归属产品线）走
+// `trae_gateway::shared_state().key_store`：Key 只存哈希 + 前缀 + `variant`，
+// 明文仅在创建时一次性返回；形状由 gateway crate 的 `trae::apikey::{list_response,
+// create_response}` 唯一产出（`MEMORY.md §二`：两条通道不得各自拼装）。
 
 /// GET /api/trae/gateway/config —— Trae 网关配置。
 #[tauri::command]
@@ -1431,8 +1476,10 @@ pub async fn save_trae_gateway_config(
 }
 
 /// GET /api/trae/gateway/status —— 运行状态 + 账号池摘要 + 账号明细 + 诊断。
+///
+/// `variant` 决定看哪个账号池：缺失 / 未知 → 默认变体（TraeWork），响应键集合不变。
 #[tauri::command]
-pub async fn trae_gateway_status(app: tauri::AppHandle) -> Value {
+pub async fn trae_gateway_status(app: tauri::AppHandle, variant: Option<String>) -> Value {
     let (running, addr) = {
         let runtime = app.state::<trae_gateway::TraeGatewayRuntime>();
         (runtime.is_running(), runtime.addr())
@@ -1442,6 +1489,7 @@ pub async fn trae_gateway_status(app: tauri::AppHandle) -> Value {
         running,
         addr,
         update::APP_VERSION,
+        parse_trae_variant(variant.as_deref()),
     )
     .await
 }
@@ -1452,18 +1500,60 @@ pub fn get_trae_gateway_models() -> Value {
     buddy_switch_gateway::trae::payload::models_response()
 }
 
-/// POST /api/trae/gateway/key/regenerate —— 重新生成 API Key（返回一次性明文）。
+/// GET /api/trae/gateway/keys —— 多 Key 列表（含归属产品线）。
+///
+/// 形状唯一来源：gateway crate 的 `apikey::list_response`（HTTP 通道同款）。
 #[tauri::command]
-pub async fn regenerate_trae_api_key() -> Result<Value, String> {
-    let plaintext = buddy_switch_gateway::trae::regenerate_api_key()?;
-    // 共享状态里缓存的是旧 Key，必须同步，否则旧 Key 在进程存活期内仍然可用（真事故）。
+pub fn list_trae_api_keys() -> Value {
     let state = trae_gateway::shared_state();
-    *state.api_key.write().await = plaintext.clone();
-    Ok(json!({
-        "ok": true,
-        "key": plaintext,
-        "prefix": buddy_switch_gateway::trae::mask_api_key(&plaintext),
-    }))
+    buddy_switch_gateway::trae::apikey::list_response(&state.key_store)
+}
+
+/// POST /api/trae/gateway/keys —— 新建 Key（`{name, variant}`，明文仅此一次返回）。
+#[tauri::command]
+pub fn create_trae_api_key(name: Option<String>, variant: Option<String>) -> Value {
+    let name = name
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "未命名 Key".to_string());
+    let state = trae_gateway::shared_state();
+    buddy_switch_gateway::trae::apikey::create_response(
+        &state.key_store,
+        name,
+        parse_trae_variant(variant.as_deref()),
+    )
+}
+
+/// POST /api/trae/gateway/keys/revoke —— 吊销 Key（`{id}`）。
+#[tauri::command]
+pub fn revoke_trae_api_key(id: String) -> Result<Value, String> {
+    let id = id.trim();
+    if id.is_empty() {
+        return Err("缺少 id".to_string());
+    }
+    let state = trae_gateway::shared_state();
+    state.key_store.revoke(id)?;
+    Ok(json!({ "ok": true }))
+}
+
+/// POST /api/trae/gateway/keys/delete —— 物理删除**已吊销**的 Key（`{id}`）。
+#[tauri::command]
+pub fn delete_trae_api_key(id: String) -> Result<Value, String> {
+    let id = id.trim();
+    if id.is_empty() {
+        return Err("缺少 id".to_string());
+    }
+    let state = trae_gateway::shared_state();
+    state.key_store.delete(id)?;
+    Ok(json!({ "ok": true }))
+}
+
+/// POST /api/trae/open-data-dir —— 打开 Trae 数据目录（`{variant?}`）。
+///
+/// 形状（`{ok,path}` 或结构化 `Unsupported`）由 `handlers::open_data_dir` 唯一产出。
+#[tauri::command]
+pub fn open_trae_data_dir(variant: Option<String>) -> Result<Value, String> {
+    trae::handlers::open_data_dir(parse_trae_variant(variant.as_deref()))
 }
 
 /// GET /api/trae/gateway/logs —— 最近 N 条请求日志（元数据）。

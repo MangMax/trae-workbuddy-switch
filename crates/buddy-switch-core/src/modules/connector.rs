@@ -225,7 +225,7 @@ pub fn merge_json_text(target_text: &str, source_text: &str) -> Result<(String, 
     Ok((text, result))
 }
 
-/// 合并某账号的全部 Connector 配置到目标账号。
+/// 合并某账号的全部 Connector 配置到目标账号（同一版本内）。
 ///
 /// 逐文件深合并 + 数组去重，保留目标已有配置。
 pub fn merge_connectors_for(
@@ -233,10 +233,23 @@ pub fn merge_connectors_for(
     source_uid: &str,
     target_uid: &str,
 ) -> Result<ConnectorMergeResult, String> {
-    if source_uid.trim() == target_uid.trim() {
+    merge_connectors_cross(region, source_uid, region, target_uid)
+}
+
+/// 跨版本合并：把 `source_region` 下源账号的 Connector 配置合并进 `target_region` 下目标账号。
+///
+/// 与 [`crate::modules::memory::merge_memory_files_cross`] 同一条判定口径：
+/// 只有**同版本且 uid 相同**才是自我覆盖，跨版本同文 uid 属巧合，照常合并。
+pub fn merge_connectors_cross(
+    source_region: Region,
+    source_uid: &str,
+    target_region: Region,
+    target_uid: &str,
+) -> Result<ConnectorMergeResult, String> {
+    if source_region == target_region && source_uid.trim() == target_uid.trim() {
         return Err("源账号与目标账号相同".to_string());
     }
-    let source_dir = connector_account_dir_for(region, source_uid);
+    let source_dir = connector_account_dir_for(source_region, source_uid);
     if !source_dir.is_dir() {
         return Ok(ConnectorMergeResult {
             files: Vec::new(),
@@ -244,7 +257,7 @@ pub fn merge_connectors_for(
             backup: None,
         });
     }
-    let target_dir = connector_account_dir_for(region, target_uid);
+    let target_dir = connector_account_dir_for(target_region, target_uid);
 
     let mut report = ConnectorMergeResult::default();
     for file_name in CONNECTOR_FILES {

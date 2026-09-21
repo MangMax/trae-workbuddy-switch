@@ -16,7 +16,9 @@ import {
 } from "@/components/ui/dialog";
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import * as api from "@/lib/api";
+import { REGIONS, regionLabel } from "@/lib/region";
 import type { AccountMeta, MigrateResult, Region, Session } from "@/lib/types";
 
 interface Props {
@@ -52,6 +54,11 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone, regio
   const [error, setError] = useState("");
   const [currentUid, setCurrentUid] = useState<string | null>(null);
   const [progress, setProgress] = useState("");
+  /**
+   * 数据**来源**版本（会话 / 记忆 / 连接器取自哪一版的当前登录账号）。
+   * 缺省等于目标 `region` —— 即同版本内切换，行为与改造前完全一致。
+   */
+  const [sourceRegion, setSourceRegion] = useState<Region>(region ?? "cn");
 
   // 监听后端切换进度：桌面端走 Tauri 事件，webui 走 HTTP 轮询
   useEffect(() => {
@@ -83,17 +90,29 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone, regio
       setSelected(new Set());
       setExpanded(new Set());
       setError("");
+      setSourceRegion(region ?? "cn");
       setLoadingSessions(true);
+      // 首次进入时 `sourceRegion` 可能还是上一次的选择，重置后会再跑一次本 effect；
+      // 用 cancelled 丢弃那次过期请求，避免短暂显示「另一个版本」的会话。
+      let cancelled = false;
       api
-        .listSessions(region)
+        .listSessions(sourceRegion)
         .then((res) => {
+          if (cancelled) return;
           setSessions(res.sessions);
           setCurrentUid(res.current);
         })
-        .catch((e) => setError(api.asError(e)))
-        .finally(() => setLoadingSessions(false));
+        .catch((e) => {
+          if (!cancelled) setError(api.asError(e));
+        })
+        .finally(() => {
+          if (!cancelled) setLoadingSessions(false);
+        });
+      return () => {
+        cancelled = true;
+      };
     }
-  }, [open, account, region]);
+  }, [open, account, region, sourceRegion]);
 
   function toggleSession(id: string) {
     setSelected((prev) => {
@@ -140,6 +159,7 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone, regio
         // 只请求勾选的分区；未请求的分区不会出现在响应里（见 summarizeMigration）。
         const mig = await api.migrateAccountData(account.id, {
           region,
+          sourceRegion,
           memory: migrateMemory,
           connectors: migrateConnectors,
         });
@@ -150,6 +170,9 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone, regio
       const res = await api.switchAccount({
         accountId: account.id,
         region,
+        // 只有「跨版本」时才显式带来源版本：同版本时它由后端缺省为目标 region，
+        // 少传一个字段就少一处与后端默认值漂移的机会。
+        sourceRegion: sourceRegion === region ? undefined : sourceRegion,
         copySessionIds: copySessions ? [...selected] : undefined,
       });
       const nickname = account.nickname || account.email || account.uid || "该账号";
@@ -230,6 +253,8 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone, regio
   }, [error]);
 
   const copyCount = copySessions ? selected.size : 0;
+  const targetRegion: Region = region ?? "cn";
+  const crossRegion = sourceRegion !== targetRegion;
   const needsPermission = error.includes("无权限");
   const sessionsEmpty = !loadingSessions && sessions.length === 0;
   const copyHint = loadingSessions
@@ -240,7 +265,9 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone, regio
         ? currentUid
           ? "当前账号暂无会话，无法复制"
           : "未检测到当前登录账号，无法列出会话"
-        : "将当前账号勾选的会话以新 id 复制给目标账号（云端归属目标）";
+        : crossRegion
+          ? `把${regionLabel(sourceRegion)}当前账号勾选的会话以新 id 复制到${regionLabel(targetRegion)}目标账号`
+          : "将当前账号勾选的会话以新 id 复制给目标账号（云端归属目标）";
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -268,6 +295,31 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone, regio
         <div className="min-h-0 space-y-3 overflow-x-hidden overflow-y-auto">
           <div className="flex items-center justify-between gap-3 rounded-md border px-3 py-2.5">
             <div className="min-w-0 flex-1">
+              <div className="text-sm font-medium">数据来源版本</div>
+              <div className="text-xs text-muted-foreground">
+                {sourceRegion === targetRegion
+                  ? `与目标一致（${regionLabel(targetRegion)}），同版本内搬运`
+                  : `从${regionLabel(sourceRegion)}当前登录账号搬到${regionLabel(targetRegion)}`}
+              </div>
+            </div>
+            <Tabs
+              value={sourceRegion}
+              onValueChange={(next) => {
+                if (next === "cn" || next === "global") setSourceRegion(next);
+              }}
+            >
+              <TabsList className="h-auto" aria-label="数据来源版本">
+                {REGIONS.map((r) => (
+                  <TabsTrigger key={r} value={r} className="whitespace-nowrap">
+                    {regionLabel(r)}
+                  </TabsTrigger>
+                ))}
+              </TabsList>
+            </Tabs>
+          </div>
+
+          <div className="flex items-center justify-between gap-3 rounded-md border px-3 py-2.5">
+            <div className="min-w-0 flex-1">
               <div className="text-sm font-medium">复制会话到目标账号</div>
               <div
                 className={
@@ -290,7 +342,9 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone, regio
             <div className="min-w-0 flex-1">
               <div className="text-sm font-medium">迁移长期记忆</div>
               <div className="text-xs text-muted-foreground">
-                合并当前账号的长期记忆到目标账号；按内容去重，只补差集，改写前自动备份原文
+                {crossRegion
+                  ? `把${regionLabel(sourceRegion)}当前账号的长期记忆合并到${regionLabel(targetRegion)}目标账号；按内容去重，只补差集，改写前自动备份原文`
+                  : "合并当前账号的长期记忆到目标账号；按内容去重，只补差集，改写前自动备份原文"}
               </div>
             </div>
             <Switch checked={migrateMemory} onCheckedChange={setMigrateMemory} />
@@ -300,7 +354,9 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone, regio
             <div className="min-w-0 flex-1">
               <div className="text-sm font-medium">迁移连接器配置</div>
               <div className="text-xs text-muted-foreground">
-                合并当前账号的连接器配置到目标账号；同名条目递归合并、重复项去重，改写前自动备份原文
+                {crossRegion
+                  ? `把${regionLabel(sourceRegion)}当前账号的连接器配置合并到${regionLabel(targetRegion)}目标账号；同名条目递归合并、重复项去重，改写前自动备份原文`
+                  : "合并当前账号的连接器配置到目标账号；同名条目递归合并、重复项去重，改写前自动备份原文"}
               </div>
             </div>
             <Switch checked={migrateConnectors} onCheckedChange={setMigrateConnectors} />
