@@ -15,7 +15,9 @@ use buddy_switch_core::modules::{checkin, update};
 
 const TRAY_ID: &str = "main-menu-bar";
 const MAIN_WINDOW_LABEL: &str = "main";
-const DEFAULT_TOOLTIP: &str = "BuddySwitch";
+/// 展示名统一为 `Buddy Switch`（带空格）；构建标识仍是 `BuddySwitch`
+/// （productName / .app / 安装包文件名），两者刻意不同名，详见 README 的命名约定。
+const DEFAULT_TOOLTIP: &str = "Buddy Switch";
 const CHECKIN_TOOLTIP_RESTORE_SECS: u64 = 8;
 
 /// 系统自启注册的启动参数：仅携带该精确参数的启动进入静默托盘模式。
@@ -351,7 +353,7 @@ fn notify_checkin<R: Runtime>(app: &AppHandle<R>, body: &str) {
     let _ = app
         .notification()
         .builder()
-        .title("BuddySwitch")
+        .title(DEFAULT_TOOLTIP)
         .body(body)
         .show();
 }

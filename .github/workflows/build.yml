@@ -170,7 +170,7 @@ jobs:
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          PKG_DIR="npm/platform/workbuddy-switch-${{ matrix.platform_tag }}"
+          PKG_DIR="npm/platform/buddy-switch-${{ matrix.platform_tag }}"
           # 与桌面构建同一份版本规则（git 里的可能滞后，这里强制同步）
           if [[ "${GITHUB_REF_NAME#v}" =~ ^[0-9] ]]; then
             VER=$(sh scripts/stamp-version.sh --tag "$GITHUB_REF_NAME" --print)

@@ -59,7 +59,7 @@ echo "打 dmg: $APP → $OUT"
 dmgbuild \
   -s "$SETTINGS" \
   -D "app=$APP" \
-  "BuddySwitch" \
+  "Buddy Switch" \
   "$TMP_OUT"
 
 # Publish atomically after dmgbuild has completed.  A failed build therefore
