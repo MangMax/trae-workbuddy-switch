@@ -4,9 +4,10 @@
 //! 每条工具调用必须紧跟同 id 的工具结果，反之亦然。不自洽时整单被拒：
 //! `400 {"code":11148,"extError":{"code":"tool_call_sequence_broken"}}`。
 //!
-//! 这条不变量跨模块，缺陷也可以各自独立，故在**跨模块**层面钉住：
+//! 这两条路径分别由两个模块负责，缺陷也各自独立，故在**跨模块**层面钉住不变量：
 //! - `protocol::anthropic::to_upstream_request`：同一条 user 消息内的文本块与工具结果
-//!   的相对顺序。
+//!   的相对顺序；
+//! - `outbound::prepare_outbound_body`：孤儿清理时「删除」与「放行」是否用了同一套 id。
 
 use buddy_switch_core::modules::region::Region;
 use buddy_switch_gateway::outbound::{prepare_outbound_body, OutboundMeta, OutboundOptions};
@@ -117,6 +118,35 @@ fn text_and_tool_result_in_one_turn_keeps_tool_adjacency() {
         messages[tool_at - 1].get("role").and_then(Value::as_str),
         Some("assistant"),
         "工具结果必须紧邻发起调用的 assistant：{messages:?}"
+    );
+}
+
+/// 并行批次 `[A, B]` 只有 `A` 有结果时，整批 `tool_calls` 会被删除——此时 `A` 的
+/// 工具结果必须**一起**删除，否则悬空（历史被裁剪 / 某个工具被丢弃时会命中）。
+#[test]
+fn partial_tool_result_set_leaves_no_dangling_tool_message() {
+    let inbound = json!({
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 1024,
+        "messages": [
+            {"role": "user", "content": "并行跑两个工具"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_A", "name": "Bash", "input": {"command": "ls"}},
+                {"type": "tool_use", "id": "toolu_B", "name": "Read", "input": {"file_path": "a.txt"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_A", "content": "ok"}
+            ]}
+        ]
+    });
+
+    let messages = outbound_messages(&inbound);
+    check_tool_sequence(&messages).unwrap_or_else(|error| panic!("{error}"));
+    assert!(
+        !messages
+            .iter()
+            .any(|message| message.get("role").and_then(Value::as_str) == Some("tool")),
+        "批次被整批删除后不得残留工具结果：{messages:?}"
     );
 }
 
