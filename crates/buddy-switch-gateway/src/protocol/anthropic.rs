@@ -45,6 +45,8 @@ fn tool_result_to_text(content: Option<&Value>) -> String {
 /// - 顶层 `system` → `messages[0] {role:"system"}`
 /// - assistant `tool_use` block → `tool_calls`
 /// - user `tool_result` block → 独立 `{role:"tool",tool_call_id,content}` 消息
+/// - 同一条 user 消息里的文本块排在工具结果**之后**：`role:"tool"` 必须紧邻发起
+///   调用的 assistant 消息，否则上游判 `tool_call_sequence_broken`
 /// - `tools[{name,description,input_schema}]` → `tools[{type:"function",function:{...parameters}}]`
 /// - `tool_choice`（auto/any/tool）→ 上游字符串形态
 /// - `stop_sequences` → `stop`；强制 `stream:true`
@@ -176,10 +178,16 @@ pub fn to_upstream_request(body: &Value) -> Value {
                             messages.push(Value::Object(assistant));
                         }
                     } else {
+                        // 顺序不可交换：`role:"tool"` 必须**紧跟**发起该调用的
+                        // assistant 消息，中间插入任何消息都会被上游判
+                        // `tool_call_sequence_broken`（400，tool calls and tool
+                        // results do not match）。因此同一条 user 消息里的文本块
+                        // （Claude Code 的插话 / 中断说明）排在工具结果**之后**，
+                        // 作为本轮结果之后的新用户发言。
+                        messages.extend(tool_results);
                         if !text.is_empty() {
                             messages.push(json!({"role": "user", "content": text}));
                         }
-                        messages.extend(tool_results);
                     }
                 }
                 _ => {
@@ -619,6 +627,35 @@ mod tests {
         assert_eq!(messages[2]["role"], "tool");
         assert_eq!(messages[2]["tool_call_id"], "toolu_1");
         assert_eq!(messages[2]["content"], "sunny");
+    }
+
+    /// 同一条 user 消息里既有工具结果又有文本块时，文本必须排在结果**之后**。
+    ///
+    /// `role:"tool"` 必须紧邻发起调用的 assistant 消息；把文本块排到前面会让工具结果
+    /// 与 assistant 隔开，上游判 `tool_call_sequence_broken`（400）。
+    #[test]
+    fn tool_result_precedes_sibling_text_block() {
+        let anthropic = json!({
+            "model": "m",
+            "max_tokens": 10,
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "sunny"},
+                    {"type": "text", "text": "顺带提一句"}
+                ]}
+            ]
+        });
+        let upstream = to_upstream_request(&anthropic);
+        let messages = upstream["messages"].as_array().unwrap();
+
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[1]["role"], "tool");
+        assert_eq!(messages[1]["tool_call_id"], "toolu_1");
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(messages[2]["content"], "顺带提一句");
     }
 
     #[test]
