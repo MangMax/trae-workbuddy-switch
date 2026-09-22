@@ -7,6 +7,10 @@
   WorkBuddy / CodeBuddy / Trae 账号切换工具
 </p>
 
+<p align="center">
+  <strong>简体中文</strong> · <a href="README.en.md">English</a>
+</p>
+
 # Buddy Switch
 
 **WorkBuddy / TraeWork 多账号管理工具**：OAuth 扫码登录、一键切换登录态、积分到期监控与自动签到、Token 用量统计，并可以把模型额度以 OpenAI / Anthropic 兼容接口提供给本机其它工具。
