@@ -113,6 +113,14 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           target: ${{ matrix.target }}
+          # ⚠️ 这个 action 的 `build-warnings` **默认就是 `"deny"`**，会写入
+          # `CARGO_BUILD_WARNINGS=deny`（即 cargo 的 `build.warnings` 配置）：
+          # **全工作区任何 rustc 警告都变成硬错误，退出码 101**。
+          # 这里显式写出来，是为了让这条策略成为「看得见的决定」而不是隐形默认值。
+          #   · 本机（Windows）构建复现不出来 —— 只有 CI 会因此变红；
+          #   · 想放宽成「警告只提示、不阻断」就把值改成 ""（空串 = 不设置该变量）。
+          # 背景见 `.workbuddy/memory/2026-09-22.md`。
+          build-warnings: "deny"
 
       # cargo 缓存：依赖 + 编译产物，增量编译大幅提速（Cargo.lock 不变时命中）
       - name: Cache cargo
@@ -149,6 +157,27 @@ jobs:
             "dmgbuild==1.6.7"
           echo "$DMGBUILD_VENV/bin" >> "$GITHUB_PATH"
 
+      # 版本号唯一来源：tag 触发时 tag 是唯一真相；非 tag 触发按打包时刻生成
+      # <YYYY>.<M>.<DHHMM>（与本地打包同一份规则，见 scripts/stamp-version.mjs）。
+      #
+      # ⚠️ 必须**不带 `--print`** 调用。`--print` 是 printOnly：只打印、不写入任何
+      # 版本载体。只取一个变量而不落盘时，Tauri 会继续用仓库里 committed 的旧版本
+      # 命名产物（`BuddySwitch_<旧版本>_x64-setup.exe`），而后续断言/清单用的是新算出的
+      # 值 → Windows 的 `Build desktop app` 里的陈旧包守卫必然触发 `exit 1`。
+      # 放在这里（而非打包那一步）是为了让「server 二进制 / 桌面 App / updater 清单」
+      # 三步拿到**同一个** VER —— VER 经 GITHUB_ENV 向后传递。
+      - name: Stamp version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_NAME#v}" =~ ^[0-9] ]]; then
+            sh scripts/stamp-version.sh --tag "$GITHUB_REF_NAME"
+          else
+            sh scripts/stamp-version.sh
+          fi
+          VER=$(node -p "require('./package.json').version")
+          echo "VER=$VER" >> "$GITHUB_ENV"
+          echo "stamped version: $VER"
+
       # 前端构建产物（CLI 二进制 rust-embed 嵌入 + Tauri App 使用）
       - name: Build frontend
         run: |
@@ -171,12 +200,12 @@ jobs:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           PKG_DIR="npm/platform/buddy-switch-${{ matrix.platform_tag }}"
-          # 与桌面构建同一份版本规则（git 里的可能滞后，这里强制同步）
-          if [[ "${GITHUB_REF_NAME#v}" =~ ^[0-9] ]]; then
-            VER=$(sh scripts/stamp-version.sh --tag "$GITHUB_REF_NAME" --print)
-          else
-            VER=$(sh scripts/stamp-version.sh --print)
-          fi
+          # VER 由前面的 `Stamp version` 步骤写入 GITHUB_ENV，本步骤直接读 $VER。
+          # ⚠️ 不要在这里「重新推导」：`stamp-version.sh --print` **只打印不写入**，
+          # 而且分散在多步里独立调用可能跨分钟边界拿到不同的值 ——
+          # 那样产出的安装包名与后面的断言/清单就会互相对不上。
+          # 下面这行 perl 现在已是**冗余**（`Stamp version` 已把各平台包的 version 一并写好），
+          # 保留它只作为「万一 stamp 步骤被移除」时的兜底，不再承担版本同步职责。
           perl -pi -e "s/\"version\": \"[0-9.]+\"/\"version\": \"$VER\"/" "$PKG_DIR/package.json"
           mkdir -p "$PKG_DIR/bin"
           SRC="target/${{ matrix.target }}/release/buddy-switch"
@@ -196,11 +225,10 @@ jobs:
           # 版本号由 scripts/stamp-version.sh 统一推导（本地与 CI 同一份规则）。
           # tag 触发时 tag 是唯一真相；非 tag 触发按打包时刻生成 <YYYY>.<M>.<DHHMM>。
           # 注意必须是 3 段：Cargo 拒绝 4 段 semver（`2026.9.18.1214` 会编译失败）。
-          if [[ "${GITHUB_REF_NAME#v}" =~ ^[0-9] ]]; then
-            VER=$(sh scripts/stamp-version.sh --tag "$GITHUB_REF_NAME" --print)
-          else
-            VER=$(sh scripts/stamp-version.sh --print)
-          fi
+          # VER 由前面的 `Stamp version` 步骤写入 GITHUB_ENV，本步骤直接读 $VER。
+          # ⚠️ 不要在这里「重新推导」：`stamp-version.sh --print` **只打印不写入**，
+          # 而且分散在多步里独立调用可能跨分钟边界拿到不同的值 ——
+          # 那样产出的安装包名与后面的断言/清单就会互相对不上。
           BUNDLE_ROOT="target/${{ matrix.target }}/release/bundle"
           # cargo cache 会保留旧 NSIS/DMG/AppImage；不清理就会把旧产物带进 Release。
           rm -rf "$BUNDLE_ROOT"
@@ -237,11 +265,10 @@ jobs:
         run: |
           # 与 Build desktop app 同一份规则：必须用同一个 VER，
           # 否则 updater 资产名会与上一步产出的安装包名对不上。
-          if [[ "${GITHUB_REF_NAME#v}" =~ ^[0-9] ]]; then
-            VER=$(sh scripts/stamp-version.sh --tag "$GITHUB_REF_NAME" --print)
-          else
-            VER=$(sh scripts/stamp-version.sh --print)
-          fi
+          # VER 由前面的 `Stamp version` 步骤写入 GITHUB_ENV，本步骤直接读 $VER。
+          # ⚠️ 不要在这里「重新推导」：`stamp-version.sh --print` **只打印不写入**，
+          # 而且分散在多步里独立调用可能跨分钟边界拿到不同的值 ——
+          # 那样产出的安装包名与后面的断言/清单就会互相对不上。
           echo "updater bundle dir: $BUNDLE_DIR (version $VER)"
           ls -la "$BUNDLE_DIR" || true
           if [ "$UPDATE_OS" = "windows" ]; then
