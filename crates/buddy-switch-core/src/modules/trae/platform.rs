@@ -98,6 +98,15 @@ pub fn platform_tag() -> &'static str {
 /// Windows 上不设该标志会让每次子进程调用都闪一个控制台窗口，
 /// 对一个常驻托盘的应用而言是不可接受的干扰。
 pub(crate) fn hidden_command(program: &str) -> std::process::Command {
+    // `mut` 只有 Windows 用得上（唯一的变异在下面的 `#[cfg(windows)]` 块里）。
+    //
+    // ⚠️ 不要删掉这个 `mut`、也不要给整个函数加 `allow(unused_mut)`：
+    // 同一份源码要在三平台编过，而 `#[cfg_attr(not(windows), …)]` 是唯一能把豁免
+    // **精确限定在非 Windows** 的写法。此前缺了它，CI 三个非 Windows job 全部
+    // 因 `unused_mut` 报 `error: variable does not need to be mutable`
+    // 而退出码 101（CI 的 rust 工具链 action 默认 `build-warnings: deny`，
+    // 警告即硬错误 —— 本机 Windows 构建永远看不到这条）。
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut command = std::process::Command::new(program);
     #[cfg(windows)]
     {
@@ -203,18 +212,19 @@ pub fn detect_install_for(variant: super::variant::TraeVariant) -> InstallProbe 
         }
     }
 
-    for root in windows_install_roots() {
-        for name in data_dir_names_for(variant) {
-            for exe in exe_names_for(variant) {
-                let candidate = root.join(name).join(exe);
-                if candidate.is_file() {
-                    return InstallProbe {
-                        installed: true,
-                        version: version_from_exe(&candidate),
-                        exe: Some(candidate),
-                    };
-                }
-            }
+    // 装配候选路径必须走平台共用 helper（[`candidate_paths_for`]）。此前这里
+    // 直接调 `windows_install_roots()`，而那个函数只在 `#[cfg(windows)]` 下存在
+    // —— Windows 编得过、macOS / Linux 直接
+    // `E0425 cannot find function windows_install_roots in this scope`
+    // （CI 的 mac-arm64 / mac-x64 / linux-x64 三个 job 就是这样红的）。
+    // 三平台共用一份装配逻辑后，这类「只在 Windows 定义」的缺口不可能再出现在此处。
+    for candidate in candidate_paths_for(data_dir_names_for(variant), exe_names_for(variant)) {
+        if candidate.is_file() {
+            return InstallProbe {
+                installed: true,
+                version: version_from_exe(&candidate),
+                exe: Some(candidate),
+            };
         }
     }
 
@@ -553,23 +563,47 @@ pub fn detect_install(custom: Option<&str>) -> InstallProbe {
     }
 }
 
-/// 生成候选可执行文件路径（跨平台）。
+/// 按平台装配「安装根目录 × 目录名 × exe 名」的候选路径（**三平台共用一份**）。
 ///
-/// **候选名放外层循环**：名字已按「最近活跃」排序（见 [`data_dir_names_by_activity`]），
-/// 放外层才能让「活跃产品」的安装路径整体优先于「非活跃产品」的。
-/// 若把安装根目录放外层，一个装在 C 盘的非活跃产品会盖过装在 D 盘的活跃产品，
-/// 于是出现「切换器管的是我没在用的那个 Trae」。
-fn candidate_exe_paths() -> Vec<PathBuf> {
+/// 调用方只负责给出**已按优先级/活跃度排序**的目录名与 exe 名候选，本函数负责各平台的
+/// **路径形状**：
+///
+/// - Windows：`%LOCALAPPDATA%\Programs`、`ProgramFiles*` 与非系统盘 `<盘符>:\Programs`
+///   下的 `<name>\<exe>`（roots 由 [`windows_install_roots`] 提供）；
+/// - macOS：`/Applications`、`/System/Applications`、`~/Applications` 下的
+///   `<name>.app/Contents/MacOS/<exe>`；
+/// - Linux：`/opt`、`/usr/local`、`/usr/share`、`~/.local/share` 下的 `<name>/<exe>`。
+///
+/// ## 为什么必须共用（而不是各写一份）
+///
+/// 本函数的前身是 `candidate_exe_paths()`（只被跨变体探测使用），而**单项变体探测
+/// [`detect_install_for`] 另写了一份、并且直接调用 `#[cfg(windows)]` 的
+/// [`windows_install_roots`]**。于是留下「Windows 编得过、macOS/Linux 编不过」的缺口 ——
+/// 本机全在 Windows 上开发，本地构建**永远发现不了**（CI 的 mac-arm64 / mac-x64 /
+/// linux-x64 三个 job 因此在 `Build server binary` 报
+/// `E0425 cannot find function windows_install_roots`，退出码 101）。
+///
+/// 现在平台分支集中在这一处，调用方不认识平台细节：
+/// 新增「按变体探测安装」之类的需求时，直接复用本函数即可，不会再复制出一份
+/// 只在 Windows 存在的实现。
+///
+/// ## 循环顺序（保持既有行为，勿随意调整）
+///
+/// Windows 上**目录名放外层**：名字已按「最近活跃」排序
+/// （见 [`data_dir_names_by_activity`]），放外层才能让「活跃产品」的安装路径整体优先于
+/// 「非活跃产品」的；若把安装根目录放外层，一个装在 C 盘的非活跃产品会盖过装在 D 盘的
+/// 活跃产品，于是出现「切换器管的是我没在用的那个 Trae」。
+/// macOS / Linux 沿用「系统目录在前、用户目录在后」的既有顺序。
+fn candidate_paths_for(names: &[&'static str], exes: &[&'static str]) -> Vec<PathBuf> {
     let mut out = Vec::new();
 
     #[cfg(windows)]
     {
-        let names = data_dir_names_by_activity();
         // 提到循环外：`windows_install_roots` 会做一轮盘符探测，不必每个名字都重算。
         let roots = windows_install_roots();
-        for name in &names {
+        for &name in names {
             for root in &roots {
-                for exe in exe_names() {
+                for &exe in exes {
                     out.push(root.join(name).join(exe));
                 }
             }
@@ -578,30 +612,17 @@ fn candidate_exe_paths() -> Vec<PathBuf> {
 
     #[cfg(target_os = "macos")]
     {
-        let names = data_dir_names_by_activity();
         for root in ["/Applications", "/System/Applications"] {
-            for name in &names {
-                for exe in exe_names() {
-                    out.push(
-                        PathBuf::from(root)
-                            .join(format!("{name}.app"))
-                            .join("Contents")
-                            .join("MacOS")
-                            .join(exe),
-                    );
+            for &name in names {
+                for &exe in exes {
+                    out.push(macos_bundle_exe(Path::new(root), name, exe));
                 }
             }
         }
         if let Some(home) = dirs::home_dir() {
-            for name in &names {
-                for exe in exe_names() {
-                    out.push(
-                        home.join("Applications")
-                            .join(format!("{name}.app"))
-                            .join("Contents")
-                            .join("MacOS")
-                            .join(exe),
-                    );
+            for &name in names {
+                for &exe in exes {
+                    out.push(macos_bundle_exe(&home.join("Applications"), name, exe));
                 }
             }
         }
@@ -609,24 +630,48 @@ fn candidate_exe_paths() -> Vec<PathBuf> {
 
     #[cfg(target_os = "linux")]
     {
-        let names = data_dir_names_by_activity();
         for root in ["/opt", "/usr/local", "/usr/share"] {
-            for name in &names {
-                for exe in exe_names() {
+            for &name in names {
+                for &exe in exes {
                     out.push(PathBuf::from(root).join(name).join(exe));
                 }
             }
         }
         if let Some(home) = dirs::home_dir() {
-            for name in &names {
-                for exe in exe_names() {
+            for &name in names {
+                for &exe in exes {
                     out.push(home.join(".local").join("share").join(name).join(exe));
                 }
             }
         }
     }
 
+    // 既非 Windows 也非 macOS/Linux：显式吞掉参数，免得在 `-D warnings` 的 CI 上
+    // 因「未使用变量」把整个 job 打成红的（本仓 CI 的 rust 工具链 action 默认
+    // `build-warnings: deny`）。返回空列表 = 探测不到，不伪造任何命中。
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (names, exes);
+    }
+
     out
+}
+
+/// macOS 的安装是 `.app` bundle，可执行文件在 `Contents/MacOS/` 下。
+#[cfg(target_os = "macos")]
+fn macos_bundle_exe(root: &Path, name: &str, exe: &str) -> PathBuf {
+    root.join(format!("{name}.app"))
+        .join("Contents")
+        .join("MacOS")
+        .join(exe)
+}
+
+/// **全部变体**的可执行文件候选路径（跨平台）。
+///
+/// 平台差异全部收在 [`candidate_paths_for`]；本函数只负责把「按最近活跃排序的
+/// 跨变体目录名」与 exe 名候选喂进去。
+fn candidate_exe_paths() -> Vec<PathBuf> {
+    candidate_paths_for(&data_dir_names_by_activity(), exe_names())
 }
 
 /// 定位 Trae 客户端的 userData 目录（**跨变体、最近活跃**；环境自检用）。
