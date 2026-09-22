@@ -187,10 +187,16 @@ jobs:
       # 这里提前把它变成一句明确的话 —— 要改的是**仓库 Settings → Secrets**，不是代码。
       # 只打印长度，绝不回显密钥内容。
       - name: Preflight - updater signing key
-        # 只对**确实要消费 .sig 的平台**检查：这些 job 的 `Generate updater manifest`
-        # 断言 `$ARCHIVE.sig` 存在。linux-x64 的 `update_arch` 为空、该步骤整体跳过，
-        # 因此不在这里替它做假设 —— 免得把一个本来能过的 job 判成失败。
-        if: matrix.update_arch != ''
+        # 四个 job 都要查：缺密钥时 `tauri build` 会在**打包阶段**统一失败，与平台无关。
+        # 2026-09-22 本机实测（不加该变量、Windows/nsis）：安装包已完整打出来，
+        # 紧接着签名器报
+        #   A public key has been found, but no private key. Make sure to set
+        #   `TAURI_SIGNING_PRIVATE_KEY` environment variable.
+        # 然后 exit 1 —— 也就是说整轮编译白跑，正是这条 Preflight 要省掉的时间。
+        # 早先只对 `matrix.update_arch != ''` 的 job 检查是**错的**：linux-x64 的
+        # `Build desktop app` 也在同一处挂掉（它跑了 7m25s，形状就是编完才死），
+        # 而它的日志需要管理员权限才拿得到、注解里只有一句 exit code 1。
+        # 密钥配好后本步骤是纯 no-op，不会给任何 job 引入新的失败。
         shell: bash
         env:
           KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
