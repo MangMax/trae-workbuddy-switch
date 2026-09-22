@@ -178,6 +178,25 @@ jobs:
           echo "VER=$VER" >> "$GITHUB_ENV"
           echo "stamped version: $VER"
 
+      # `tauri.conf.json` 的 `createUpdaterArtifacts: true` 使签名私钥成为**打包硬依赖**：
+      # 少了它，`tauri build` 会先跑完 ~5 分钟的 Rust 编译，最后才抛一句难定位的错。
+      # 这里提前把它变成一句明确的话 —— 要改的是**仓库 Settings → Secrets**，不是代码。
+      # 只打印长度，绝不回显密钥内容。
+      - name: Preflight - updater signing key
+        # 只对**确实要消费 .sig 的平台**检查：这些 job 的 `Generate updater manifest`
+        # 断言 `$ARCHIVE.sig` 存在。linux-x64 的 `update_arch` 为空、该步骤整体跳过，
+        # 因此不在这里替它做假设 —— 免得把一个本来能过的 job 判成失败。
+        if: matrix.update_arch != ''
+        shell: bash
+        env:
+          KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [ -z "$KEY" ]; then
+            echo "::error::缺少 secret TAURI_SIGNING_PRIVATE_KEY：createUpdaterArtifacts=true 需要它才能产出 .sig（内容取本机 ~/.buddy-switch/buddy-switch-updater.key，配套 TAURI_SIGNING_PRIVATE_KEY_PASSWORD）"
+            exit 1
+          fi
+          echo "签名密钥已配置（${#KEY} 字符，不回显内容）"
+
       # 前端构建产物（CLI 二进制 rust-embed 嵌入 + Tauri App 使用）
       - name: Build frontend
         run: |
