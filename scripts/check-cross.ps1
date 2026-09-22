@@ -14,10 +14,15 @@
        `ring` 要编 C/汇编，它们都会去找**目标平台**的 C 编译器。
        Windows 上没有 → 用 `scripts/cross-cc-stub.rs` 编出的桩顶替（造出空目标文件并返回 0）。
        因为不链接，空目标文件不影响类型检查结论。
-    3. 同时设 `CARGO_BUILD_WARNINGS=deny`，与 CI 的策略一致（CI 的
-       `actions-rust-lang/setup-rust-toolchain@v1` 默认 `build-warnings: "deny"`）。
-       这样「只在非 Windows 上出现」的 `unused_mut` 之类警告也会在本地被拦下 ——
-       否则它会变成 CI 上的硬错误（退出码 101）。
+    3. 同时设 `CARGO_BUILD_WARNINGS=deny`（cargo 的 `build.warnings` 配置）。
+       ⚠️ 这**比 CI 更严格，是刻意的**：CI 目前并不把警告升级为错误 ——
+       `actions-rust-lang/setup-rust-toolchain@v1` **没有** `build-warnings` 输入
+       （2026-09-22 实测，写了会被报
+       「Unexpected input(s) 'build-warnings'」），本仓也没有 `-D warnings` /
+       `#![deny(...)]` / rustflags 配置。
+       在这里保持严格，是为了把「只在非 Windows 上出现的 `unused_mut` 之类警告」
+       拦在本地（那类代码在本机 Windows 上永远编不到，等到 CI 才发现太晚）。
+       代价：本地红而 CI 绿是**可能**的 —— 判读时按警告处理，不要当成 CI 会失败。
 
   覆盖范围：
     * buddy-switch-core / buddy-switch-gateway / buddy-switch-server —— 三个目标全覆盖
@@ -123,7 +128,8 @@ foreach ($t in $Targets) {
   $stubEnvNames["AR_$key"] = $stubExe
 }
 
-# 与 CI 一致：警告即错误（CI 的 setup-rust-toolchain 默认 build-warnings=deny）
+# 刻意比 CI 更严格：把警告当错误（CI 并不这么做，详见文件头「原理」第 3 条）。
+# 目的只是让「非 Windows 上才出现的警告」在本地就被看见，别等到 CI。
 $env:CARGO_BUILD_WARNINGS = "deny"
 $env:CARGO_INCREMENTAL = "0"
 
@@ -148,7 +154,7 @@ foreach ($t in $Targets) {
   foreach ($pkg in $pkgs) {
     Write-Host ""
     Write-Host "=== cargo check -p $pkg --target $t ==="
-    Write-Host "(CARGO_BUILD_WARNINGS=deny，与 CI 一致)"
+    Write-Host "(CARGO_BUILD_WARNINGS=deny —— 比 CI 更严格，刻意如此；本地红未必等于 CI 会红)"
     Push-Location $repoRoot
     try {
       & $cargo check -p $pkg --target $t

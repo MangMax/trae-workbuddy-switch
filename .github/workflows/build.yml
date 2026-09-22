@@ -113,14 +113,18 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           target: ${{ matrix.target }}
-          # ⚠️ 这个 action 的 `build-warnings` **默认就是 `"deny"`**，会写入
-          # `CARGO_BUILD_WARNINGS=deny`（即 cargo 的 `build.warnings` 配置）：
-          # **全工作区任何 rustc 警告都变成硬错误，退出码 101**。
-          # 这里显式写出来，是为了让这条策略成为「看得见的决定」而不是隐形默认值。
-          #   · 本机（Windows）构建复现不出来 —— 只有 CI 会因此变红；
-          #   · 想放宽成「警告只提示、不阻断」就把值改成 ""（空串 = 不设置该变量）。
-          # 背景见 `.workbuddy/memory/2026-09-22.md`。
-          build-warnings: "deny"
+          # ⚠️ 不要在这里加 `build-warnings` —— `@v1`（tag）**没有这个输入**。
+          # 2026-09-22 实测：四个 job 各报一次
+          #   Unexpected input(s) 'build-warnings', valid inputs are
+          #   ['toolchain','target','components','cache',…,'rustflags','override','rust-src-dir']
+          # 当时是照 action 的 `main` 分支 action.yml 写的（那上面确实有该输入、
+          # 默认 "deny"），据此得出「CI 默认把警告当错误」的结论 —— **那是错的**，
+          # 已撤掉。本仓目前也没有别的地方把警告升级为错误：
+          # 无 `-D warnings`、无 `#![deny(...)]`、无 `.cargo/config.toml` 的 rustflags。
+          # 若确实想要「零警告」门禁，v1 支持的写法是：
+          #   rustflags: "-D warnings"   或 job 级 env: CARGO_BUILD_WARNINGS: deny
+          # 但两者都会波及依赖的 build script（通常被 cap-lints 兜住），
+          # 先在 linux-x64 / mac-arm64 / mac-x64 三个目标上验过再开。
 
       # cargo 缓存：依赖 + 编译产物，增量编译大幅提速（Cargo.lock 不变时命中）
       - name: Cache cargo
