@@ -220,29 +220,20 @@ jobs:
           cargo build -p buddy-switch-server --release --target ${{ matrix.target }}
           mkdir -p dist-bin
 
-      # 打包本平台包并发布到 npm（CLI 二进制走 npm registry，Release 只留桌面 App）
-      # 仅 tag 发布；手动触发（例如只打 Windows 试装包）不得 npm publish。
-      - name: Publish platform package
-        if: startsWith(github.ref, 'refs/tags/v')
+      # CLI 裸二进制：npm 平台包需要它（装进 `npm/platform/*/bin/<cli_bin>`）。
+      # 原先由紧随其后的 npm 发布步骤就地拷贝；npm 发布已抽成独立的 `publish-platform`
+      # job（与 Release 解耦，理由见该 job 的注释），所以这里把它**一并打进 artifact**，
+      # 供那个 job 取用。
+      # ⚠️ 文件名必须等于 matrix 的 `cli_bin`（那个 job 按这个名字取）；
+      #   `release` job 会把它从 Release 资产里剔除 —— Release 只留桌面 App。
+      - name: Stage CLI binary for npm
         shell: bash
-        env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          PKG_DIR="npm/platform/buddy-switch-${{ matrix.platform_tag }}"
-          # VER 由前面的 `Stamp version` 步骤写入 GITHUB_ENV，本步骤直接读 $VER。
-          # ⚠️ 不要在这里「重新推导」：`stamp-version.sh --print` **只打印不写入**，
-          # 而且分散在多步里独立调用可能跨分钟边界拿到不同的值 ——
-          # 那样产出的安装包名与后面的断言/清单就会互相对不上。
-          # 下面这行 perl 现在已是**冗余**（`Stamp version` 已把各平台包的 version 一并写好），
-          # 保留它只作为「万一 stamp 步骤被移除」时的兜底，不再承担版本同步职责。
-          perl -pi -e "s/\"version\": \"[0-9.]+\"/\"version\": \"$VER\"/" "$PKG_DIR/package.json"
-          mkdir -p "$PKG_DIR/bin"
           SRC="target/${{ matrix.target }}/release/buddy-switch"
           [ -f "$SRC.exe" ] && SRC="$SRC.exe"
-          cp "$SRC" "$PKG_DIR/bin/${{ matrix.cli_bin }}"
-          cd "$PKG_DIR"
-          printf '//registry.npmjs.org/:_authToken=%s\n' "$NPM_TOKEN" > .npmrc
-          npm publish --access public --registry=https://registry.npmjs.org
+          test -f "$SRC"
+          cp "$SRC" "dist-bin/${{ matrix.cli_bin }}"
+          ls -l "dist-bin/${{ matrix.cli_bin }}"
 
       # 桌面 App（mac app / nsis exe / deb + AppImage）
       - name: Build desktop app
@@ -331,10 +322,62 @@ jobs:
           path: dist-bin/
           if-no-files-found: error
 
+  # npm 平台包发布 —— **与 Release 解耦**。
+  #
+  # 原先这一步在 `build` job 内部、且排在 `Build desktop app` **之前**：只要 npm 发布失败
+  # （最典型是 `NPM_TOKEN` 未配置），桌面端产物就不会上传，`release` 又因 `needs: build`
+  # 被跳过 —— 二进制发布被 npm 发布拖累。两者本应互不依赖：
+  # CLI 二进制走 npm registry，Release 只留桌面 App（这正是原注释写明的前提）。
+  # 拆开后：npm 失败只影响本 job，Release 照常产出。
+  #
+  # `runs-on: ubuntu-latest` 是**刻意**的 —— npm publish 与系统无关；
+  # 复用 `select-matrix` 的 matrix 只为取 `platform_tag` / `cli_bin` 这两个唯一真源，
+  # 不另抄一份平台清单（抄了必然漂移）。
+  publish-platform:
+    name: npm platform ${{ matrix.name }}
+    needs: [select-matrix, build]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.select-matrix.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # 只下本平台那一个 artifact（linux 那个有 ~100MB，不必全下）
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist-bin
+
+      - name: Publish platform package
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          # 先让打包脚本**落盘**再读回：tag 是唯一真相，
+          # 不自己拼版本号（拼出来的会和产物名/主包 optionalDependencies 对不上）。
+          sh scripts/stamp-version.sh --tag "${{ github.ref_name }}"
+          VER=$(node -p "require('./package.json').version")
+          PKG_DIR="npm/platform/buddy-switch-${{ matrix.platform_tag }}"
+          # 平台包自己的 version 也必须已同步（stamp 脚本负责），断言一下免得静默发错版本
+          test "$(node -p "require('./${PKG_DIR}/package.json').version")" = "$VER"
+          mkdir -p "$PKG_DIR/bin"
+          cp "dist-bin/${{ matrix.cli_bin }}" "$PKG_DIR/bin/${{ matrix.cli_bin }}"
+          cd "$PKG_DIR"
+          printf '//registry.npmjs.org/:_authToken=%s\n' "$NPM_TOKEN" > .npmrc
+          npm publish --access public --registry=https://registry.npmjs.org
+
   # 所有平台包发布成功后，发布主包（optionalDependencies 引用平台包）
+  # 刻意 `needs: [build, publish-platform]`：主包必须在平台包都上架后再发，
+  # 否则存在「装了主包却拉不到平台包」的窗口。这**不会**拖累 Release ——
+  # `release` 只 `needs: build`。
   publish-main:
     name: Publish npm main package
-    needs: build
+    needs: [build, publish-platform]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
@@ -346,6 +389,13 @@ jobs:
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
+          # 主包的 version 与它的 optionalDependencies（各平台包）必须**同时**等于本次 tag，
+          # 否则用户装到的主包会去找一个不存在的平台包版本。
+          # 原先这一步没有落盘版本戳 —— tag 路径从未真正跑过，所以一直没暴露。
+          sh scripts/stamp-version.sh --tag "${{ github.ref_name }}"
+          export VER=$(node -p "require('./package.json').version")
+          test "$(node -p "require('./npm/package.json').version")" = "$VER"
+          node -e 'const p=require("./npm/package.json");const bad=Object.entries(p.optionalDependencies||{}).filter(([k,v])=>v!==process.env.VER);if(bad.length){console.error("optionalDependencies 与主包版本不一致:",bad);process.exit(1)}'
           cd npm
           printf '//registry.npmjs.org/:_authToken=%s\n' "$NPM_TOKEN" > .npmrc
           npm publish --access public --registry=https://registry.npmjs.org
@@ -362,6 +412,17 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+
+      # artifact 里含一份 CLI 裸二进制（build job 的 `Stage CLI binary for npm` 放的，
+      # 供 publish-platform 取用）。它是**中转物**，不属于 Release 资产 ——
+      # Release 只留桌面 App + updater 清单。桌面产物都是 `BuddySwitch…` 大写开头，
+      # 因此按小写前缀 `buddy-switch-` 精确剔除。
+      - name: Drop npm-only CLI payloads
+        run: |
+          ls -1 artifacts
+          rm -f artifacts/buddy-switch-*
+          echo "--- after drop ---"
+          ls -1 artifacts
 
       - name: Merge updater manifests
         run: python3 scripts/merge-update-manifests.py artifacts
