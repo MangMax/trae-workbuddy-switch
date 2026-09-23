@@ -11,8 +11,6 @@ mod api;
 mod gateway_host;
 mod trae_gateway_host;
 
-use serde_json::json;
-
 use buddy_switch_core::modules::{
     account, auth_file, config, process, rotate, schedule, scheduler, update,
 };
@@ -138,14 +136,9 @@ fn spawn_background_task(task: BackgroundTask) {
 
 fn print_status() {
     let auth = auth_file::read_auth_file();
-    let current = auth.as_ref().and_then(|a| {
-        let acct = a.get("account").cloned().unwrap_or_else(|| json!({}));
-        Some(json!({
-            "uid": acct.get("uid"),
-            "nickname": acct.get("nickname"),
-            "email": acct.get("email"),
-        }))
-    });
+    // 与 webui 的 `/api/status` 共用同一份提取逻辑（见 `current_account_fields` 的说明：
+    // 客户端新版会把 `nickname` 存成加密信封对象，必须只透出字符串形态）。
+    let current = auth.as_ref().map(auth_file::current_account_fields);
     let running = process::is_workbuddy_running();
     println!("Buddy Switch v{}", update::APP_VERSION);
     println!("WorkBuddy 运行中: {}", if running { "是" } else { "否" });

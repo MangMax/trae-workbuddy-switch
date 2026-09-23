@@ -302,14 +302,9 @@ async fn api_status(RawQuery(query): RawQuery) -> Response {
         Ok(auth) => (auth, Value::Null),
         Err(mismatch) => (None, mismatch_json(&mismatch)),
     };
-    let current = auth.as_ref().and_then(|a| {
-        let acct = a.get("account").cloned().unwrap_or_else(|| json!({}));
-        Some(json!({
-            "uid": acct.get("uid"),
-            "nickname": acct.get("nickname"),
-            "email": acct.get("email"),
-        }))
-    });
+    // 展示三元组由 `auth_file::current_account_fields` 唯一产出：客户端新版会把
+    // `nickname` 存成加密信封对象，原样透传会让前端把它当 React 子节点渲染并抛 #31。
+    let current = auth.as_ref().map(auth_file::current_account_fields);
     json_ok(json!({
         "running": cached_workbuddy_running(region),
         "region": region,
@@ -2025,6 +2020,48 @@ mod tests {
     // -----------------------------------------------------------------------
     // 只读路由
     // -----------------------------------------------------------------------
+
+    /// 客户端把 `nickname` 存成加密信封时，`current.nickname` 必须是 `null`，不能是那个对象。
+    ///
+    /// 真实场景：WorkBuddy 桌面端新版把 `account.nickname` / `phoneNumber` / `accessToken`
+    /// 全部改成 `{"$wbEncrypted":1,"envelope":"…"}`。原样透传时前端取展示名走的是
+    /// `nickname || email || uid` 这条链 —— 对象恒为真值，会被选中并当 React 子节点渲染，
+    /// 直接抛 React #31（Objects are not valid as a React child），整页白屏。
+    /// 契约要求 `current.nickname` 是 `string | null`。
+    #[tokio::test]
+    async fn status_current_coerces_encrypted_envelope_fields_to_null() {
+        let _guard = test_guard();
+        isolated_home();
+
+        let auth_file = buddy_switch_core::modules::auth_file::auth_file_path_for(Region::Cn);
+        std::fs::create_dir_all(auth_file.parent().unwrap()).expect("create auth dir");
+        std::fs::write(
+            &auth_file,
+            r#"{"account":{"uid":"u-enc","nickname":{"$wbEncrypted":1,"envelope":"eyJzdWl0ZSI6MX0="}},"auth":{"domain":"www.codebuddy.cn"}}"#,
+        )
+        .expect("seed auth file");
+
+        let (status, body) = call_api(Method::GET, "/api/status", None).await;
+        let _ = std::fs::remove_file(&auth_file);
+
+        assert_eq!(status, StatusCode::OK);
+        let current = &body["current"];
+        assert!(
+            current.is_object(),
+            "认证文件可读时 current 必须是对象：{body}"
+        );
+        // 普通字符串字段原样透出 —— 前端的回落链因此仍有可用值。
+        assert_eq!(
+            current["uid"],
+            json!("u-enc"),
+            "字符串字段必须保留：{current}"
+        );
+        // 信封对象必须被压成 null，绝不能透出去。
+        assert!(
+            current["nickname"].is_null(),
+            "加密信封不得透传，必须是 null：{current}"
+        );
+    }
 
     #[tokio::test]
     async fn core_read_only_routes_return_expected_shapes() {

@@ -161,6 +161,29 @@ pub fn read_auth_file_checked_for(region: Region) -> Result<Option<Value>, Regio
     }
 }
 
+/// 当前登录账号的展示三元组（`uid` / `nickname` / `email`），**只透出字符串形态**。
+///
+/// 客户端新版会把敏感字段（`nickname` / `phoneNumber` / `accessToken` / `refreshToken`）
+/// 存成加密信封对象 `{"$wbEncrypted":1,"envelope":"…"}`。原样透传会让消费方把对象当
+/// 字符串用 —— webui 取展示名走 `nickname || email || uid` 这条链，对象恒为真值会被
+/// 选中并当 React 子节点渲染，直接抛 React #31（Objects are not valid as a React child）
+/// 导致整页白屏。读不出来就如实给 `null`，让消费方回落到下一个可用字段。
+///
+/// **webui（`/api/status`）与 CLI（`status` 子命令）共用本函数**，避免两条通道的契约分叉。
+pub fn current_account_fields(root: &Value) -> Value {
+    let acct = root
+        .get("account")
+        .filter(|value| value.is_object())
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let text = |key: &str| acct.get(key).and_then(Value::as_str).map(str::to_string);
+    json!({
+        "uid": text("uid"),
+        "nickname": text("nickname"),
+        "email": text("email"),
+    })
+}
+
 /// 切换前备份当前认证文件，返回备份路径。对照 server.py `backup_auth_file`。
 pub fn backup_auth_file() -> Option<PathBuf> {
     backup_auth_file_for(Region::Cn)
