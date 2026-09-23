@@ -11,7 +11,7 @@
 use serde_json::{json, Map, Value};
 use std::path::PathBuf;
 
-use crate::modules::account::get_str;
+use crate::modules::account::{display_value, get_str, secret_value};
 use crate::modules::config::{atomic_write, backup_dir, now_ms, utc_iso};
 use crate::modules::region::{region_of, region_spec, Region};
 
@@ -161,7 +161,7 @@ pub fn read_auth_file_checked_for(region: Region) -> Result<Option<Value>, Regio
     }
 }
 
-/// 当前登录账号的展示三元组（`uid` / `nickname` / `email`），**只透出字符串形态**。
+/// 当前登录账号的展示三元组（`uid` / `nickname` / `email`），**只透出标量形态**。
 ///
 /// 客户端新版会把敏感字段（`nickname` / `phoneNumber` / `accessToken` / `refreshToken`）
 /// 存成加密信封对象 `{"$wbEncrypted":1,"envelope":"…"}`。原样透传会让消费方把对象当
@@ -169,18 +169,18 @@ pub fn read_auth_file_checked_for(region: Region) -> Result<Option<Value>, Regio
 /// 选中并当 React 子节点渲染，直接抛 React #31（Objects are not valid as a React child）
 /// 导致整页白屏。读不出来就如实给 `null`，让消费方回落到下一个可用字段。
 ///
-/// **webui（`/api/status`）与 CLI（`status` 子命令）共用本函数**，避免两条通道的契约分叉。
+/// **webui（`/api/status`）、CLI（`status` 子命令）与桌面端（`get_status`）共用本函数**，
+/// 避免三条通道的契约分叉；标量化规则本身收敛在 [`display_value`]。
 pub fn current_account_fields(root: &Value) -> Value {
     let acct = root
         .get("account")
         .filter(|value| value.is_object())
         .cloned()
         .unwrap_or_else(|| json!({}));
-    let text = |key: &str| acct.get(key).and_then(Value::as_str).map(str::to_string);
     json!({
-        "uid": text("uid"),
-        "nickname": text("nickname"),
-        "email": text("email"),
+        "uid": display_value(&acct, "uid"),
+        "nickname": display_value(&acct, "nickname"),
+        "email": display_value(&acct, "email"),
     })
 }
 
@@ -265,13 +265,16 @@ pub fn build_auth_obj(acc: &Value) -> Value {
     let expires_at = acc.get("expiresAt").and_then(|v| v.as_i64());
     let now = now_ms();
 
+    // token 可能是明文字符串，也可能是 WorkBuddy 5.6 加密信封对象：信封必须**原样写回**，
+    // 由 WorkBuddy 读取时在同一 keyblob 下自行解密。用 `get_str(..).unwrap_or_default()`
+    // 会把信封降级成空串，静默毁掉登录态。
     obj.insert(
         "accessToken".to_string(),
-        get_str(acc, "access_token").unwrap_or_default().into(),
+        secret_value(acc, "access_token").unwrap_or_else(|| json!("")),
     );
     obj.insert(
         "refreshToken".to_string(),
-        get_str(acc, "refresh_token").unwrap_or_default().into(),
+        secret_value(acc, "refresh_token").unwrap_or_else(|| json!("")),
     );
     obj.insert("tokenType".to_string(), token_type.into());
     obj.insert(
@@ -386,16 +389,17 @@ pub fn write_account_to_auth_file_for(region: Region, acc: &Value) -> Result<(),
         return Err(e.to_string());
     }
 
-    // 写后校验
+    // 写后校验：**按值比较**（token 可能是明文字符串，也可能是加密信封对象，
+    // 后者用 as_str() 取不到值会误判成写入失败）。
     let written: Value =
         serde_json::from_str(&std::fs::read_to_string(&path).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
     let written_token = written
         .get("auth")
         .and_then(|a| a.get("accessToken"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let expect_token = get_str(acc, "access_token").unwrap_or_default();
+        .cloned()
+        .unwrap_or(Value::Null);
+    let expect_token = acc.get("access_token").cloned().unwrap_or(Value::Null);
     if written_token != expect_token {
         return Err("认证文件写后校验失败，未写入目标账号".to_string());
     }
@@ -432,21 +436,24 @@ fn imported_account_from_root(root: Value) -> Option<Value> {
 
     let uid = get_str(&root, "uid").or_else(|| get_str(&account_obj, "uid"));
     let uid = uid.or_else(|| get_str(&account_obj, "id"));
-    let nickname = get_str(&root, "nickname")
-        .or_else(|| get_str(&root, "name"))
-        .or_else(|| get_str(&account_obj, "nickname"))
-        .or_else(|| get_str(&account_obj, "label"));
+    // WorkBuddy 5.6 起 nickname/accessToken/refreshToken 可能是 `{$wbEncrypted, envelope}`
+    // 加密信封：这里必须**原样保留**（`secret_value`），不能 `get_str` 强转字符串——
+    // 否则 accessToken 取不到导致导入恒 400，切换写回时也会把信封覆盖成空串。
+    let nickname = secret_value(&root, "nickname")
+        .or_else(|| secret_value(&root, "name"))
+        .or_else(|| secret_value(&account_obj, "nickname"))
+        .or_else(|| secret_value(&account_obj, "label"));
     let email = get_str(&root, "email")
         .or_else(|| get_str(&account_obj, "email"))
         .or_else(|| get_str(&auth_obj, "email"));
-    let access_token = get_str(&auth_obj, "accessToken")
-        .or_else(|| get_str(&auth_obj, "access_token"))
-        .or_else(|| get_str(&root, "accessToken"))
-        .or_else(|| get_str(&root, "access_token"));
-    let refresh_token = get_str(&auth_obj, "refreshToken")
-        .or_else(|| get_str(&auth_obj, "refresh_token"))
-        .or_else(|| get_str(&root, "refreshToken"))
-        .or_else(|| get_str(&root, "refresh_token"));
+    let access_token = secret_value(&auth_obj, "accessToken")
+        .or_else(|| secret_value(&auth_obj, "access_token"))
+        .or_else(|| secret_value(&root, "accessToken"))
+        .or_else(|| secret_value(&root, "access_token"));
+    let refresh_token = secret_value(&auth_obj, "refreshToken")
+        .or_else(|| secret_value(&auth_obj, "refresh_token"))
+        .or_else(|| secret_value(&root, "refreshToken"))
+        .or_else(|| secret_value(&root, "refresh_token"));
     let token_type = get_str(&auth_obj, "tokenType")
         .or_else(|| get_str(&auth_obj, "token_type"))
         .unwrap_or_else(|| "Bearer".to_string());
@@ -584,5 +591,96 @@ mod tests {
         assert_eq!(account["uid"], "u-1");
         assert_eq!(account["nickname"], "同名用户");
         assert!(account["email"].is_null());
+    }
+
+    /// 回归：WorkBuddy 5.6 起本机登录态是加密信封，导入必须**原样保留**信封。
+    ///
+    /// 修复前 `access_token` 走 `get_str`，遇信封恒为 `None` → 第 `if
+    /// access_token.is_none()` 提前返回 `None` → `/api/import-local` 恒 400。
+    /// 信封在本机同一 keyblob 下由 WorkBuddy 自解，无需我们实现解密。
+    #[test]
+    fn import_keeps_encrypted_envelope_credentials() {
+        let envelope = json!({"$wbEncrypted": 1, "envelope": "eyJzdWl0ZSI6MX0="});
+        let account = imported_account_from_root(json!({
+            "account": {
+                "uid": "u-enc",
+                "nickname": envelope,
+                "email": "enc@example.com",
+            },
+            "auth": {
+                "accessToken": envelope,
+                "refreshToken": envelope,
+                "tokenType": "Bearer",
+                "domain": "www.codebuddy.cn",
+            },
+            "domain": "www.codebuddy.cn",
+        }))
+        .expect("信封凭据必须能导入，不得因 get_str 取不到值而返回 None");
+
+        assert_eq!(account["uid"], "u-enc");
+        assert_eq!(
+            account["access_token"], envelope,
+            "信封 accessToken 必须原样保留：{account}"
+        );
+        assert_eq!(account["refresh_token"], envelope, "信封 refreshToken 同理");
+        assert_eq!(
+            account["nickname"], envelope,
+            "信封 nickname 原样保留（展示层由 display_value 折叠）"
+        );
+        assert_eq!(account["email"], "enc@example.com", "明文邮箱正常提取");
+    }
+
+    /// 写回时信封不得被 `get_str(..).unwrap_or_default()` 降级成空串。
+    /// 那会静默毁掉登录态：文件写进去了，token 却是空的。
+    #[test]
+    fn build_auth_obj_preserves_envelope_token_instead_of_blanking_it() {
+        let envelope = json!({"$wbEncrypted": 1, "envelope": "abc"});
+        let auth = build_auth_obj(&json!({
+            "uid": "u-enc",
+            "access_token": envelope,
+            "refresh_token": envelope,
+            "token_type": "Bearer",
+            "domain": "www.codebuddy.cn",
+        }));
+
+        assert_eq!(auth["accessToken"], envelope, "不得降级为空串：{auth}");
+        assert_eq!(auth["refreshToken"], envelope, "不得降级为空串：{auth}");
+        assert_eq!(auth["tokenType"], "Bearer");
+        assert_eq!(auth["domain"], "www.codebuddy.cn");
+    }
+
+    /// 明文与缺失字段的行为不得被信封改造破坏。
+    #[test]
+    fn build_auth_obj_keeps_plain_token_and_blanks_missing_one() {
+        let auth = build_auth_obj(&json!({
+            "uid": "u-plain",
+            "access_token": "AT-plain",
+            "token_type": "Bearer",
+            "domain": "www.codebuddy.cn",
+        }));
+
+        assert_eq!(auth["accessToken"], "AT-plain");
+        assert_eq!(auth["refreshToken"], "", "缺失的 refresh token 仍写空串");
+    }
+
+    /// `current_account_fields` 是 webui / CLI / 桌面端共用的展示三元组，
+    /// 信封必须折叠为 null（前端 `nickname || email || uid` 否则会渲染对象 → React #31）。
+    #[test]
+    fn current_account_fields_scalarizes_envelope_but_keeps_plain() {
+        let fields = current_account_fields(&json!({
+            "account": {
+                "uid": "u-1",
+                "nickname": {"$wbEncrypted": 1, "envelope": "…"},
+                "email": "a@b.c",
+            }
+        }));
+        assert_eq!(fields["uid"], "u-1");
+        assert!(fields["nickname"].is_null(), "信封必须折叠：{fields}");
+        assert_eq!(fields["email"], "a@b.c");
+
+        // 认证文件缺失/非对象时如实给三个 null，不 panic。
+        let empty = current_account_fields(&json!({}));
+        assert!(empty["uid"].is_null() && empty["nickname"].is_null());
+        assert!(empty["email"].is_null());
     }
 }

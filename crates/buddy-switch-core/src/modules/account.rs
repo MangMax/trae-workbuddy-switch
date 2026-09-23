@@ -7,8 +7,23 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::modules::config::atomic_write;
+use crate::modules::config::{atomic_write, now_ms};
 use crate::modules::region::{accounts_file_for, region_spec, Region};
+
+/// 是否持有未过期的明文 `access_token`（OAuth 扫码所得形态）。
+/// 无 `expiresAt` 时视为有效（保守：不因缺字段丢弃明文凭据）。
+fn has_unexpired_plain_token(acc: &Value) -> bool {
+    let Some(Value::String(s)) = acc.get("access_token") else {
+        return false;
+    };
+    if s.trim().is_empty() {
+        return false;
+    }
+    match acc.get("expiresAt").and_then(|v| v.as_i64()) {
+        Some(exp) => exp > now_ms(),
+        None => true,
+    }
+}
 
 fn load_accounts_from_path(path: &Path) -> Vec<Value> {
     if let Ok(text) = std::fs::read_to_string(path) {
@@ -86,19 +101,23 @@ pub fn account_display_name(acc: &Value) -> String {
 }
 
 /// 账号的展示元数据（不泄露 token）。对照 server.py `account_meta`。
+///
+/// 展示字段一律走 [`display_value`]：WorkBuddy 5.6 起 `nickname` / `phoneNumber`
+/// 等可能是加密信封对象，裸透传会让前端把它当 React 子节点渲染，
+/// 触发 error #31 整树卸载（白屏）。
 pub fn account_meta(acc: &Value) -> Value {
     json!({
-        "id": acc.get("id"),
-        "uid": acc.get("uid"),
-        "email": acc.get("email"),
-        "nickname": acc.get("nickname"),
-        "enterpriseName": acc.get("enterpriseName"),
-        "expiresAt": acc.get("expiresAt"),
-        "refreshExpiresAt": acc.get("refreshExpiresAt"),
-        "refreshedAt": acc.get("refreshedAt"),
-        "createdAt": acc.get("createdAt"),
+        "id": display_value(acc, "id"),
+        "uid": display_value(acc, "uid"),
+        "email": display_value(acc, "email"),
+        "nickname": display_value(acc, "nickname"),
+        "enterpriseName": display_value(acc, "enterpriseName"),
+        "expiresAt": display_value(acc, "expiresAt"),
+        "refreshExpiresAt": display_value(acc, "refreshExpiresAt"),
+        "refreshedAt": display_value(acc, "refreshedAt"),
+        "createdAt": display_value(acc, "createdAt"),
         "needsRelogin": acc.get("needs_relogin").and_then(|v| v.as_bool()) == Some(true),
-        "needsReloginReason": acc.get("needs_relogin_reason"),
+        "needsReloginReason": display_value(acc, "needs_relogin_reason"),
     })
 }
 
@@ -108,6 +127,56 @@ pub fn get_str(v: &Value, key: &str) -> Option<String> {
         .and_then(|v| v.as_str())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// 字段是否为 WorkBuddy 5.6 加密信封对象（`{$wbEncrypted, envelope}`）。
+///
+/// 信封在本机同一 keyblob 下可由 WorkBuddy 自行解密，因此**不需要**我们实现解密：
+/// 导入与切换写回时原样保留即可；只有需要明文 token 的接口（签到 / 积分 / 旅行）
+/// 才必须拦截。
+pub fn is_envelope(v: &Value, key: &str) -> bool {
+    matches!(v.get(key), Some(Value::Object(map)) if map.contains_key("$wbEncrypted"))
+}
+
+/// 展示型字段安全读取：标量原样返回；对象/数组（如加密信封）折叠为 `Null`。
+///
+/// 这是**唯一**的展示字段标量化规则，`account_meta`、`/api/status` 的 `current`
+/// 与桌面端 `get_status` 都必须走它。裸透传对象到前端会触发 React error #31
+/// （Objects are not valid as a React child）导致整树卸载、整页白屏。
+pub fn display_value(acc: &Value, key: &str) -> Value {
+    match acc.get(key) {
+        Some(v @ (Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Null)) => v.clone(),
+        _ => Value::Null,
+    }
+}
+
+/// 凭据型字段读取：接受明文字符串或加密信封对象，其他类型返回 `None`。
+///
+/// 与 [`get_str`] 的区别是**信封不被丢弃**。`get_str` 遇信封返回 `None`，调用方
+/// 一旦用 `unwrap_or_default()` 兜底就会把信封静默降级成空串——导入侧表现为
+/// `/api/import-local` 恒 400，写回侧表现为登录态被悄悄毁掉。
+pub fn secret_value(v: &Value, key: &str) -> Option<Value> {
+    match v.get(key) {
+        Some(s @ Value::String(_)) => Some(s.clone()),
+        Some(o @ Value::Object(map)) if map.contains_key("$wbEncrypted") => Some(o.clone()),
+        _ => None,
+    }
+}
+
+/// 加密信封凭据的可读错误：`access_token` 为信封形态时返回提示文案。
+///
+/// 信封 token 解不出明文，不能用于签到 / 积分 / 旅行等接口；此前会经
+/// [`build_auth_headers`] 的 `unwrap_or_default()` 兜底成空 `Bearer`，被网关 401
+/// 后再把错误页原样回显到界面。需要账号身份的请求发出前应先用本函数短路。
+pub fn envelope_token_error(account: &Value) -> Option<String> {
+    if is_envelope(account, "access_token") {
+        return Some(
+            "该账号凭据为 WorkBuddy 加密信封态，无法直接调用签到 / 积分 / Token 统计等接口；\
+             切换功能不受影响，如需上述功能请删除该账号后改用「OAuth 扫码添加」获取明文凭据。"
+                .to_string(),
+        );
+    }
+    None
 }
 
 /// 返回可用于 UID 缺失场景的真实邮箱。历史展示占位值不参与身份匹配。
@@ -148,6 +217,25 @@ pub fn upsert_collected_account(accounts: &mut Vec<Value>, mut collected: Value)
 
     if let Some(&first_index) = matching_indexes.first() {
         let existing = &accounts[first_index];
+
+        // WorkBuddy 5.6 加密态保护：本机重导入得到的是加密信封 token；若已有记录
+        // 仍持有未过期的明文 token（OAuth 扫码所得），不得让信封覆盖明文 —— 否则
+        // 账号页每次加载自动 importLocal 都会把扫码凭据冲掉，签到 / 积分等需要明文
+        // token 的功能随之失效（且 `build_auth_headers` 只会发出空 Bearer）。
+        // 明文过期后才放行信封接管。
+        if is_envelope(&collected, "access_token") && has_unexpired_plain_token(existing) {
+            return existing.clone();
+        }
+        // 展示字段兜底：新采集为信封时保留已有记录的明文展示值，避免昵称/邮箱
+        // 从可读文本退化成 null。
+        for key in ["nickname", "email", "enterpriseName"] {
+            if is_envelope(&collected, key) {
+                if let Some(v) = existing.get(key) {
+                    collected[key] = v.clone();
+                }
+            }
+        }
+
         if let Some(existing_id) = existing.get("id").cloned() {
             collected["id"] = existing_id;
         }
@@ -213,6 +301,9 @@ pub fn build_auth_headers(account: &Value) -> HashMap<String, String> {
     headers.insert(
         "Authorization".to_string(),
         format!(
+            // 注意：`access_token` 为加密信封对象时 `get_str` 取不到值，这里会产出
+            // 空 `Bearer`。调用方必须先用 `envelope_token_error` 拦截，不要把空凭据
+            // 真的发出去（否则换回网关 401，错误页还会被原样回显到界面）。
             "Bearer {}",
             get_str(account, "access_token").unwrap_or_default()
         ),
@@ -303,6 +394,153 @@ pub fn build_chat_headers(region: Region, account: &Value) -> HashMap<String, St
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// 展示字段标量化：标量原样保留，加密信封折叠为 null。
+    ///
+    /// 裸透传信封会让前端 `nickname || email || uid` 选中对象并当 React 子节点渲染，
+    /// 触发 error #31 整树卸载（白屏）。
+    #[test]
+    fn display_value_folds_envelope_to_null_but_keeps_scalars() {
+        let acc = json!({
+            "uid": "u1",
+            "nickname": {"$wbEncrypted": 1, "envelope": "…"},
+            "enterpriseName": null,
+            "expiresAt": 1_800_000_000_000_i64,
+            "needsRelogin": false,
+            "nested": ["a"],
+        });
+        assert_eq!(display_value(&acc, "uid"), json!("u1"));
+        assert_eq!(display_value(&acc, "expiresAt"), json!(1_800_000_000_000_i64));
+        assert_eq!(display_value(&acc, "needsRelogin"), json!(false));
+        assert!(display_value(&acc, "nickname").is_null(), "信封必须折叠为 null");
+        assert!(display_value(&acc, "nested").is_null(), "数组同样不得透传");
+        assert!(display_value(&acc, "missing").is_null(), "缺失字段为 null");
+    }
+
+    /// `account_meta` 是账号列表 / OAuth 结果 / 网关下发的统一出口，必须已标量化。
+    #[test]
+    fn account_meta_scalarizes_envelope_display_fields() {
+        let meta = account_meta(&json!({
+            "id": "a1",
+            "uid": "u1",
+            "nickname": {"$wbEncrypted": 1, "envelope": "…"},
+            "enterpriseName": {"$wbEncrypted": 1, "envelope": "…"},
+            "access_token": "SECRET",
+        }));
+        assert!(meta["nickname"].is_null(), "信封昵称不得透传：{meta}");
+        assert!(meta["enterpriseName"].is_null(), "信封企业名不得透传：{meta}");
+        assert_eq!(meta["uid"], json!("u1"));
+        assert!(meta.get("access_token").is_none(), "不得泄露 token：{meta}");
+    }
+
+    /// `secret_value` 与 `get_str` 的差别就是**不丢信封** —— 这是导入能修好的前提。
+    #[test]
+    fn secret_value_accepts_plain_and_envelope_but_rejects_others() {
+        let envelope = json!({"$wbEncrypted": 1, "envelope": "…"});
+        let acc = json!({
+            "access_token": envelope,
+            "refresh_token": "plain-refresh",
+            "bad": 42,
+            "other": {"not": "envelope"},
+        });
+        assert_eq!(secret_value(&acc, "access_token"), Some(envelope.clone()));
+        assert_eq!(secret_value(&acc, "refresh_token"), Some(json!("plain-refresh")));
+        assert!(secret_value(&acc, "bad").is_none(), "数字不是凭据");
+        assert!(
+            secret_value(&acc, "other").is_none(),
+            "普通对象不是信封，不得当凭据"
+        );
+        assert!(secret_value(&acc, "missing").is_none());
+        // 对照：get_str 遇信封返回 None —— 正是导入恒 400 的成因。
+        assert!(get_str(&acc, "access_token").is_none());
+    }
+
+    /// 信封凭据要能被识别并给出可读错误；明文 / 缺字段不误报。
+    #[test]
+    fn envelope_token_error_only_fires_on_envelope_access_token() {
+        let envelope = json!({
+            "id": "a1",
+            "access_token": {"$wbEncrypted": true, "envelope": "…"},
+            "refresh_token": {"$wbEncrypted": true, "envelope": "…"},
+        });
+        let err = envelope_token_error(&envelope).expect("信封 access_token 应返回错误");
+        assert!(err.contains("信封"), "错误文案应可读：{err}");
+        assert!(err.contains("OAuth"), "应给出扫码重新添加的指引：{err}");
+
+        let plain = json!({"id": "a2", "access_token": "SECRET", "refresh_token": "R"});
+        assert!(envelope_token_error(&plain).is_none(), "明文凭据不应报错");
+
+        let legacy = json!({"id": "a3"});
+        assert!(
+            envelope_token_error(&legacy).is_none(),
+            "缺 access_token 的历史账号不在此拦截（保持既有行为）"
+        );
+    }
+
+    #[test]
+    fn envelope_reimport_keeps_unexpired_plain_oauth_token() {
+        let envelope = json!({"$wbEncrypted": 1, "envelope": "enc"});
+        let mut accounts = vec![json!({
+            "id": "a-1",
+            "uid": "uid-1",
+            "nickname": "明文昵称",
+            "access_token": "plain-token",
+            "refresh_token": "plain-refresh",
+            "expiresAt": now_ms() + 86_400_000_i64,
+        })];
+        // 账号页自动 importLocal 会拿本机加密态重采集同一 uid：
+        // 不得让信封覆盖仍未过期的明文 token（否则签到 / 积分失效）。
+        let collected = json!({
+            "uid": "uid-1",
+            "nickname": envelope,
+            "access_token": {"$wbEncrypted": 1, "envelope": "a"},
+            "refresh_token": {"$wbEncrypted": 1, "envelope": "r"},
+        });
+        let saved = upsert_collected_account(&mut accounts, collected);
+
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(saved["access_token"], "plain-token");
+        assert_eq!(saved["refresh_token"], "plain-refresh");
+        assert_eq!(saved["nickname"], "明文昵称");
+    }
+
+    #[test]
+    fn envelope_reimport_takes_over_after_plain_token_expired() {
+        let mut accounts = vec![json!({
+            "id": "a-1",
+            "uid": "uid-1",
+            "access_token": "stale-plain",
+            "expiresAt": now_ms() - 1_000_i64,
+        })];
+        let collected = json!({
+            "uid": "uid-1",
+            "access_token": {"$wbEncrypted": 1, "envelope": "a"},
+        });
+        let saved = upsert_collected_account(&mut accounts, collected);
+
+        assert_eq!(accounts.len(), 1);
+        // 明文已过期：信封接管（切换仍可用，由 WorkBuddy 自解）。
+        assert!(saved.get("access_token").and_then(|v| v.as_str()).is_none());
+    }
+
+    #[test]
+    fn fresh_plain_oauth_token_replaces_envelope_record() {
+        let mut accounts = vec![json!({
+            "id": "a-1",
+            "uid": "uid-1",
+            "access_token": {"$wbEncrypted": 1, "envelope": "old"},
+        })];
+        // 重新扫码得到新明文：应正常替换。
+        let collected = json!({
+            "uid": "uid-1",
+            "access_token": "fresh-plain",
+            "expiresAt": now_ms() + 86_400_000_i64,
+        });
+        let saved = upsert_collected_account(&mut accounts, collected);
+
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(saved["access_token"], "fresh-plain");
+    }
 
     #[test]
     fn account_meta_strips_tokens() {

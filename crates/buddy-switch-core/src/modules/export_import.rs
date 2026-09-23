@@ -14,6 +14,20 @@ use serde_json::{json, Value};
 use crate::modules::account;
 use crate::modules::region::Region;
 
+/// 该记录是否带可用凭据。
+///
+/// 不能用 `get_str(..).is_some()`：WorkBuddy 5.6 起 `access_token` 可能是加密信封
+/// 对象，`get_str` 取不到值会把「有凭据」误判成「没凭据」——预览显示无 token，
+/// 合并阶段则直接 `Skipped`，导出的账号再也导不回来（静默丢账号）。
+/// 空字符串仍视为无凭据，保持既有语义。
+fn has_credential(item: &Value) -> bool {
+    match account::secret_value(item, "access_token") {
+        Some(Value::String(s)) => !s.trim().is_empty(),
+        Some(_) => true,
+        None => false,
+    }
+}
+
 /// 导入结果计数。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ImportResult {
@@ -54,10 +68,12 @@ pub fn preview_accounts(text: &str) -> Result<Value, String> {
         .map(|(index, item)| {
             json!({
                 "index": index,
-                "uid": item.get("uid"),
-                "nickname": item.get("nickname"),
-                "email": item.get("email"),
-                "hasToken": account::get_str(item, "access_token").is_some(),
+                // 展示字段走 display_value：加密信封必须折叠为 null，裸透传会让
+                // 导入预览弹窗把它当 React 子节点渲染，触发 error #31（白屏）。
+                "uid": account::display_value(item, "uid"),
+                "nickname": account::display_value(item, "nickname"),
+                "email": account::display_value(item, "email"),
+                "hasToken": has_credential(item),
             })
         })
         .collect();
@@ -78,9 +94,9 @@ enum MergeOutcome {
 /// 纯函数：把一条导入记录合并进账号列表。
 ///
 /// 按 uid 去重：同 uid 覆盖（保留导入记录原样）；uid 缺失或无法匹配则追加。
-/// 缺少 access_token 的记录跳过，不进入账号库。
+/// 缺少 access_token 的记录跳过，不进入账号库（信封形态算「有」，见 [`has_credential`]）。
 fn merge_import_record(accounts: &mut Vec<Value>, item: &Value) -> MergeOutcome {
-    if account::get_str(item, "access_token").is_none() {
+    if !has_credential(item) {
         return MergeOutcome::Skipped;
     }
     if let Some(uid) = account::get_str(item, "uid").as_deref() {
@@ -487,5 +503,65 @@ mod tests {
         let records = vec![record("a1", Some("u1"), "甲", None, true)];
         assert!(write_records_to_file(&dir, &records, "../escape.json").is_err());
         assert!(write_records_to_file(&dir, &records, "no-ext").is_err());
+    }
+
+    /// 信封 token 的账号**有**凭据：预览不得报 `hasToken:false`，
+    /// 且展示字段必须标量化（否则预览弹窗 React #31 白屏）。
+    #[test]
+    fn preview_scalarizes_envelope_and_reports_has_token() {
+        let envelope = json!({"$wbEncrypted": 1, "envelope": "…"});
+        let text = json!([{
+            "uid": "u-enc",
+            "nickname": envelope,
+            "email": "enc@example.com",
+            "access_token": envelope,
+        }])
+        .to_string();
+
+        let preview = preview_accounts(&text).expect("信封账号应能生成预览");
+        let item = &preview["accounts"][0];
+        assert_eq!(item["hasToken"], json!(true), "信封算有凭据：{item}");
+        assert!(item["nickname"].is_null(), "信封昵称必须折叠为 null：{item}");
+        assert_eq!(item["uid"], "u-enc");
+        assert_eq!(item["email"], "enc@example.com");
+    }
+
+    /// 信封 token 的导出记录必须能导回来。修复前 `get_str` 取不到值 → `Skipped`，
+    /// 导出的账号静默丢失。
+    #[test]
+    fn merge_imports_envelope_token_record_instead_of_skipping() {
+        let envelope = json!({"$wbEncrypted": 1, "envelope": "…"});
+        let mut accounts: Vec<Value> = vec![];
+        let outcome = merge_import_record(
+            &mut accounts,
+            &json!({
+                "id": "a-enc",
+                "uid": "u-enc",
+                "access_token": envelope,
+                "refresh_token": envelope,
+            }),
+        );
+
+        assert_eq!(outcome, MergeOutcome::Appended, "信封记录不得被跳过");
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0]["access_token"], envelope, "信封原样入库");
+    }
+
+    /// 既有语义不能被信封改造破坏：空串 / 缺失 token 仍然跳过。
+    #[test]
+    fn merge_still_skips_blank_or_missing_token() {
+        let mut accounts: Vec<Value> = vec![];
+        for item in [
+            json!({"uid": "u1", "access_token": ""}),
+            json!({"uid": "u2"}),
+            json!({"uid": "u3", "access_token": "   "}),
+        ] {
+            assert_eq!(
+                merge_import_record(&mut accounts, &item),
+                MergeOutcome::Skipped,
+                "空/缺失凭据必须跳过：{item}"
+            );
+        }
+        assert!(accounts.is_empty());
     }
 }

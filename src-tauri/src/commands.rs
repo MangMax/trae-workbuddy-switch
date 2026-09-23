@@ -102,14 +102,11 @@ fn build_app_status(region: Region) -> AppStatus {
         Ok(auth) => (auth, None),
         Err(mismatch) => (None, Some(mismatch_json(&mismatch))),
     };
-    let current = auth.as_ref().and_then(|a| {
-        let acct = a.get("account").cloned().unwrap_or_else(|| json!({}));
-        Some(json!({
-            "uid": acct.get("uid"),
-            "nickname": acct.get("nickname"),
-            "email": acct.get("email"),
-        }))
-    });
+    // 展示三元组由 `auth_file::current_account_fields` 唯一产出，与 webui 的
+    // `/api/status`、CLI 的 `status` 共用同一份逻辑：客户端新版会把 `nickname` 存成
+    // 加密信封对象 `{"$wbEncrypted":1,"envelope":"…"}`，裸透传会让桌面端把它当 React
+    // 子节点渲染，触发 error #31 整树卸载——桌面 App 打开即白屏。
+    let current = auth.as_ref().map(auth_file::current_account_fields);
     AppStatus {
         running: process::is_workbuddy_running_for(region),
         region: region.as_str().to_string(),
