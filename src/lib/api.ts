@@ -80,7 +80,24 @@ import type {
  * - 桌面 App（Tauri）：`invoke` 调用 Rust commands
  * - webui（浏览器）：HTTP fetch 调用本地 buddy-switch 服务（127.0.0.1）
  */
-const API_BASE = "http://127.0.0.1:57890";
+
+/** 拿不到页面 origin 时的兜底地址（桌面 App 走 `invoke`，不经过这里）。 */
+const FALLBACK_API_BASE = "http://127.0.0.1:57890";
+
+/**
+ * webui 的 API 基址：**与页面同源**，按 `window.location.origin` 推导，不要写死端口。
+ *
+ * 静态资源与 `/api/*` 由**同一个二进制、同一个端口**提供（`buddy-switch serve --port`），
+ * 所以页面 origin 就是 API 基址。写死 57890 的后果：一旦用 `--port` 换端口，页面会去连
+ * 一个没人监听的地址，报「无法连接 Buddy Switch 服务（http://127.0.0.1:57890）」
+ * —— 而 57890 本身还常被 Windows 的 WinNAT 排除端口区间占掉，未必可用。
+ */
+function apiBase(): string {
+  if (!isWebui() || typeof window === "undefined") return FALLBACK_API_BASE;
+  const origin = window.location?.origin;
+  // `file://` 下 origin 是字符串 "null"，不是可用基址，回落。
+  return origin && origin !== "null" ? origin : FALLBACK_API_BASE;
+}
 
 const DEMO_READ_COMMANDS = new Set([
   "get_status", "get_accounts", "get_codebuddy_cli_status", "get_codebuddy_cn_ide_status", "get_checkin_status",
@@ -262,19 +279,20 @@ function queryString(args?: Record<string, unknown>): string {
 async function httpCall<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   const route = ROUTES[cmd];
   if (!route) throw new Error(`webui 模式暂不支持该操作: ${cmd}`);
+  const base = apiBase();
   let res: Response;
   try {
     const url =
       route.method === "GET"
-        ? `${API_BASE}${route.path}${queryString(args)}`
-        : `${API_BASE}${route.path}`;
+        ? `${base}${route.path}${queryString(args)}`
+        : `${base}${route.path}`;
     res = await fetch(url, {
       method: route.method,
       headers: { "Content-Type": "application/json" },
       body: route.method === "POST" ? JSON.stringify(args ?? {}) : undefined,
     });
   } catch {
-    throw new Error(`无法连接 Buddy Switch 服务（${API_BASE}），请先运行 \`buddy-switch\``);
+    throw new Error(`无法连接 Buddy Switch 服务（${base}），请先运行 \`buddy-switch\``);
   }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
