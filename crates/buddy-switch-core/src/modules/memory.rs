@@ -494,6 +494,17 @@ mod tests {
 
     #[test]
     fn memory_paths_are_region_scoped_and_named_by_uid() {
+        // ★ 必须持 `env_lock`：`memory_file_for` / `memory_dir_for` 都是无参全局函数，
+        //   每次调用都重读进程级 `BUDDY_SWITCH_HOME`。lib 单测在**同一进程里并行跑**，
+        //   不持锁时别的用例（如
+        //   `config::tests::store_dir_falls_back_to_legacy_when_new_absent` —— 它在 guard
+        //   还活着时就删掉了临时 home）可能在两次调用之间换掉 home。症状是 `left` 是本机
+        //   真实 home、`right` 是临时 home，看着像「目录隔离失效」，其实是被别的用例改了
+        //   环境（日志里会有「BUDDY_SWITCH_HOME 已忽略：必须是一个已存在的目录」）。
+        //   同一坑已在 `connector::tests` 记录，那边改成相对结构断言；这里持锁即可让两次
+        //   调用取到同一根目录，因此保留绝对路径断言。
+        let _lock = crate::modules::config::env_lock();
+
         let cn = memory_file_for(Region::Cn, "uid-a");
         let global = memory_file_for(Region::Global, "uid-a");
         assert_ne!(cn, global, "CN / Global 记忆文件必须隔离");
