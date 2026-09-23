@@ -1069,18 +1069,28 @@ mod tests {
     }
 
     /// `open_data_dir` 在非 Windows 上必须返回**结构化 Unsupported**（四个字段），
-    /// 而不是裸错误或假成功；Windows 上返回 `{ok,path,variant}`（路径可不存在但不得 panic）。
+    /// 而不是裸错误或假成功；Windows 上候选目录不存在时返回**指向该变体**的错误。
     #[test]
     fn open_data_dir_is_structured_unsupported_off_windows() {
-        let dir = std::env::temp_dir().join(format!("trae-opendir-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let _guard = crate::modules::config::HomeOverrideGuard::set(&dir);
+        // ★ 必须用 `TempEnv`（同时隔离 `BUDDY_SWITCH_HOME` 与 `APPDATA`）。
+        //
+        // `open_data_dir` 的目录选择走 `platform::select_data_dir_for`，它读的是
+        // **`APPDATA`**（见 `platform::data_dir_base`），与 buddy-switch 自己的 home
+        // 完全无关。早先这里用 `HomeOverrideGuard::set` 只隔离了 home，等于没隔离：
+        // 宿主机装了 Trae Work 就「碰巧」通过、干净环境（CI）恒红 —— 正是
+        // `trae::test_support` 模块文档点名的第 3 种错法。
+        #[cfg(windows)]
+        let _env = crate::modules::trae::test_support::TempEnv::empty();
 
-        let value = open_data_dir(TraeVariant::TraeWork).expect("open_data_dir 不应 Err");
+        let result = open_data_dir(TraeVariant::TraeWork);
+
         if cfg!(windows) {
-            // 隔离 home 下不一定真装了 Trae；能拿到 ok+path 就够（实际打开是宿主副作用）。
-            assert!(value.get("ok").is_some() || value.get("capability").is_some());
+            // 临时 `APPDATA` 下必然一个候选目录都没有 ⇒ 如实返回错误，而非假成功。
+            // 这同时保证了用例**不产生副作用**（不会真的拉起 explorer）。
+            let error = result.expect_err("候选目录不存在时必须 Err，不得假成功");
+            assert!(error.contains("Trae Work"), "错误必须指向具体变体：{error}");
         } else {
+            let value = result.expect("非 Windows 必须返回结构化 Unsupported");
             assert_eq!(value["capability"], "open_data_dir");
             assert_eq!(value["supportedOn"], "Windows");
             assert!(value.get("reason").is_some());
