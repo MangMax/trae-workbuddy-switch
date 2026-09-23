@@ -10,7 +10,9 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
-use crate::modules::account::{account_display_name, build_auth_headers, load_accounts};
+use crate::modules::account::{
+    account_display_name, build_auth_headers, envelope_token_error, load_accounts,
+};
 use crate::modules::config::{
     http_request, load_checkin_config, load_travel_cache, load_travel_config, now_ms, now_secs,
     save_travel_cache, with_travel_cache_lock, RunFlagGuard, TRAVEL_API_PREFIX,
@@ -86,6 +88,10 @@ fn is_unauthorized(resp: &Value) -> bool {
 
 /// 发旅行接口请求；遇到未授权且存在 refresh token 时刷新一次并重试。
 async fn travel_request(path: &str, method: &str, body: Option<Value>, account: &Value) -> Value {
+    // 加密信封凭据短路：不发空 Bearer，直接给出可读错误。
+    if let Some(err) = envelope_token_error(account) {
+        return json!({"code": -2, "message": err});
+    }
     let url = format!("{WORKBUDDY_API_ENDPOINT}{path}");
     let headers = build_travel_headers(account);
     let mut resp = http_request(&url, method, body.clone(), Some(&headers)).await;
@@ -1232,5 +1238,19 @@ mod tests {
             ),
             "traveling"
         );
+    }
+
+    /// 回归：信封凭据的旅行请求必须在入口短路并返回可读错误，不发出空 Bearer。
+    #[tokio::test]
+    async fn envelope_credentials_short_circuit_before_request() {
+        let account = json!({
+            "id": "envelope-only",
+            "access_token": {"$wbEncrypted": true, "envelope": "…"},
+            "refresh_token": {"$wbEncrypted": true, "envelope": "…"},
+        });
+        let resp = travel_request("/whatever", "GET", None, &account).await;
+        assert_eq!(resp["code"], -2);
+        let msg = resp["message"].as_str().expect("message 应为字符串");
+        assert!(msg.contains("信封"), "错误文案应可读：{msg}");
     }
 }

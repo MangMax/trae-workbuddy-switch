@@ -970,8 +970,12 @@ pub fn status() -> Value {
 pub fn switch_account(account_id: &str, restart: bool) -> Result<Value, String> {
     let acc = account::find_account(account_id)
         .ok_or_else(|| format!("账号不存在: {account_id}"))?;
-    let token = get_str(&acc, "access_token")
-        .ok_or_else(|| "账号缺少 access_token，无法注入 CodeBuddy CN".to_string())?;
+    let token = get_str(&acc, "access_token").ok_or_else(|| {
+        // 信封凭据解不出明文，注入进去等于把 IDE 登录态写成空 token：如实拒绝并说明
+        // 原因，而不是报「缺少 access_token」——账号其实有凭据，只是形态不可用。
+        account::envelope_token_error(&acc)
+            .unwrap_or_else(|| "账号缺少 access_token，无法注入 CodeBuddy CN".to_string())
+    })?;
     if token.is_empty() {
         return Err("账号 access_token 为空".to_string());
     }

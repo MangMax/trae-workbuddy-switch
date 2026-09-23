@@ -15,7 +15,9 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use crate::modules::account::{account_display_name, build_auth_headers, load_accounts_for};
+use crate::modules::account::{
+    account_display_name, build_auth_headers, envelope_token_error, load_accounts_for,
+};
 use crate::modules::config::{
     add_checkin_log, http_request, load_checkin_config, load_checkin_logs, now_ms, RunFlagGuard,
     CHECKIN_API_PREFIX,
@@ -97,6 +99,10 @@ fn is_unauthorized(resp: &Value) -> bool {
 
 /// 按 region 发签到相关请求；遇到未授权且存在 refresh token 时刷新一次并重试。
 async fn checkin_request_for(region: Region, path: &str, account: &Value) -> Value {
+    // 加密信封凭据短路：不发空 Bearer（此前会被网关 401 后把错误页原样回显到界面）。
+    if let Some(err) = envelope_token_error(account) {
+        return json!({"code": -2, "message": err});
+    }
     let url = format!("{}{path}", region_spec(region).billing_base);
     let headers = build_auth_headers(account);
     let mut resp = http_request(&url, "POST", Some(json!({})), Some(&headers)).await;
@@ -519,5 +525,21 @@ mod tests {
             get_checkin_status_for(Region::Global, &account).await["ok"],
             json!(false)
         );
+    }
+
+    /// 回归：信封凭据的签到请求必须在入口短路并返回可读错误，**不发出空 Bearer**
+    /// （此前 `build_auth_headers` 会把信封兜底成空 `Bearer`，被网关 401 后把错误页
+    /// 原样回显到界面）。短路发生在任何全局状态与网络之前，故无需取全局锁。
+    #[tokio::test]
+    async fn envelope_credentials_short_circuit_before_request() {
+        let account = json!({
+            "id": "envelope-only",
+            "access_token": {"$wbEncrypted": true, "envelope": "…"},
+            "refresh_token": {"$wbEncrypted": true, "envelope": "…"},
+        });
+        let resp = checkin_request_for(Region::Cn, "/whatever", &account).await;
+        assert_eq!(resp["code"], -2);
+        let msg = resp["message"].as_str().expect("message 应为字符串");
+        assert!(msg.contains("信封"), "错误文案应可读：{msg}");
     }
 }
