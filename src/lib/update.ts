@@ -1,4 +1,5 @@
-export const GITHUB_OWNER = "NextAgentX";
+/** 更新检查坐标：本仓库（私人维护版）。原版仓库的 release 与本仓库不同步。 */
+export const GITHUB_OWNER = "MangMax";
 export const GITHUB_REPO = "trae-workbuddy-switch";
 export const GITHUB_REPOSITORY_URL = `https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}`;
 export const GITHUB_RELEASE_URL = `${GITHUB_REPOSITORY_URL}/releases/latest`;

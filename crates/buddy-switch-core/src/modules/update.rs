@@ -19,7 +19,10 @@ use crate::modules::config::{
 
 /// 应用当前版本（来自 Cargo.toml package.version）。
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const GITHUB_OWNER: &str = "NextAgentX";
+/// 更新检查坐标：**本仓库**（私人维护版）。原仓库 `NextAgentX/trae-workbuddy-switch`
+/// 与更早的 `changexbc/workbuddy-switch` 的 release 与我们不同步，指向它们会导致
+/// 客户端反复提示「可以升级」却装不上（资产/签名对不上），故统一指向本仓库。
+pub const GITHUB_OWNER: &str = "MangMax";
 pub const GITHUB_REPO: &str = "trae-workbuddy-switch";
 
 /// 成功结果缓存有效期（6 小时）。自动轮询（30 分钟）命中缓存，不发网络请求；
@@ -40,12 +43,14 @@ pub fn github_config_file() -> PathBuf {
 
 /// 把已知的旧仓库坐标归一到当前坐标，返回 `(owner, repo)`。
 ///
-/// 旧坐标有两代：`changexbc/buddy-switch`（早期截图/配置）与
-/// `changexbc/workbuddy-switch`（旧公开仓库）。配置文件 `github_config.json`
-/// 的优先级**高于**常量，若不迁移，已存有旧坐标的用户会永久指向已迁走的仓库、
-/// 再也收不到更新。因此按 **owner** 判定，一次性把该 owner 下的所有旧 repo 归一到新坐标。
+/// 旧坐标有三代：`changexbc/buddy-switch`（早期截图/配置）、
+/// `changexbc/workbuddy-switch`（旧公开仓库）与 `NextAgentX/trae-workbuddy-switch`
+/// （上游原版仓库）。配置文件 `github_config.json` 的优先级**高于**常量，
+/// 若不迁移，已存有旧坐标的用户会永久指向别的仓库、收不到本仓库的更新
+/// （指向原版仓库时还会反复提示「可以升级」但资产对不上）。
+/// 因此按 **owner** 判定，一次性把该 owner 下的所有旧 repo 归一到新坐标。
 fn migrate_legacy_coordinates(owner: &str, repo: &str) -> (String, String) {
-    if owner == "changexbc" {
+    if matches!(owner, "changexbc" | "NextAgentX") {
         (GITHUB_OWNER.to_string(), GITHUB_REPO.to_string())
     } else {
         (owner.to_string(), repo.to_string())
@@ -216,8 +221,15 @@ async fn fetch_latest_tag(
         return Err((msg, -1));
     }
     if status == 404 {
-        // 无正式 release 或仓库不存在。
-        return Err(("未找到可用的发布版本".to_string(), 404));
+        // 无正式 release、仓库不存在，或**私人仓库**（匿名请求一律 404）。
+        // 本仓库为私人仓库，匿名客户端读不到它的 Release —— 文案要说清这一点，
+        // 否则用户会把「检查不到」当成网络故障反复重试。
+        return Err((
+            "未找到可公开访问的发布版本（code=404）：仓库无正式发布，或它是私人仓库、匿名请求读不到 Release。\
+             更新检查失败不影响使用；如需更新请到仓库 Release 页手动下载。"
+                .to_string(),
+            404,
+        ));
     }
     let location = resp_headers
         .iter()
@@ -341,14 +353,21 @@ pub async fn update_check(proxy: Option<&str>, force: bool) -> Value {
 mod tests {
     use super::*;
 
+    /// 端点必须跟随 `GITHUB_OWNER`/`GITHUB_REPO` 常量（本仓库坐标），
+    /// 不写死字符串——写死会在改坐标时静默指向旧仓库。
+    fn repo_release_base() -> String {
+        format!("https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest/download")
+    }
+
     #[test]
     fn updater_manifest_urls_macos_skips_duplicate_fallback() {
         let urls = updater_manifest_urls(GITHUB_OWNER, GITHUB_REPO, "macos", "aarch64");
+        let base = repo_release_base();
         assert_eq!(
             urls,
             vec![
-                "https://github.com/NextAgentX/trae-workbuddy-switch/releases/latest/download/latest.json",
-                "https://github.com/NextAgentX/trae-workbuddy-switch/releases/latest/download/latest-macos-aarch64.json",
+                format!("{base}/latest.json"),
+                format!("{base}/latest-macos-aarch64.json"),
             ]
         );
     }
@@ -356,27 +375,30 @@ mod tests {
     #[test]
     fn updater_manifest_urls_windows_keeps_macos_compat() {
         let urls = updater_manifest_urls(GITHUB_OWNER, GITHUB_REPO, "windows", "x86_64");
+        let base = repo_release_base();
         assert_eq!(
             urls,
             vec![
-                "https://github.com/NextAgentX/trae-workbuddy-switch/releases/latest/download/latest.json",
-                "https://github.com/NextAgentX/trae-workbuddy-switch/releases/latest/download/latest-windows-x86_64.json",
-                "https://github.com/NextAgentX/trae-workbuddy-switch/releases/latest/download/latest-macos-x86_64.json",
+                format!("{base}/latest.json"),
+                format!("{base}/latest-windows-x86_64.json"),
+                format!("{base}/latest-macos-x86_64.json"),
             ]
         );
     }
 
     /// 旧坐标必须被迁移到新仓库：配置文件里的旧坐标优先级高于常量，
-    /// 不迁移的话老用户会永久指向已迁走的仓库。
+    /// 不迁移的话老用户会永久指向别的仓库、收不到本仓库更新。
     #[test]
     fn legacy_github_coordinates_migrate_to_current_repo() {
-        for legacy_repo in ["workbuddy-switch", "buddy-switch"] {
-            let migrated = migrate_legacy_coordinates("changexbc", legacy_repo);
-            assert_eq!(
-                migrated,
-                (GITHUB_OWNER.to_string(), GITHUB_REPO.to_string()),
-                "legacy repo `{legacy_repo}` should migrate to current coordinates"
-            );
+        for legacy_repo in ["workbuddy-switch", "buddy-switch", "trae-workbuddy-switch"] {
+            for legacy_owner in ["changexbc", "NextAgentX"] {
+                let migrated = migrate_legacy_coordinates(legacy_owner, legacy_repo);
+                assert_eq!(
+                    migrated,
+                    (GITHUB_OWNER.to_string(), GITHUB_REPO.to_string()),
+                    "legacy `{legacy_owner}/{legacy_repo}` should migrate to current coordinates"
+                );
+            }
         }
         // 非旧 owner 的坐标必须原样保留（不得被误伤）
         let kept = migrate_legacy_coordinates("someone-else", "workbuddy-switch");

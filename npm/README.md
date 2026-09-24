@@ -2,16 +2,16 @@
 
 **WorkBuddy / TraeWork 多账号管理工具**（webui 形态）：启动本地服务后用浏览器操作，能力与桌面 App 一致。
 
-> 桌面 App（Tauri）请从 [GitHub Releases](https://github.com/NextAgentX/trae-workbuddy-switch/releases/latest) 下载安装包。
-> 在线只读演示：<https://nextagentx.github.io/trae-workbuddy-switch/>
+> 桌面 App（Tauri）请从 [GitHub Releases](https://github.com/MangMax/trae-workbuddy-switch/releases/latest) 下载安装包。
+> 在线只读演示：<https://mangmax.github.io/trae-workbuddy-switch/>
 
-> **本包（`@nextagentx/buddy-switch`）尚未发布到 npm**：下面的安装命令现在还不可用，需要 webui 形态请先按仓库 README 从源码构建。
+> **本包（`@mangmax/buddy-switch`）尚未发布到 npm**：下面的安装命令现在还不可用，需要 webui 形态请先按仓库 README 从源码构建。
 > 发布后再以本页命令为准。
 
 ## 安装与运行
 
 ```bash
-npm i -g @nextagentx/buddy-switch
+npm i -g @mangmax/buddy-switch
 
 buddy-switch              # 启动本地服务 + 自动打开浏览器
 buddy-switch serve        # 只起服务，不开浏览器（--port 指定端口）
@@ -19,7 +19,7 @@ buddy-switch status       # 终端查看当前账号
 buddy-switch version      # 版本号
 ```
 
-默认监听 `127.0.0.1:57890`。二进制以「平台分包」形式发布（`@nextagentx/buddy-switch-<platform>-<arch>`），
+默认监听 `127.0.0.1:57890`。二进制以「平台分包」形式发布（`@mangmax/buddy-switch-<platform>-<arch>`），
 主包把它声明为 `optionalDependencies`，安装时 npm 自动装好，`postinstall` 只负责把二进制复制到 `bin/`——
 因此**不依赖 GitHub，国内镜像（npmmirror）也能稳定安装**。
 
@@ -56,18 +56,10 @@ buddy-switch version      # 版本号
 - 切换账号前会先备份原认证文件；Trae 切换登录态前会先保存快照
 - 网关 API Key 只保存前缀与哈希，明文仅在创建时返回一次
 
-## 支持这个项目
+## 来源说明
 
-如果 Buddy Switch 帮到了你，可以请作者喝杯饮料 ☕
-
-<table>
-  <tbody>
-    <tr>
-      <td align="center"><img src="https://raw.githubusercontent.com/NextAgentX/trae-workbuddy-switch/main/docs/images/donate-wechat.png" alt="微信支付收款码" width="240" /><br />微信支付</td>
-      <td align="center"><img src="https://raw.githubusercontent.com/NextAgentX/trae-workbuddy-switch/main/docs/images/donate-alipay.jpg" alt="支付宝收款码" width="240" /><br />支付宝</td>
-    </tr>
-  </tbody>
-</table>
+本仓库来自原仓库 **[changexbc/workbuddy-switch](https://github.com/changexbc/workbuddy-switch)**（原版项目）。
+本仓库为私人维护版本，仅在原版基础上做本地适配与缺陷修复，不代表原作者的立场或发布。
 
 ## 许可
 

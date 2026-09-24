@@ -1,5 +1,5 @@
 {
-  "name": "@nextagentx/buddy-switch",
+  "name": "@mangmax/buddy-switch",
   "version": "2026.9.211636",
   "description": "Buddy Switch（WorkBuddy 账号切换工具）：本地 webui（浏览器操作）+ 桌面 App（安装后运行 buddy-switch）",
   "bin": {
@@ -10,10 +10,10 @@
     "scripts"
   ],
   "optionalDependencies": {
-    "@nextagentx/buddy-switch-darwin-arm64": "2026.9.211636",
-    "@nextagentx/buddy-switch-darwin-x64": "2026.9.211636",
-    "@nextagentx/buddy-switch-win32-x64": "2026.9.211636",
-    "@nextagentx/buddy-switch-linux-x64": "2026.9.211636"
+    "@mangmax/buddy-switch-darwin-arm64": "2026.9.211636",
+    "@mangmax/buddy-switch-darwin-x64": "2026.9.211636",
+    "@mangmax/buddy-switch-win32-x64": "2026.9.211636",
+    "@mangmax/buddy-switch-linux-x64": "2026.9.211636"
   },
   "scripts": {
     "postinstall": "node scripts/install.js"

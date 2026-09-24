@@ -19,11 +19,11 @@ One interface, three forms:
 
 | Form | How to get it | Notes |
 | --- | --- | --- |
-| **Desktop app** | Download the installer from [GitHub Releases](https://github.com/NextAgentX/trae-workbuddy-switch/releases/latest) | Packaged with Tauri; recommended for daily use |
+| **Desktop app** | Download the installer from [GitHub Releases](https://github.com/MangMax/trae-workbuddy-switch/releases/latest) | Packaged with Tauri; recommended for daily use |
 | **webui (browser)** | Build from source, see [webui form](#webui-form-build-from-source) | The same frontend bundle as the desktop app, served over a local HTTP channel |
-| **Online demo** | [GitHub Pages](https://nextagentx.github.io/trae-workbuddy-switch/) | Read-only demo; accounts, credits and request records are fictional data and all business actions are disabled |
+| **Online demo** | [GitHub Pages](https://mangmax.github.io/trae-workbuddy-switch/) | Read-only demo; accounts, credits and request records are fictional data and all business actions are disabled |
 
-> **No npm distribution yet**: the npm package `@nextagentx/buddy-switch` has not been published, so `npm i -g …` will not install it yet.
+> **No npm distribution yet**: the npm package `@mangmax/buddy-switch` has not been published, so `npm i -g …` will not install it yet.
 > For the webui form, follow [Build from source](#webui-form-build-from-source) below; the install command will be added here once it is published.
 
 ## Two product sections
@@ -43,7 +43,7 @@ The pages under both sections are **structurally identical, item for item**: Acc
 
 ### Desktop app
 
-Download the installer for your platform from [GitHub Releases](https://github.com/NextAgentX/trae-workbuddy-switch/releases/latest):
+Download the installer for your platform from [GitHub Releases](https://github.com/MangMax/trae-workbuddy-switch/releases/latest):
 
 | Platform | Installer | Installation |
 | --- | --- | --- |
@@ -296,28 +296,14 @@ crates/
   buddy-switch-server/   # HTTP server + CLI (axum API + rust-embed embedded frontend)
 src-tauri/               # desktop host (thin Tauri command wrappers + tray)
 src/                     # frontend: components / pages / lib (api.ts dual channel: Tauri invoke or HTTP fetch)
-npm/                     # npm packages (**not published yet**): main package @nextagentx/buddy-switch + 5 platform packages
+npm/                     # npm packages (**not published yet**): main package @mangmax/buddy-switch + 5 platform packages
 ```
 
-## Support the project
+## Origin
 
-If Buddy Switch has been useful to you, you can buy the author a drink ☕
-
-<table>
-  <thead>
-    <tr>
-      <th>WeChat Pay</th>
-      <th>Alipay</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td><img src="docs/images/donate-wechat.png" alt="WeChat Pay QR code" width="260" /></td>
-      <td><img src="docs/images/donate-alipay.jpg" alt="Alipay QR code" width="260" /></td>
-    </tr>
-  </tbody>
-</table>
-
+This repository is derived from the original project **[changexbc/workbuddy-switch](https://github.com/changexbc/workbuddy-switch)**.
+It is a privately maintained fork with local adaptations and bug fixes; it does not represent the original author's positions or releases.
+Version checks, releases, and installers are served from **this repository** (the original repository's releases are not in sync with it).
 
 ## License
 

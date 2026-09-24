@@ -19,11 +19,11 @@
 
 | 形态 | 获取方式 | 说明 |
 | --- | --- | --- |
-| **桌面 App** | 从 [GitHub Releases](https://github.com/NextAgentX/trae-workbuddy-switch/releases/latest) 下载安装包 | Tauri 打包，推荐日常使用 |
+| **桌面 App** | 从 [GitHub Releases](https://github.com/MangMax/trae-workbuddy-switch/releases/latest) 下载安装包 | Tauri 打包，推荐日常使用 |
 | **webui（浏览器）** | 从源码构建，见 [webui 形态](#webui-形态源码构建) | 与桌面 App 同一份前端产物，走本地 HTTP 通道 |
-| **在线演示** | [GitHub Pages](https://nextagentx.github.io/trae-workbuddy-switch/) | 只读演示；账号、积分与请求记录均为虚构数据，所有业务操作已禁用 |
+| **在线演示** | [GitHub Pages](https://mangmax.github.io/trae-workbuddy-switch/) | 只读演示；账号、积分与请求记录均为虚构数据，所有业务操作已禁用 |
 
-> **暂未提供 npm 安装**：npm 包 `@nextagentx/buddy-switch` 尚未发布，`npm i -g …` 还装不到它。
+> **暂未提供 npm 安装**：npm 包 `@mangmax/buddy-switch` 尚未发布，`npm i -g …` 还装不到它。
 > 需要 webui 形态请按下方[从源码构建](#webui-形态源码构建)；发布后会在这里补上安装命令。
 
 
@@ -44,7 +44,7 @@
 
 ### 桌面 App
 
-前往 [GitHub Releases](https://github.com/NextAgentX/trae-workbuddy-switch/releases/latest) 下载对应平台的安装包：
+前往 [GitHub Releases](https://github.com/MangMax/trae-workbuddy-switch/releases/latest) 下载对应平台的安装包：
 
 | 平台 | 安装包 | 安装方式 |
 | --- | --- | --- |
@@ -297,28 +297,14 @@ crates/
   buddy-switch-server/   # HTTP server + CLI（axum API + rust-embed 内嵌前端）
 src-tauri/               # 桌面宿主（Tauri command 薄包装 + 托盘）
 src/                     # 前端：components / pages / lib（api.ts 双通道：Tauri invoke 或 HTTP fetch）
-npm/                     # npm 包（**尚未发布**）：主包 @nextagentx/buddy-switch + 5 个平台分包
+npm/                     # npm 包（**尚未发布**）：主包 @mangmax/buddy-switch + 5 个平台分包
 ```
 
-## 支持这个项目
+## 来源说明
 
-如果 Buddy Switch 帮到了你，可以请作者喝杯饮料 ☕
-
-<table>
-  <thead>
-    <tr>
-      <th>微信支付</th>
-      <th>支付宝</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td><img src="docs/images/donate-wechat.png" alt="微信支付收款码" width="260" /></td>
-      <td><img src="docs/images/donate-alipay.jpg" alt="支付宝收款码" width="260" /></td>
-    </tr>
-  </tbody>
-</table>
-
+本仓库来自原仓库 **[changexbc/workbuddy-switch](https://github.com/changexbc/workbuddy-switch)**（原版项目）。
+本仓库为私人维护版本，仅在原版基础上做本地适配与缺陷修复，不代表原作者的立场或发布。
+版本检查、Release 与安装包均以**本仓库**为准（原仓库的 Release 与本仓库不同步）。
 
 ## 许可
 

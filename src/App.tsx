@@ -16,7 +16,6 @@ import TraeCreditsPage from "@/pages/TraeCreditsPage";
 import TraeSettingsPage from "@/pages/TraeSettingsPage";
 import TraeTokenStatsPage from "@/pages/TraeTokenStatsPage";
 import { StatusDot, AppIconMark, TraeVariantMark, WorkBuddyMark } from "@/components/product-marks";
-import { DonateButton } from "@/components/donate-dialog";
 import { UpdateInstallDialog } from "@/components/update-install-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -261,8 +260,7 @@ function ProductSwitch({
  * 误以为它是 WorkBuddy 客户端的版本号。状态圆点跟随当前选中的产品。
  *
  * **只负责内容**：底部区块的边框、外边距与水平内边距归 `Layout` 里的那个
- * `<section>`——同一块里还要放打赏入口（见 `DonateButton`），而它在 webui 下
- * **仍然显示**（版本行则不显示），把容器留在 `Layout` 才能只写一处。
+ * `<section>`（版本行在 webui 下不显示），把容器留在 `Layout` 才能只写一处。
  */
 function AppFooter({
   product,
@@ -440,11 +438,8 @@ function Layout() {
           ))}
         </nav>
 
-        {/* 侧栏底部区块：打赏入口在**版本号上方**。
-            打赏在 webui 下**也显示**（版本行不显示），因此容器放在这里、
-            由两个子项共用边框与内边距，而不是塞进 `AppFooter`。 */}
+        {/* 侧栏底部区块：版本行在 webui 下不显示，容器放在这里以便只写一处边框与内边距。 */}
         <section className="mt-auto flex flex-col gap-2.5 border-t border-sidebar-border px-2 pt-3 text-xs">
-          <DonateButton />
           {api.isWebui() && !demoModeEnabled ? null : (
             <AppFooter product={product} running={running} version={appVersion} />
           )}
