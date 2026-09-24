@@ -343,10 +343,17 @@ function RegionPanel({ region }: { region: Region }) {
     };
   }, [accounts.length]);
 
-  /** 首次进入该版本且无账号时自动导入本机账号（本会话每版本只尝试一次，无本机账号时静默） */
+  /**
+   * 首次进入该版本且无账号时自动导入本机账号（本会话每版本只尝试一次）。
+   *
+   * 只对国内版做静默自动导入：上游 WorkBuddy 客户端可能把当前登录态写进
+   * 兼容路径，国际版若在页面挂载时自动尝试，删除后的账号会被本机登录态再次采集。
+   * 国际版改由用户显式点击「导入本机账号」或走 OAuth；服务端仍有 domain 校验作为
+   * 最后一道防线，避免任何跨 region 记录落入错误账号库。
+   */
   const autoImportTried = useRef(false);
   useEffect(() => {
-    if (autoImportTried.current || loading || accounts.length > 0) return;
+    if (region !== "cn" || autoImportTried.current || loading || accounts.length > 0) return;
     autoImportTried.current = true;
     void importLocalStore(region)
       .then(() => void reconcileAccounts(region))

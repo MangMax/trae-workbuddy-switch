@@ -325,7 +325,11 @@ async fn api_accounts(RawQuery(query): RawQuery) -> Response {
             .iter()
             .map(account::account_meta)
             .collect::<Vec<_>>(),
-        "current": auth_file::read_auth_file_for(region)
+        // 与 `/api/status` 保持同一条区域安全边界：认证文件内容若与文件名所属
+        // region 不一致，不得把错误版本的 uid 继续标成当前账号。
+        "current": auth_file::read_auth_file_checked_for(region)
+            .ok()
+            .flatten()
             .and_then(|a| a.get("account").and_then(|x| x.get("uid")).and_then(|x| x.as_str()).map(String::from)),
     }))
 }
@@ -2881,6 +2885,50 @@ mod tests {
             account_ids(&body_default),
             vec!["cn-only"],
             "缺省 region 必须等价于 cn：{body_default}"
+        );
+    }
+
+    /// 本机认证文件的内容即使被写到了 CN 路径，也不能作为 Global 凭据写入 CN 账号库。
+    ///
+    /// 这是用户「国际账号删除后又自动出现在国内版」的最小回归：导入入口必须先校验
+    /// domain，且失败前不得创建/修改 `accounts.json`。
+    #[tokio::test]
+    async fn import_local_rejects_cross_region_auth_without_writing_cn() {
+        let _guard = test_guard();
+        isolated_home();
+
+        let auth_file = buddy_switch_core::modules::auth_file::auth_file_path_for(Region::Cn);
+        std::fs::create_dir_all(auth_file.parent().unwrap()).expect("create auth dir");
+        std::fs::write(
+            &auth_file,
+            r#"{"account":{"uid":"global-uid","nickname":"global"},"auth":{"accessToken":"token","domain":"www.workbuddy.ai"}}"#,
+        )
+        .expect("seed cross-region auth");
+
+        let (status, body) = call_api(
+            Method::POST,
+            "/api/import-local",
+            Some(json!({"region": "cn"})),
+        )
+        .await;
+        let cn_accounts = buddy_switch_core::modules::account::load_accounts_for(Region::Cn);
+        let global_accounts =
+            buddy_switch_core::modules::account::load_accounts_for(Region::Global);
+
+        let _ = std::fs::remove_file(&auth_file);
+        clear_accounts(Region::Cn);
+        clear_accounts(Region::Global);
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "跨区域导入必须失败：{body}");
+        let error = body["error"].as_str().unwrap_or("");
+        assert!(
+            error.contains("WorkBuddy AI") && error.contains("WorkBuddy 的认证文件位置"),
+            "错误必须说明实际凭据版本和错误文件位置：{body}"
+        );
+        assert!(cn_accounts.is_empty(), "失败导入不得写入 CN 库：{cn_accounts:?}");
+        assert!(
+            global_accounts.is_empty(),
+            "错误区域导入也不得偷偷写入 Global 库：{global_accounts:?}"
         );
     }
 

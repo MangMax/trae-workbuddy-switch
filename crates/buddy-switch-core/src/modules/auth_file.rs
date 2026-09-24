@@ -417,9 +417,25 @@ pub fn import_from_auth_file() -> Option<Value> {
     import_from_auth_file_for(Region::Cn)
 }
 
-/// 按 region 从当前登录态导入账号。
+/// 按 region 从当前登录态导入账号（安全包装）。
+///
+/// 认证文件名只是路径分流，不等于文件内容一定属于该 region：例如某些客户端
+/// 或旧版本可能把国际版登录态写进 `workbuddy-desktop.info`。因此这个兼容保留的
+/// `Option` API 也必须走 checked 读取，跨 region 时宁可返回 `None`，不能继续解析
+/// 后写入错误的账号库。需要向 UI 反馈具体冲突时使用 [`import_from_auth_file_checked_for`]。
 pub fn import_from_auth_file_for(region: Region) -> Option<Value> {
-    imported_account_from_root(read_auth_file_for(region)?)
+    import_from_auth_file_checked_for(region).ok().flatten()
+}
+
+/// 按 region 导入本机登录态，并保留区域不匹配的结构化错误。
+///
+/// 这是会继续写入账号库的调用方应使用的入口：认证文件内容与目标 region 不一致时
+/// 返回 [`RegionMismatch`]，调用方不得落库。
+pub fn import_from_auth_file_checked_for(
+    region: Region,
+) -> Result<Option<Value>, RegionMismatch> {
+    let root = read_auth_file_checked_for(region)?;
+    Ok(root.and_then(imported_account_from_root))
 }
 
 fn imported_account_from_root(root: Value) -> Option<Value> {

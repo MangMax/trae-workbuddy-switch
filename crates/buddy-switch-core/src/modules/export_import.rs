@@ -151,12 +151,36 @@ pub fn import_accounts(text: &str, indexes: &[usize]) -> Result<ImportResult, St
     import_accounts_for(Region::Cn, text, indexes)
 }
 
+/// 检查选中的账号记录是否属于目标 region。
+///
+/// 缺 token 的记录仍由后续合并阶段计为 skipped；只有会实际进入账号库的记录需要
+/// 经过区域校验。索引越界也保持既有 skipped 语义。
+fn validate_records_for_region(
+    region: Region,
+    array: &[Value],
+    indexes: &[usize],
+) -> Result<(), String> {
+    for &index in indexes {
+        if let Some(item) = array.get(index) {
+            if has_credential(item) {
+                account::ensure_account_region(region, item)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// 按 region 导入：读该 region 账号库 → 合并 → 写回，返回计数。
 pub fn import_accounts_for(
     region: Region,
     text: &str,
     indexes: &[usize],
 ) -> Result<ImportResult, String> {
+    // 先做区域预检，再创建/写回目标账号库。这样即使导入文件来自国际版，
+    // 也不会因为调用方把 region 传成 cn 而把它落入 `accounts.json`。
+    let array = parse_accounts_json(text)?;
+    validate_records_for_region(region, &array, indexes)?;
+
     let mut accounts = account::load_accounts_for(region);
     let result = merge_import_records(&mut accounts, text, indexes)?;
     account::save_accounts_for(region, &accounts).map_err(|e| format!("保存账号库失败：{e}"))?;
@@ -563,5 +587,28 @@ mod tests {
             );
         }
         assert!(accounts.is_empty());
+    }
+
+    /// 账号文件导入必须拒绝把 Global 记录写进 CN 账号库；这是 UI 传错 region
+    /// 或用户选择了另一版本导出文件时的最后一道纯逻辑防线。
+    #[test]
+    fn region_mismatch_is_rejected_before_file_import() {
+        let global = json!({
+            "uid": "global-1",
+            "domain": "www.workbuddy.ai",
+            "access_token": "token",
+        });
+        let cn = json!({
+            "uid": "cn-1",
+            "domain": "www.codebuddy.cn",
+            "access_token": "token",
+        });
+
+        let records = vec![global.clone(), cn.clone()];
+        assert!(validate_records_for_region(Region::Global, &records, &[0]).is_ok());
+        let err = validate_records_for_region(Region::Cn, &records, &[0])
+            .expect_err("Global 记录不得导入 CN");
+        assert!(err.contains("账号库"), "错误应能指导用户：{err}");
+        assert!(validate_records_for_region(Region::Cn, &records, &[1]).is_ok());
     }
 }

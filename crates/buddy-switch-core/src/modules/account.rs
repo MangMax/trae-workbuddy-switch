@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::modules::config::{atomic_write, now_ms};
-use crate::modules::region::{accounts_file_for, region_spec, Region};
+use crate::modules::region::{accounts_file_for, region_display, region_of, region_spec, Region};
 
 /// 是否持有未过期的明文 `access_token`（OAuth 扫码所得形态）。
 /// 无 `expiresAt` 时视为有效（保守：不因缺字段丢弃明文凭据）。
@@ -259,13 +259,58 @@ pub fn upsert_collected_account(accounts: &mut Vec<Value>, mut collected: Value)
     collected
 }
 
+/// 校验账号记录的凭据域是否属于目标 region。
+///
+/// 账号库是按文件分区的，但账号 JSON 自身仍可能来自错误的导入入口；只按目标
+/// 文件落库会把国际账号写进 CN 的 `accounts.json`。CN 旧账号可能没有 `domain`，
+/// 为保持兼容允许这种历史记录；Global 没有 domain 时则拒绝，因为无法证明它
+/// 属于国际版。只要 domain 存在，就必须严格匹配目标 region。
+pub fn ensure_account_region(region: Region, account: &Value) -> Result<(), String> {
+    let domain = get_str(account, "domain");
+    if domain.is_none() {
+        return if region == Region::Cn {
+            Ok(())
+        } else {
+            Err("国际版账号缺少凭据 domain，无法安全写入国际版账号库".to_string())
+        };
+    }
+
+    let domain = domain.unwrap_or_default();
+    let actual = region_of(&domain);
+    if actual == region {
+        return Ok(());
+    }
+
+    let actual_name = region_display(actual);
+    let expected_name = region_display(region);
+    let actual_label = if actual == Region::Global {
+        format!("{actual_name}（国际版）")
+    } else {
+        format!("{actual_name}（国内版）")
+    };
+    let expected_label = if region == Region::Global {
+        format!("{expected_name}（国际版）")
+    } else {
+        format!("{expected_name}（国内版）")
+    };
+    Err(format!(
+        "账号凭据属于{}（domain: {}），不能写入{}账号库",
+        actual_label, domain, expected_label,
+    ))
+}
+
 /// 使用统一身份规则保存采集到的账号（CN）。
 pub fn save_collected_account(collected: Value) -> std::io::Result<Value> {
     save_collected_account_for(Region::Cn, collected)
 }
 
 /// 按 region 使用统一身份规则保存采集到的账号。
+///
+/// 这是所有 OAuth / 本机导入等采集入口的最后一道区域边界；在读取目标账号库
+/// 或写盘之前校验 domain，防止任何调用方因丢失 region 参数把跨区域账号落到 CN。
 pub fn save_collected_account_for(region: Region, collected: Value) -> std::io::Result<Value> {
+    ensure_account_region(region, &collected)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     let mut accounts = load_accounts_for(region);
     let saved = upsert_collected_account(&mut accounts, collected);
     save_accounts_for(region, &accounts)?;
@@ -279,6 +324,8 @@ pub fn upsert_account(updated: &Value) -> std::io::Result<()> {
 
 /// 按 region 覆盖写入账号库（不存在则追加）。
 pub fn upsert_account_for(region: Region, updated: &Value) -> std::io::Result<()> {
+    ensure_account_region(region, updated)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     let mut accounts = load_accounts_for(region);
     let id = updated.get("id").and_then(|v| v.as_str()).unwrap_or("");
     let mut replaced = false;
@@ -578,6 +625,39 @@ mod tests {
         assert_eq!(account_display_name(&json!({})), "unknown");
     }
 
+    /// 账号采集结果落库前必须按 domain 再做一次 region 校验，不能只相信调用方参数。
+    #[test]
+    fn ensure_account_region_rejects_cross_region_records() {
+        let global = json!({
+            "uid": "global-1",
+            "domain": "www.workbuddy.ai",
+            "access_token": "token",
+        });
+        let cn = json!({
+            "uid": "cn-1",
+            "domain": "www.codebuddy.cn",
+            "access_token": "token",
+        });
+
+        assert!(ensure_account_region(Region::Global, &global).is_ok());
+        let err = ensure_account_region(Region::Cn, &global)
+            .expect_err("国际账号不得落入 CN 账号库");
+        assert!(err.contains("国际版"), "错误应指出实际 region：{err}");
+        assert!(err.contains("国内版"), "错误应指出目标 region：{err}");
+
+        assert!(ensure_account_region(Region::Cn, &cn).is_ok());
+        assert!(ensure_account_region(Region::Global, &cn).is_err());
+    }
+
+    /// 历史 CN 账号可能没有 domain；保持兼容。Global 缺 domain 则不能安全判定归属。
+    #[test]
+    fn ensure_account_region_handles_missing_domain_conservatively() {
+        assert!(ensure_account_region(Region::Cn, &json!({"uid": "legacy-cn"})).is_ok());
+        let err = ensure_account_region(Region::Global, &json!({"uid": "unknown"}))
+            .expect_err("缺 domain 的记录不能写入 Global 账号库");
+        assert!(err.contains("缺少"), "错误应说明缺少 domain：{err}");
+    }
+
     #[test]
     fn get_str_trims_and_filters_empty() {
         assert_eq!(get_str(&json!({"k": "  v  "}), "k"), Some("v".to_string()));
@@ -829,7 +909,8 @@ pub fn import_local() -> Result<Value, String> {
 
 /// 按 region 导入本机当前账号（从该 region 认证文件读取）。
 pub fn import_local_for(region: Region) -> Result<Value, String> {
-    let acc = crate::modules::auth_file::import_from_auth_file_for(region)
+    let acc = crate::modules::auth_file::import_from_auth_file_checked_for(region)
+        .map_err(|mismatch| mismatch.message())?
         .ok_or("未读取到本地 WorkBuddy 登录信息")?;
     let saved = save_collected_account_for(region, acc).map_err(|e| e.to_string())?;
     Ok(account_meta(&saved))
