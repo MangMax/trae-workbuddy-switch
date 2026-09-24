@@ -3,7 +3,6 @@
 **WorkBuddy / TraeWork 多账号管理工具**（webui 形态）：启动本地服务后用浏览器操作，能力与桌面 App 一致。
 
 > 桌面 App（Tauri）请从 [GitHub Releases](https://github.com/MangMax/trae-workbuddy-switch/releases/latest) 下载安装包。
-> 在线只读演示：<https://mangmax.github.io/trae-workbuddy-switch/>
 
 > **本包（`@mangmax/buddy-switch`）尚未发布到 npm**：下面的安装命令现在还不可用，需要 webui 形态请先按仓库 README 从源码构建。
 > 发布后再以本页命令为准。

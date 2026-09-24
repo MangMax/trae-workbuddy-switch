@@ -21,7 +21,7 @@
 | --- | --- | --- |
 | **桌面 App** | 从 [GitHub Releases](https://github.com/MangMax/trae-workbuddy-switch/releases/latest) 下载安装包 | Tauri 打包，推荐日常使用 |
 | **webui（浏览器）** | 从源码构建，见 [webui 形态](#webui-形态源码构建) | 与桌面 App 同一份前端产物，走本地 HTTP 通道 |
-| **在线演示** | [GitHub Pages](https://mangmax.github.io/trae-workbuddy-switch/) | 只读演示；账号、积分与请求记录均为虚构数据，所有业务操作已禁用 |
+| **只读演示** | 本地执行 `npm run build:demo` 生成 | 账号、积分与请求记录均为虚构数据，所有业务操作已禁用 |
 
 > **暂未提供 npm 安装**：npm 包 `@mangmax/buddy-switch` 尚未发布，`npm i -g …` 还装不到它。
 > 需要 webui 形态请按下方[从源码构建](#webui-形态源码构建)；发布后会在这里补上安装命令。

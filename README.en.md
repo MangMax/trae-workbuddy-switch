@@ -21,7 +21,7 @@ One interface, three forms:
 | --- | --- | --- |
 | **Desktop app** | Download the installer from [GitHub Releases](https://github.com/MangMax/trae-workbuddy-switch/releases/latest) | Packaged with Tauri; recommended for daily use |
 | **webui (browser)** | Build from source, see [webui form](#webui-form-build-from-source) | The same frontend bundle as the desktop app, served over a local HTTP channel |
-| **Online demo** | [GitHub Pages](https://mangmax.github.io/trae-workbuddy-switch/) | Read-only demo; accounts, credits and request records are fictional data and all business actions are disabled |
+| **Read-only demo** | Generated locally via `npm run build:demo` | Accounts, credits and request records are fictional data and all business actions are disabled |
 
 > **No npm distribution yet**: the npm package `@mangmax/buddy-switch` has not been published, so `npm i -g …` will not install it yet.
 > For the webui form, follow [Build from source](#webui-form-build-from-source) below; the install command will be added here once it is published.

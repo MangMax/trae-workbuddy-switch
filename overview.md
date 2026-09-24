@@ -20,7 +20,7 @@
 - **消除 `/api/sessions` 空洞断言**：新增 `sessions_route_returns_seeded_session_rows`，用 `rusqlite` 播种真实 `workbuddy.db`（含 `custom_title` 覆盖、`is_playground`、软删除、跨账号、`claw` 工作区、以及「有/无正文 jsonl → `hasHistory`」等分支）与认证文件，断言**恰好**返回应返回的两条及其字段值、排序与逐项键集合。切断 `uid → sessions 表` 映射即变红。
 - **修复前端产物目录冲突（`dist` 双用途陷阱）**：`npm run build`（WebUI/Tauri，Vite `base=/`）与 `npm run build:demo`（GitHub Pages 演示，`base=/trae-workbuddy-switch/`）原本**都输出到 `dist/`**，而 `dist/` 被三处消费：`rust-embed`（`crates/buddy-switch-server`）、Tauri `frontendDist`、`scripts/fix-app.sh`。一旦编译期 `dist/` 是演示构建，`index.html` 会请求 `/workbuddy-switch/assets/*`（embed 中不存在）→ 回退成 HTML → 浏览器模块脚本 MIME 校验失败（实测控制台：`Failed to load module script: … responded with a MIME type of "text/html"`）→ **webui 与桌面端双双空白页**（实测 `#root` 子节点数为 0）。现已把演示构建**分流**到 `dist-demo/`：
   - `package.json`：`build:demo` 增加 `--outDir dist-demo`；`vite.config.ts` 记录该输出目录约定。
-  - `.github/workflows/pages.yml`：Pages 上传路径改为 `dist-demo`。
+  - `.github/workflows/pages.yml`：Pages 上传路径改为 `dist-demo`（该 workflow 后续已随私人维护版移除，演示构建改由本地 `npm run build:demo` 执行）。
   - `.gitignore`：新增 `dist-*`，避免各类本地实验产物被纳入版本。
   - 实测确认：WebUI 构建写 `dist`（`/assets/index-*.js`），演示构建写 `dist-demo`（`/trae-workbuddy-switch/assets/index-*.js`），且**演示构建前后 `dist/index.html` 的 SHA256 完全不变**。
 - **新增构建产物一致性护栏（回归测试）**：`embedded_index_html_references_only_embedded_assets` 断言内嵌 `index.html` 引用的**每个根绝对资源**都能在 embed 中命中，配套 `asset_refs_in`（提取器）与 `embedded_index_html_is_servable_at_root_and_index`。它把上述白屏事故变成测试期可见的错误——把演示构建塞回 `dist/` 后该测试立即变红并给出可执行提示。**server 测试 16 → 19。**
