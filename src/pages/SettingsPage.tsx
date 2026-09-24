@@ -995,7 +995,16 @@ function GatewaySettingsCard() {
   async function persist(next: Partial<GatewayConfig>) {
     setSaving(true);
     try {
-      await saveConfig({ ...config, ...next });
+      // 配置保存与监听重启分两级报告：保存失败（throw）是真正的失败；
+      // listenError 非空表示配置已保存、仅监听启动失败（端口被占/保留段），
+      // 重启 App 后即生效 —— 不能笼统地报「保存失败」误导用户以为改不了。
+      const listenError = await saveConfig({ ...config, ...next });
+      if (listenError) {
+        toast.warning("配置已保存，但网关监听启动失败", {
+          description: listenError,
+          duration: 12000,
+        });
+      }
     } catch (e) {
       toast.error("保存失败", { description: api.asError(e) });
     } finally {

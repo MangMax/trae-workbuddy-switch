@@ -18,6 +18,8 @@ target/
 src-tauri/target/
 # 桌面版 release 构建使用的独立 target 目录（不干扰运行中的服务进程）
 src-tauri/target-desktop/
+# 测试时用 CARGO_TARGET_DIR 生成的根级独立 target 目录
+target-desktop/
 
 # npm 包 postinstall 下载的平台二进制
 npm/bin/buddy-switch-*

@@ -1028,15 +1028,20 @@ async fn api_save_gateway_config(Json(body): Json<Value>) -> Response {
     *state.config.write().await = config.clone();
     state.log.set_keep(config.log_keep);
     state.log.set_log_bodies(config.log_bodies);
-    let addr = match crate::gateway_host::apply().await {
-        Ok(addr) => addr,
-        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    // 保存与应用分两级报告（与桌面端 save_gateway_config 一致）：配置落盘成功后，
+    // 重启监听可能因端口被占/系统保留段而失败。原先整体返回 400，前端弹「保存失败」，
+    // 但配置其实已保存 —— 现在监听失败也返回 200，由 listen_error 携带原因。
+    let (addr, listen_error) = match crate::gateway_host::apply().await {
+        Ok(addr) => (addr, None),
+        Err(error) => (None, Some(error)),
     };
     json_ok(json!({
         "ok": true,
+        "saved": true,
         "config": config,
         "running": addr.is_some(),
         "addr": addr,
+        "listen_error": listen_error,
     }))
 }
 

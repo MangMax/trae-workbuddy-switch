@@ -155,7 +155,11 @@ pub async fn spawn_listener_with_state(state: GatewayState) -> anyhow::Result<Ga
 
     let addr = SocketAddr::new(ip, port);
     let listener = TcpListener::bind(addr).await.map_err(|error| {
-        anyhow::anyhow!("无法监听 {addr}：端口可能被占用或不可用（{error}）。请在设置中改用其他端口。")
+        anyhow::anyhow!(
+            "无法监听 {addr}：端口被占用或不可用（{error}）。常见原因：另一个 BuddySwitch \
+             实例正在运行、或端口落在 Windows 系统保留端口段（可用 `netsh interface ipv4 \
+             show excludedportrange protocol=tcp` 查看）。请在设置中改用其他端口。"
+        )
     })?;
     let local = listener.local_addr().unwrap_or(addr);
 

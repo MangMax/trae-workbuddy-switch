@@ -925,6 +925,11 @@ pub fn get_gateway_config() -> Value {
 }
 
 /// POST /api/gateway/config —— 保存配置并应用（启动/重启独立监听）。
+///
+/// 保存与应用分两级报告（2026-09-24）：配置落盘 + 写回共享状态**成功后**，重启监听
+/// 可能因端口被占/系统保留段而失败。原先这种情况整体返回 Err，前端弹「保存失败」，
+/// 但配置其实已经保存（重启 App 即生效）——用户被误导成「改不了端口」。
+/// 现在监听失败也返回 ok，由 `listen_error` 字段携带原因，前端区分提示。
 #[tauri::command]
 pub async fn save_gateway_config(app: tauri::AppHandle, config: Value) -> Result<Value, String> {
     let submitted = config.get("config").cloned().unwrap_or(config);
@@ -938,12 +943,17 @@ pub async fn save_gateway_config(app: tauri::AppHandle, config: Value) -> Result
     state.log.set_log_bodies(parsed.log_bodies);
 
     let runtime = app.state::<gateway::GatewayRuntime>();
-    let addr = runtime.apply().await?;
+    let (addr, listen_error) = match runtime.apply().await {
+        Ok(addr) => (addr, None),
+        Err(error) => (None, Some(error)),
+    };
     Ok(json!({
         "ok": true,
+        "saved": true,
         "config": parsed,
         "running": addr.is_some(),
         "addr": addr,
+        "listen_error": listen_error,
     }))
 }
 

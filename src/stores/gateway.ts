@@ -54,7 +54,8 @@ interface GatewayState {
   lastLoadedAt: number;
 
   loadConfig: () => Promise<void>;
-  saveConfig: (config: GatewayConfig) => Promise<void>;
+  /** 返回监听启动失败原因；null 表示配置保存且监听正常（配置保存失败时直接 throw）。 */
+  saveConfig: (config: GatewayConfig) => Promise<string | null>;
   refreshStatus: () => Promise<void>;
   loadKeys: () => Promise<void>;
   createKey: (name: string, region: Region) => Promise<CreateApiKeyResult>;
@@ -94,9 +95,11 @@ export const useGatewayStore = create<GatewayState>((set, get) => ({
   async saveConfig(config) {
     set({ saving: true });
     try {
-      const saved = await api.saveGatewayConfig(config);
-      set({ config: normalizeGatewayConfig(saved), error: null });
+      const result = await api.saveGatewayConfig(config);
+      set({ config: normalizeGatewayConfig(result.config), error: null });
       await get().refreshStatus();
+      // 配置已保存但监听重启失败：由调用方（设置页）以 warning 呈现原因。
+      return result.listen_error;
     } finally {
       set({ saving: false });
     }

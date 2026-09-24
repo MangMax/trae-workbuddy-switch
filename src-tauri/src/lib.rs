@@ -94,6 +94,16 @@ fn spawn_background_task(task: BackgroundTask) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let mut builder = tauri::Builder::default()
+        // 单实例保护必须**最先**注册（官方约束）：第二实例启动时立即退出，
+        // 由回调聚焦已有窗口。否则两个实例并存，后启动的网关绑定同端口必然
+        // 失败（报「端口被占用」），且两者各自写同一份配置/账号库互相踩踏。
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_notification::init())

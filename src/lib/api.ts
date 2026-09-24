@@ -682,8 +682,34 @@ export function getGatewayConfig(): Promise<GatewayConfig> {
   return call("get_gateway_config");
 }
 
-export function saveGatewayConfig(config: GatewayConfig): Promise<GatewayConfig> {
-  return call("save_gateway_config", { config: config as unknown as Record<string, unknown> });
+/** 保存网关配置的结果：保存与应用分两级报告。 */
+export interface GatewayConfigSaveResult {
+  /** 归一化后的完整配置（即后端确认落盘的值）。 */
+  config: GatewayConfig;
+  /** 重启后独立监听是否在运行。 */
+  running: boolean;
+  /** 实际监听地址（running 时才有）。 */
+  addr: string | null;
+  /** 监听启动失败的原因（running=false 时才有；配置本身已保存）。 */
+  listen_error: string | null;
+}
+
+export function saveGatewayConfig(config: GatewayConfig): Promise<GatewayConfigSaveResult> {
+  return call("save_gateway_config", { config: config as unknown as Record<string, unknown> }).then(
+    // 响应形状为 {ok, saved, config, running, addr, listen_error}；历史上曾有
+    // 直接把整个响应当 config 归一化的 bug —— 所有字段回落默认值，UI 上表现为
+    // 「改了端口却弹回 57891」。这里显式解包 config 字段。
+    (raw) => {
+      const record = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+      const inner = (record.config ?? record) as GatewayConfig;
+      return {
+        config: inner,
+        running: Boolean(record.running),
+        addr: (record.addr as string | null) ?? null,
+        listen_error: (record.listen_error as string | null) ?? null,
+      };
+    },
+  );
 }
 
 export function gatewayStatus(): Promise<GatewayStatus> {
