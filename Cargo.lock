@@ -518,6 +518,7 @@ version = "2026.9.211636"
 dependencies = [
  "buddy-switch-core",
  "buddy-switch-gateway",
+ "indexmap 1.9.3",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",

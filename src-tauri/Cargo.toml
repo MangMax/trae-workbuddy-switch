@@ -24,11 +24,22 @@ custom-protocol = ["tauri/custom-protocol"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+# tauri-build → schemars 0.8.22（preserve_order）→ indexmap 1.9.3 同样存在
+# E0107 问题；resolver v2 下 build-dependencies 的 features 与 normal
+# dependencies 不合并，因此这里也要显式启用 std（见下方 normal 依赖处的注释）。
+indexmap = { version = "1.9.3", features = ["std"] }
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-opener = "2"
 tauri-plugin-updater = "2"
+# 显式依赖 indexmap 1.x 并强制启用 std feature（该版本无 default feature）：
+# tauri 依赖链里的 schemars 0.8.22（preserve_order）按 `IndexMap<K, V>` 两泛型
+# 参数使用它，该写法要求 `S` 参数有默认值，而默认值藏在 indexmap 的
+# `#[cfg(has_std)]` 分支里。若依赖图中无人启用 std，其 build script 会在编译期
+# 运行时探测 std 并可能失败，导致 schemars 编译报 E0107。启用 std 让 build
+# script 走无需探测的稳定分支。
+indexmap = { version = "1.9.3", features = ["std"] }
 buddy-switch-core = { path = "../crates/buddy-switch-core" }
 buddy-switch-gateway = { path = "../crates/buddy-switch-gateway" }
 serde = { version = "1", features = ["derive"] }
