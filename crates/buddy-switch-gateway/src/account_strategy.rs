@@ -1,4 +1,4 @@
-//! 账号选择策略（`current` / `pinned` / `max_credits`；P0-8）。
+//! 账号选择策略（`current` / `pinned` / `max_credits` / `smart_rotate`；P0-8）。
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -24,6 +24,13 @@ pub enum AccountStrategy {
     Pinned { account_id: String },
     /// 积分最多：在账号库中选剩余积分最高者。
     MaxCredits,
+    /// 智能轮换：在全部账号间自动轮换，限流/冷却/熔断的账号自动避开。
+    ///
+    /// 选号**完全交给账号池治理**（[`crate::pool`]：冷却熔断、模型级限流、
+    /// 在途上限、实测成本、防惊群、全冷却兜底），因此本变体不做单点决策——
+    /// relay 在进入策略回落前会短路，[`AccountSelector::select`] 的对应分支
+    /// 只是穷尽 match 的兜底（语义等价于「账号库为空」）。
+    SmartRotate,
 }
 
 impl Default for AccountStrategy {
@@ -99,6 +106,11 @@ impl AccountSelector {
                 ensure_region(&account, region)?;
                 Ok(account)
             }
+            AccountStrategy::SmartRotate => {
+                // 见变体文档：选号由账号池接管，relay 不会走到这里；语义上等价
+                // 「池内无可用账号」——单点选择器没有冷却/熔断信息，选了也不智能。
+                Err(GatewayError::NoCredential { region })
+            }
         }
     }
 }
@@ -106,9 +118,9 @@ impl AccountSelector {
 /// 构造某 region 的策略展示对象：`{ region, strategy, selected, error?, note? }`。
 ///
 /// `selected` 只做**本地**解析（`current` 读认证文件 / `pinned` 查账号库），
-/// 因此该接口恒定快速、无网络请求。`max_credits` 需要按实时积分对**全部**账号
-/// 逐个发起请求择优，不适合在管理页轮询时预取，故返回 `selected: null` 并附
-/// `note` 说明，由前端提示「每次请求时实时择优」。
+/// 因此该接口恒定快速、无网络请求。`max_credits` / `smart_rotate` 的择优都发生在
+/// **每次请求时**（前者按实时积分、后者由账号池治理），不适合在管理页轮询时预取，
+/// 故返回 `selected: null` 并附 `note` 说明，由前端提示。
 pub async fn describe_strategy(region: Region, strategy: &AccountStrategy) -> Value {
     let mut described = serde_json::json!({
         "region": region,
@@ -119,6 +131,11 @@ pub async fn describe_strategy(region: Region, strategy: &AccountStrategy) -> Va
         AccountStrategy::MaxCredits => {
             described["note"] =
                 serde_json::json!("max_credits 在每次请求时按实时积分择优，此处不预取（避免 N 次网络请求）");
+        }
+        AccountStrategy::SmartRotate => {
+            described["note"] = serde_json::json!(
+                "smart_rotate 在每次请求时由账号池择优（冷却/熔断/模型级限流/在途/实测成本），此处不预取"
+            );
         }
         _ => match AccountSelector.select(region, strategy).await {
             Ok(account) => {
@@ -217,6 +234,13 @@ mod tests {
             serde_json::to_value(AccountStrategy::MaxCredits).unwrap(),
             json!({"kind": "max_credits"})
         );
+        assert_eq!(
+            serde_json::to_value(AccountStrategy::SmartRotate).unwrap(),
+            json!({"kind": "smart_rotate"})
+        );
+
+        let parsed: AccountStrategy = serde_json::from_value(json!({"kind": "smart_rotate"})).unwrap();
+        assert!(matches!(parsed, AccountStrategy::SmartRotate));
 
         let parsed: AccountStrategy = serde_json::from_value(json!({"kind": "pinned", "account_id": "x"})).unwrap();
         assert!(matches!(parsed, AccountStrategy::Pinned { account_id } if account_id == "x"));

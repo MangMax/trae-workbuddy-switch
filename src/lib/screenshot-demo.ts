@@ -524,7 +524,7 @@ function demoStrategyMap(): AccountStrategyMap {
   const demoAccounts = hydratedAccounts();
   return {
     cn: { region: "cn", strategy: { kind: "current" }, selected: demoAccounts[0] },
-    global: { region: "global", strategy: { kind: "max_credits" }, selected: null, note: "请求时实时择优" },
+    global: { region: "global", strategy: { kind: "smart_rotate" }, selected: null, note: "每次请求时由账号池择优" },
   };
 }
 
