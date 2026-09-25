@@ -363,6 +363,13 @@ jobs:
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
+          # 与 updater 签名密钥同一策略：未配置时**跳过而非失败**——
+          # npm 发布与桌面 Release 互不依赖（见 publish-platform job 注释），
+          # 没配 NPM_TOKEN 的仓库不应被 npm job 拖成整次构建红叉。
+          if [ -z "$NPM_TOKEN" ]; then
+            echo "::warning::未配置 secret NPM_TOKEN：跳过 npm 平台包发布（桌面 Release 照常产出）"
+            exit 0
+          fi
           # 先让打包脚本**落盘**再读回：tag 是唯一真相，
           # 不自己拼版本号（拼出来的会和产物名/主包 optionalDependencies 对不上）。
           sh scripts/stamp-version.sh --tag "${{ github.ref_name }}"
@@ -394,6 +401,11 @@ jobs:
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
+          # 与平台包同一策略：未配置 NPM_TOKEN 时跳过而非失败。
+          if [ -z "$NPM_TOKEN" ]; then
+            echo "::warning::未配置 secret NPM_TOKEN：跳过 npm 主包发布"
+            exit 0
+          fi
           # 主包的 version 与它的 optionalDependencies（各平台包）必须**同时**等于本次 tag，
           # 否则用户装到的主包会去找一个不存在的平台包版本。
           # 原先这一步没有落盘版本戳 —— tag 路径从未真正跑过，所以一直没暴露。

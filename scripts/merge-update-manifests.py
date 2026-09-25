@@ -181,8 +181,15 @@ def main() -> int:
     directory = Path(sys.argv[1] if len(sys.argv) > 1 else ".")
     latest = merge_directory(directory)
     if latest is None:
-        print("merge-update-manifests: 未找到可合并的 latest-*.json", file=sys.stderr)
-        return 1
+        # 空清单是**合法状态**，不是错误：updater 签名密钥未配置时（见 build.yml
+        # 的 Preflight），各平台本来就不产出 latest-*.json，桌面安装包照常发布。
+        # 真正该拦的场景（签名已启用却缺清单）已在 build job 的
+        # `Generate updater manifest` 步骤里用 `test -f` 硬断言拦截。
+        print(
+            "merge-update-manifests: 未找到可合并的 latest-*.json（updater 签名被跳过时属正常），继续发布",
+            file=sys.stderr,
+        )
+        return 0
     print(f"merge-update-manifests: 已生成 {latest}")
     return 0
 
