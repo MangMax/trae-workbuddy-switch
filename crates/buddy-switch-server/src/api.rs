@@ -138,6 +138,7 @@ fn api_routes() -> Router {
             get(api_gateway_config).post(api_save_gateway_config),
         )
         .route("/api/gateway/status", get(api_gateway_status))
+        .route("/api/gateway/pool", get(api_gateway_pool))
         .route(
             "/api/gateway/keys",
             get(api_gateway_list_keys).post(api_gateway_create_key),
@@ -1057,6 +1058,17 @@ async fn api_gateway_status() -> Response {
         Ok(value) => json_ok(value),
         Err(error) => json_err(error.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
     }
+}
+
+/// GET /api/gateway/pool —— 账号池快照（各账号限流/冷却治理状态与恢复时间）。
+///
+/// 与桌面端 `gateway_pool_status` 命令同构：账号管理页按 uid 逐账号展示
+/// **模型级限流恢复时间**（`rate_limited_models`，上游 429+6004 时按上游墙钟记录）。
+async fn api_gateway_pool() -> Response {
+    let state = crate::gateway_host::shared_state();
+    let now_ms = buddy_switch_gateway::timeutil::now_ms();
+    let snapshot = { state.pool.read().await.snapshot(now_ms) };
+    json_ok(snapshot)
 }
 
 async fn api_gateway_list_keys() -> Response {

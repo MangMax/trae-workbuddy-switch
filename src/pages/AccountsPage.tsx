@@ -46,6 +46,7 @@ import type {
   CodeBuddyCliStatus,
   CodeBuddyCnIdeStatus,
   CreditExpiry,
+  GatewayPoolAccount,
   Region,
   TravelConfig,
   TravelStatus,
@@ -385,6 +386,33 @@ function RegionPanel({ region }: { region: Region }) {
       cancelled = true;
     };
   }, [accounts, region]);
+
+  // 网关账号池快照：按 uid 对齐账号卡片，展示模型级限流恢复时间。
+  // 30 秒轮询足够——恢复时间精度是分钟级；快照不可用（网关未启动）时静默，
+  // 卡片只是不显示恢复徽标，不影响其余功能。
+  const [poolMap, setPoolMap] = useState<Record<string, GatewayPoolAccount>>({});
+  useEffect(() => {
+    let cancelled = false;
+    async function loadPool() {
+      try {
+        const snapshot = await api.getGatewayPoolStatus();
+        if (cancelled) return;
+        const next: Record<string, GatewayPoolAccount> = {};
+        for (const entry of snapshot.accounts ?? []) {
+          if (entry.uid) next[entry.uid] = entry;
+        }
+        setPoolMap(next);
+      } catch {
+        /* 网关未启动 / 演示模式无数据：静默降级 */
+      }
+    }
+    void loadPool();
+    const timer = window.setInterval(() => void loadPool(), 30_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, []);
 
   async function loadTravelMap(accountIds: string[], isStale?: () => boolean) {
     const next = await fetchTravelMap(accountIds, region, isStale);
@@ -973,6 +1001,7 @@ function RegionPanel({ region }: { region: Region }) {
                     codebuddyCnIdeBusy={codebuddyCnIdeSwitchingId !== null}
                     codebuddyCnIdeLoading={codebuddyCnIdeSwitchingId === a.id}
                     onSwitchCodebuddyCnIde={onSwitchCodebuddyCnIde}
+                    poolAccount={a.uid ? poolMap[a.uid] : undefined}
                     featuresDisabled={false}
                   />
                 ))}

@@ -667,3 +667,56 @@ export interface GatewayLogEntry {
   stream: boolean;
 }
 
+/** 模型级限流条目（429 + 6004/IsModelRateLimit 时按上游重置墙钟记录）。 */
+export interface GatewayModelRateLimit {
+  model: string;
+  /** 恢复截止（毫秒时间戳）。 */
+  until_ms: number;
+  /** 上游声明的重置时刻（毫秒）；未声明为 0。 */
+  reset_at_ms: number;
+  reason: string;
+}
+
+/**
+ * 网关账号池内单账号的治理快照（`gateway_pool_status`；snake_case 与 Rust 对齐）。
+ *
+ * 限流恢复时间是**模型级**的：`rate_limited_models` 只含触发限流的模型及其恢复
+ * 截止；账号级冷却（不带 6004 的 429 / 402 / 404 等）另见 `cooling` / `until_ms`。
+ */
+export interface GatewayPoolAccount {
+  uid: string;
+  realm?: "cn" | "global" | "unknown";
+  nickname?: string;
+  credits?: number;
+  /** 账号级冷却中（`now < until_ms`）。 */
+  cooling?: boolean;
+  /** 冷却类别：hard=余额不足（至次日 04:00），soft=限流/404/WAF。 */
+  cool_kind?: "hard" | "soft";
+  /** 账号级冷却剩余秒数（>0 时存在）。 */
+  cool_remaining_sec?: number;
+  /** 账号级冷却恢复截止（毫秒时间戳）。 */
+  until_ms?: number;
+  reason?: string;
+  soft_streak?: number;
+  disabled?: boolean;
+  disabled_reason?: string;
+  in_flight?: number;
+  breaker_until_ms?: number;
+  /** 模型级限流表（恢复截止在未来才有效，过期条目前端应过滤）。 */
+  rate_limited_models?: GatewayModelRateLimit[];
+  success_count?: number;
+  err_total?: number;
+  last_success_ms?: number;
+  last_err_ms?: number;
+}
+
+/** 网关账号池快照（`gateway_pool_status` 响应）。 */
+export interface GatewayPoolSnapshot {
+  accounts?: GatewayPoolAccount[];
+  total?: number;
+  healthy?: number;
+  cooling?: number;
+  disabled?: number;
+  in_flight_full?: number;
+}
+
