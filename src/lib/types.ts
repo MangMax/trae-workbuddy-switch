@@ -638,7 +638,9 @@ export interface CatalogSnapshot {
 export type AccountStrategy =
   | { kind: "current" }
   | { kind: "pinned"; account_id: string }
-  | { kind: "max_credits" };
+  | { kind: "max_credits" }
+  /** 智能轮换：选号由网关账号池治理（冷却/熔断/模型级限流/在途/实测成本择优）。 */
+  | { kind: "smart_rotate" };
 
 /** 某 region 的策略 + 当前选用账号（selected 与 AccountMeta 同构）。 */
 export interface AccountStrategyView {

@@ -25,7 +25,7 @@ use buddy_switch_core::modules::account;
 use buddy_switch_core::modules::region::Region;
 use buddy_switch_core::modules::upstream::UpstreamChatResult;
 
-use crate::account_strategy::AccountSelector;
+use crate::account_strategy::{AccountSelector, AccountStrategy};
 use crate::error::GatewayError;
 use crate::outbound::{self, DegradeGate, OutboundMeta};
 use crate::pool::{classify_event, RealmTag, UpstreamEvent};
@@ -273,7 +273,15 @@ async fn select_account(
     }
 
     // 回落：策略模块（current / pinned / max_credits）。
+    //
+    // smart_rotate 不落回单点策略：选号完全交给账号池治理（上方 pick_account 已按
+    // 冷却/熔断/模型级限流/在途/实测成本择优，账号库在每次 relay 开头已全量同步）。
+    // 池都给不出账号时说明账号库确实为空，单点策略也不会有不同结果，直接放弃——
+    // 否则「智能轮换」会在全冷却时退化成反复强试同一个策略账号。
     let strategy = state.strategy_for(region).await;
+    if matches!(strategy, AccountStrategy::SmartRotate) {
+        return None;
+    }
     let selector = AccountSelector;
     match selector.select(region, &strategy).await {
         Ok(account_value) => {

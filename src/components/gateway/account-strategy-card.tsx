@@ -15,6 +15,7 @@ const STRATEGY_OPTIONS = [
   { value: "current", label: "当前登录账号" },
   { value: "pinned", label: "指定账号" },
   { value: "max_credits", label: "积分最充裕" },
+  { value: "smart_rotate", label: "智能轮换" },
 ] as const;
 
 function accountLabel(account: AccountMeta): string {
@@ -38,9 +39,9 @@ export function AccountStrategyCard({ className }: { className?: string }) {
         <p>当前登录账号：跟随 App 内切换，最省心（推荐）</p>
         <p>指定账号：固定用某个号，适合无人值守</p>
         <p>积分最充裕：自动挑剩余最多的有效账号</p>
-        <p className="mt-1 text-foreground/70">
-          智能轮换：遇到 429 限流会自动记录恢复时间（按模型独立计时）并换号重试，
-          恢复前请求转发到其余可用账号；恢复时间在账号管理页各账号卡片上展示。
+        <p>
+          智能轮换：在全部账号间自动轮换，遇 429 限流按模型记录恢复时间并自动避开，
+          请求转发到其余可用账号；恢复时间见账号管理页各账号卡片。
         </p>
       </div>
     </Card>
@@ -81,6 +82,10 @@ function RegionStrategyRow({ region }: { region: Region }) {
     }
     if (next === "max_credits") {
       void persist({ kind: "max_credits" });
+      return;
+    }
+    if (next === "smart_rotate") {
+      void persist({ kind: "smart_rotate" });
       return;
     }
     void persist({ kind: "current" });
