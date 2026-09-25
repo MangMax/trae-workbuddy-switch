@@ -216,6 +216,7 @@ pub fn run() {
             commands::get_gateway_config,
             commands::save_gateway_config,
             commands::gateway_status,
+            commands::gateway_pool_status,
             commands::list_api_keys,
             commands::create_api_key,
             commands::revoke_api_key,

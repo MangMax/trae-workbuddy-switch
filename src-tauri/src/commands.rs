@@ -972,6 +972,20 @@ pub fn gateway_status(app: tauri::AppHandle) -> Value {
     serde_json::to_value(view).unwrap_or(Value::Null)
 }
 
+/// GET /api/gateway/pool —— 账号池快照（各账号限流/冷却治理状态）。
+///
+/// 「遇到 429 自动记录恢复时间并换号」的可见化出口：上游 429（含模型级限流 6004）
+/// 时，池会把恢复截止写入 `until_ms` / `model_cooldowns`（优先采用上游声明的重置
+/// 墙钟）。账号管理页据此按 uid 逐账号展示**模型级限流恢复时间**。网关未启动时
+/// 读共享状态里最近一次落盘的治理状态，依然可用。
+#[tauri::command]
+pub async fn gateway_pool_status() -> Value {
+    let state = gateway::shared_state();
+    let now_ms = buddy_switch_gateway::timeutil::now_ms();
+    let snapshot = { state.pool.read().await.snapshot(now_ms) };
+    snapshot
+}
+
 /// GET /api/gateway/keys —— Key 列表（脱敏）。
 #[tauri::command]
 pub fn list_api_keys() -> Value {

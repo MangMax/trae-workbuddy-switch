@@ -1,4 +1,4 @@
-import { ArrowRight, Check, CircleCheck, Clock3, Coins, Ellipsis, Loader2, PlaneTakeoff, RefreshCw, Sparkles, Star, Trash2 } from "lucide-react";
+import { ArrowRight, Check, CircleCheck, Clock3, Coins, Ellipsis, Loader2, PlaneTakeoff, RefreshCw, Sparkles, Star, Timer, Trash2 } from "lucide-react";
 import { useState } from "react";
 
 import { Badge } from "@/components/ui/badge";
@@ -16,7 +16,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { CodeBuddyCnIdeMark, CodeBuddyMark, WorkBuddyMark } from "@/components/product-marks";
 import { cn } from "@/lib/utils";
 import { demoModeEnabled } from "@/lib/demo-mode";
-import type { AccountMeta, CreditExpiry, CreditResource, TravelStatus } from "@/lib/types";
+import type { AccountMeta, CreditExpiry, CreditResource, GatewayPoolAccount, TravelStatus } from "@/lib/types";
 
 const AVATAR_TONES = [
   "bg-emerald-100 text-emerald-800",
@@ -60,6 +60,13 @@ function formatFullDate(ts: number | null): string {
 
 function formatCreditUpdatedAt(ts: number | undefined): string {
   if (!ts) return "—";
+  const date = new Date(ts);
+  if (Number.isNaN(date.getTime())) return "—";
+  return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+}
+
+/** 把恢复截止时间戳格式化为 "HH:mm"。 */
+function formatRecoverClock(ts: number): string {
   const date = new Date(ts);
   if (Number.isNaN(date.getTime())) return "—";
   return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
@@ -194,6 +201,11 @@ interface Props {
   featuresDisabled?: boolean;
   /** 紧凑模式：头部缩成一条、按钮图标化、无 footer */
   compact?: boolean;
+  /**
+   * 网关账号池内该账号（按 uid 匹配）的治理快照。
+   * 用于展示**模型级限流恢复时间**（429+6004 按上游重置墙钟记录）与账号级冷却。
+   */
+  poolAccount?: GatewayPoolAccount;
 }
 
 function ProductCurrentState({ product, compact = false }: { product: "workbuddy" | "codebuddy" | "codebuddy-cn"; compact?: boolean }) {
@@ -225,7 +237,7 @@ function ProductCurrentState({ product, compact = false }: { product: "workbuddy
   );
 }
 
-export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch, todayCheckedIn, travelStatus, credit, creditLoading, creditUpdatedAt, creditPriority, workbuddyActive, codebuddyCliConfigured, codebuddyCliActive, codebuddyCliBusy, onSwitchCodebuddyCli, codebuddyCliLoading, codebuddyCnIdeAvailable, codebuddyCnIdeActive, codebuddyCnIdeBusy, codebuddyCnIdeLoading, onSwitchCodebuddyCnIde, featuresDisabled = true, compact = false }: Props) {
+export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch, todayCheckedIn, travelStatus, credit, creditLoading, creditUpdatedAt, creditPriority, workbuddyActive, codebuddyCliConfigured, codebuddyCliActive, codebuddyCliBusy, onSwitchCodebuddyCli, codebuddyCliLoading, codebuddyCnIdeAvailable, codebuddyCnIdeActive, codebuddyCnIdeBusy, codebuddyCnIdeLoading, onSwitchCodebuddyCnIde, featuresDisabled = true, compact = false, poolAccount }: Props) {
   const [resourcesOpen, setResourcesOpen] = useState(false);
   const name = account.nickname || account.uid || "未命名账号";
   const expired = typeof account.expiresAt === "number" && account.expiresAt < Date.now();
@@ -246,12 +258,58 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
 
   const activeProductCount = [workbuddyActive, codebuddyCliActive, codebuddyCnIdeActive].filter(Boolean).length;
 
+  /** 仍在生效的模型级限流（按恢复时刻升序；过期条目过滤掉）。 */
+  const modelRateLimits = (poolAccount?.rate_limited_models ?? [])
+    .filter((limit) => limit.until_ms > Date.now())
+    .sort((left, right) => left.until_ms - right.until_ms);
+  /** 账号级冷却恢复截止（429 不带 6004 / 402 硬冷却等；模型级限流不算账号冷却）。 */
+  const accountCoolingUntil =
+    poolAccount?.cooling && typeof poolAccount.until_ms === "number" && poolAccount.until_ms > Date.now()
+      ? poolAccount.until_ms
+      : null;
+
   const statusChips = (
     <>
       {todayCheckedIn !== undefined && (
         <Badge variant={todayCheckedIn ? "success" : "secondary"} className={cn(chipClass, !todayCheckedIn && "text-muted-foreground")}><CircleCheck /> {todayCheckedIn ? "已签到" : "未签到"}</Badge>
       )}
       {travelChip(travelStatus)}
+      {modelRateLimits.length > 0 && (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Badge variant="warning" className={chipClass}>
+              <Timer />
+              {modelRateLimits.length > 1
+                ? `${modelRateLimits.length} 个模型限流中`
+                : `${modelRateLimits[0].model} 限流 ${formatRecoverClock(modelRateLimits[0].until_ms)} 恢复`}
+            </Badge>
+          </TooltipTrigger>
+          <TooltipContent side="top" className="max-w-72">
+            <p className="font-medium">限流恢复时间（按模型独立记录）</p>
+            <ul className="mt-1 space-y-0.5">
+              {modelRateLimits.map((limit) => (
+                <li key={limit.model} className="tabular-nums">
+                  {limit.model}：{formatRecoverClock(limit.until_ms)} 恢复
+                </li>
+              ))}
+            </ul>
+            <p className="mt-1 text-muted-foreground">恢复前该模型的请求会自动转发到其它可用账号，其它模型不受影响。</p>
+          </TooltipContent>
+        </Tooltip>
+      )}
+      {accountCoolingUntil && (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Badge variant="warning" className={chipClass}>
+              <Timer />
+              {poolAccount?.cool_kind === "hard" ? "额度恢复" : "账号冷却"} {formatRecoverClock(accountCoolingUntil)}
+            </Badge>
+          </TooltipTrigger>
+          <TooltipContent side="top">
+            {poolAccount?.reason || "账号级冷却中"}；恢复前请求自动转发到其它可用账号。
+          </TooltipContent>
+        </Tooltip>
+      )}
       {(account.needsRelogin || expired) && <Badge variant="warning" className={chipClass}>{account.needsRelogin ? "需重新登录" : "Token 已过期"}</Badge>}
       {creditPriority && (
         <Tooltip>

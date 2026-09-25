@@ -6,6 +6,10 @@
 //! 轮换语义（对照参考实现 `handler.go` 的轮转循环）：
 //! - 单轮最多尝试 `max_rotate` 次，`tried` 集合保证**同一账号不试第二次**；
 //! - 每次失败按事件类型写入池的冷却/熔断状态，下一次选号自然避开；
+//! - **429 限流的恢复时间是模型级的**：`429 + 6004/IsModelRateLimit` 只冷却触发
+//!   限流的那个模型（`model_cooldowns`，优先采用上游声明的重置墙钟、封顶
+//!   `soft_rate_max`），冷却期内选号自动避开该组合，请求转发到其余可用账号——
+//!   同一账号切到其它模型立即可用；账号级限流（不带 6004）才整体冷却；
 //! - 账号被禁用（12153 三振）时立即跳出——继续重试没有意义；
 //! - 全部失败时返回**最后一个**上游错误（而非第一个），它对用户更有诊断价值。
 //!
@@ -214,6 +218,30 @@ pub async fn relay(
     }))
 }
 
+/// 回落选号的智能轮换判定：返回 `true` 表示应跳过该候选账号。
+///
+/// 跳过情形：
+/// - 本轮已试过（`tried`）——重试必然立刻二次失败；
+/// - 池内有该账号的治理记录，且它对**本次请求的模型**处于限流/冷却/熔断/禁用
+///   （429 + 6004 的恢复时间按模型独立记录，切到其它模型不受影响）。
+///
+/// 池内尚无治理记录（`entry == None`）时放行：首次使用的账号不能凭空拒绝。
+/// 纯函数是为了可测——`select_account` 依赖磁盘上的策略与认证文件，不适合单测。
+fn skip_fallback_candidate(
+    entry: Option<&crate::pool::PoolEntry>,
+    tried: bool,
+    now_ms: i64,
+    model: &str,
+) -> bool {
+    if tried {
+        return true;
+    }
+    match entry {
+        Some(entry) => !entry.healthy_for_request(now_ms, model),
+        None => false,
+    }
+}
+
 /// 选号：优先账号池（有治理状态），池给不出时回落既有策略。
 async fn select_account(
     state: &GatewayState,
@@ -250,8 +278,21 @@ async fn select_account(
     match selector.select(region, &strategy).await {
         Ok(account_value) => {
             let uid = account::get_str(&account_value, "uid").unwrap_or_default();
-            // 池已试过的账号不再重复选择（否则会立刻二次失败）。
-            if !uid.is_empty() && tried.contains(&uid) {
+            if uid.is_empty() {
+                // 无 uid 无法对齐池治理状态，放行（与既有行为一致）。
+                return Some(account_value);
+            }
+            let entry = {
+                let pool = state.pool.read().await;
+                pool.get(&uid).cloned()
+            };
+            let skip = skip_fallback_candidate(
+                entry.as_ref(),
+                tried.contains(&uid),
+                now_ms,
+                model,
+            );
+            if skip {
                 None
             } else {
                 Some(account_value)
@@ -406,12 +447,58 @@ pub fn pool_usage_sink(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pool::PoolEntry;
     use serde_json::json;
 
     #[test]
     fn realm_mapping_covers_both_regions() {
         assert_eq!(realm_of(Region::Cn), RealmTag::Cn);
         assert_eq!(realm_of(Region::Global), RealmTag::Global);
+    }
+
+    #[test]
+    fn fallback_skip_blocks_only_the_rate_limited_model() {
+        // 429 + 6004：模型级限流，恢复截止 5000（上游墙钟优先）。
+        let mut entry = PoolEntry::new("u1");
+        entry.cooldown_model(1000, "glm-5.3", 5000, 60_000, "6004 model rate limit");
+
+        assert!(
+            skip_fallback_candidate(Some(&entry), false, 2000, "glm-5.3"),
+            "限流未恢复的模型必须被跳过"
+        );
+        assert!(
+            !skip_fallback_candidate(Some(&entry), false, 2000, "deepseek-v4-flash"),
+            "切到其它模型时同一账号立即可用"
+        );
+        assert!(
+            !skip_fallback_candidate(Some(&entry), false, 5000, "glm-5.3"),
+            "到达恢复时刻即解冻（边界）"
+        );
+    }
+
+    #[test]
+    fn fallback_skip_blocks_tried_and_account_level_cooling_but_passes_unknown() {
+        let mut soft = PoolEntry::new("u1");
+        // 账号级软冷却（429 不带 6004）：所有模型都不可用。
+        soft.cooldown_soft_until(1000, 60_000, 120_000, "429 rate limit");
+        assert!(
+            skip_fallback_candidate(Some(&soft), false, 2000, "any-model"),
+            "账号级冷却期间该账号整体跳过"
+        );
+
+        let healthy = PoolEntry::new("u2");
+        assert!(
+            skip_fallback_candidate(Some(&healthy), true, 1000, "m"),
+            "本轮已试过的账号必须跳过（与健康与否无关）"
+        );
+        assert!(
+            !skip_fallback_candidate(Some(&healthy), false, 1000, "m"),
+            "健康账号放行"
+        );
+        assert!(
+            !skip_fallback_candidate(None, false, 1000, "m"),
+            "池内无治理记录（首次使用）不得凭空拒绝"
+        );
     }
 
     #[test]

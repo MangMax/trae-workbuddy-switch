@@ -24,6 +24,7 @@ import type {
   MigrateResult,
   GatewayConfig,
   GatewayLogEntry,
+  GatewayPoolSnapshot,
   GatewayStatus,
   GithubConfig,
   ImportPreviewAccount,
@@ -107,7 +108,7 @@ const DEMO_READ_COMMANDS = new Set([
   "get_github_config", "check_update", "get_launch_at_login_enabled", "switch_progress",
   "get_travel_status", "get_auto_travel_config", "get_schedule_config",
   // API 网关只读命令（演示站需返回虚构数据，否则 build:demo 报错）
-  "get_gateway_config", "gateway_status", "list_api_keys", "get_gateway_models",
+  "get_gateway_config", "gateway_status", "gateway_pool_status", "list_api_keys", "get_gateway_models",
   "get_account_strategy", "get_gateway_logs",
   // Trae 分区只读命令（演示站需返回虚构数据，否则 build:demo 报错）。
   // 只登记**只读**命令：写操作（签到 / 增删账号 / 切换 / 重置设备…）一律不进这里，
@@ -196,6 +197,7 @@ const ROUTES: Record<string, Route> = {
   get_gateway_config: { method: "GET", path: "/api/gateway/config" },
   save_gateway_config: { method: "POST", path: "/api/gateway/config" },
   gateway_status: { method: "GET", path: "/api/gateway/status" },
+  gateway_pool_status: { method: "GET", path: "/api/gateway/pool" },
   list_api_keys: { method: "GET", path: "/api/gateway/keys" },
   create_api_key: { method: "POST", path: "/api/gateway/keys" },
   revoke_api_key: { method: "POST", path: "/api/gateway/keys/revoke" },
@@ -714,6 +716,11 @@ export function saveGatewayConfig(config: GatewayConfig): Promise<GatewayConfigS
 
 export function gatewayStatus(): Promise<GatewayStatus> {
   return call("gateway_status");
+}
+
+/** 账号池快照：各账号的限流/冷却治理状态。模型级限流恢复时间见 `rate_limited_models`。 */
+export function getGatewayPoolStatus(): Promise<GatewayPoolSnapshot> {
+  return call("gateway_pool_status");
 }
 
 export function listApiKeys(): Promise<{ keys: ApiKeyRecord[] }> {

@@ -464,6 +464,32 @@ function demoGatewayStatus(): GatewayStatus {
   };
 }
 
+/** 账号池快照（演示）：一个账号带模型级限流恢复时间，其余健康。 */
+function demoGatewayPoolStatus() {
+  const now = Date.now();
+  return {
+    accounts: [
+      {
+        uid: "10001", realm: "cn", nickname: "测试 A", credits: 812,
+        cooling: false, disabled: false, in_flight: 0,
+      },
+      {
+        uid: "10002", realm: "cn", nickname: "测试 B", credits: 336,
+        cooling: false, disabled: false, in_flight: 1,
+        rate_limited_models: [
+          { model: "GLM-5.3", until_ms: now + 27 * 60_000, reset_at_ms: now + 27 * 60_000, reason: "6004 model rate limit" },
+          { model: "Kimi-K3", until_ms: now + 8 * 60_000, reset_at_ms: 0, reason: "6004 model rate limit" },
+        ],
+      },
+    ],
+    total: 2,
+    healthy: 2,
+    cooling: 0,
+    disabled: 0,
+    in_flight_full: 0,
+  };
+}
+
 function demoApiKeys(): ApiKeyRecord[] {
   return [
     { id: "demo-key-1", name: "Cursor", region: "cn", prefix: "sk-wb-a1b2", createdAt: atLocalTime(3, 17, 3), revokedAt: null, revoked: false, lastUsedAt: atLocalTime(0, 17, 10) },
@@ -1093,6 +1119,7 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
     case "switch_progress": return { running: false, progress: null };
     case "get_gateway_config": return demoGatewayConfig();
     case "gateway_status": return demoGatewayStatus();
+    case "gateway_pool_status": return demoGatewayPoolStatus();
     case "list_api_keys": return { keys: demoApiKeys() };
     case "get_gateway_models": return demoCatalog(args?.region === "global" ? "global" : "cn");
     case "get_account_strategy": return demoStrategyMap();
