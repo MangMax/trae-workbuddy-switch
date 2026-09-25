@@ -57,8 +57,9 @@ buddy-switch version      # 版本号
 
 ## 来源说明
 
-本仓库来自原仓库 **[changexbc/workbuddy-switch](https://github.com/changexbc/workbuddy-switch)**（原版项目）。
-本仓库为私人维护版本，仅在原版基础上做本地适配与缺陷修复，不代表原作者的立场或发布。
+本仓库来自 **[NextAgentX/trae-workbuddy-switch](https://github.com/NextAgentX/trae-workbuddy-switch)**，
+其上游原版项目为 **[changexbc/workbuddy-switch](https://github.com/changexbc/workbuddy-switch)**。
+本仓库为个人维护分支，在此基础上做本地适配与缺陷修复，不代表原作者的立场或发布。
 
 ## 许可
 

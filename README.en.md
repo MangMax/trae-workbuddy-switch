@@ -301,9 +301,10 @@ npm/                     # npm packages (**not published yet**): main package @m
 
 ## Origin
 
-This repository is derived from the original project **[changexbc/workbuddy-switch](https://github.com/changexbc/workbuddy-switch)**.
-It is a privately maintained fork with local adaptations and bug fixes; it does not represent the original author's positions or releases.
-Version checks, releases, and installers are served from **this repository** (the original repository's releases are not in sync with it).
+This repository is derived from **[NextAgentX/trae-workbuddy-switch](https://github.com/NextAgentX/trae-workbuddy-switch)**,
+whose upstream original project is **[changexbc/workbuddy-switch](https://github.com/changexbc/workbuddy-switch)**.
+It is a personally maintained fork with local adaptations and bug fixes; it does not represent the original author's positions or releases.
+Version checks, releases, and installers are served from **this repository** (the upstream repositories' releases are not in sync with it).
 
 ## License
 
